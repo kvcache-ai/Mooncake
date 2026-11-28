@@ -66,6 +66,17 @@ class KvcsDriver {
     virtual tl::expected<void, ErrorCode> Init() = 0;
     virtual uint64_t MaxValueSize() const = 0;
     virtual uint32_t MaxKeySize() const { return kKvcsDefaultMaxKeySize; }
+    // Zero retains native batching. Read concurrency is the number of GET
+    // workers in the driver's client; zero retains disabled SDK reads.
+    virtual size_t MaxBatchKeys() const { return 0; }
+    virtual size_t ReadConcurrency() const { return 1; }
+    // Sub-batches the adapter may keep in flight. Kept apart from the client's
+    // ring workers so the window can overlap calls without resizing pools.
+    virtual size_t ReadWindow() const { return ReadConcurrency(); }
+    // Absolute steady-clock nanoseconds, captured before adapter queueing.
+    // Drivers without a read timeout retain the existing BatchGet contract.
+    virtual int64_t ReadDeadlineNs() const { return INT64_MAX; }
+
     virtual tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
@@ -73,6 +84,10 @@ class KvcsDriver {
 
     virtual KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) = 0;
     virtual KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) = 0;
+    virtual KvcsIoResults BatchGetUntil(std::span<const KvcsIoRequest> requests,
+                                        int64_t deadline_ns) {
+        return BatchGet(requests);
+    }
     virtual KvcsIoResults BatchDelete(
         std::span<const ObjectKey> logical_keys) = 0;
 };

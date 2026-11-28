@@ -3,24 +3,32 @@
 #include <stdexcept>
 namespace mooncake {
 ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
-    for (size_t i = 0; i < num_threads; ++i) {
-        workers.emplace_back([this] {
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lock(this->queue_mutex);
-                    this->condition.wait(lock, [this] {
-                        return this->stop_flag || !this->tasks.empty();
-                    });
+    try {
+        workers.reserve(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] {
+                            return this->stop_flag || !this->tasks.empty();
+                        });
 
-                    if (this->stop_flag && this->tasks.empty()) return;
+                        if (this->stop_flag && this->tasks.empty()) return;
 
-                    task = std::move(this->tasks.front());
-                    this->tasks.pop();
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
                 }
-                task();
-            }
-        });
+            });
+        }
+    } catch (...) {
+        // The destructor does not run when construction fails. Join every
+        // worker already started before unwinding its synchronization state.
+        stop();
+        throw;
     }
 }
 

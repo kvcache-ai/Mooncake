@@ -152,8 +152,8 @@ tl::expected<uint64_t, ErrorCode> CalculateSliceBytes(
 }
 
 std::vector<bool> ShareableReadDestinations(
-    const std::vector<DfsReadRequest>& requests,
-    const std::vector<bool>& valid) {
+    const std::vector<DfsReadRequest>& requests, const std::vector<bool>& valid,
+    bool* aliased) {
     std::vector<bool> shareable(requests.size(), false);
     size_t range_count = 0;
     for (size_t i = 0; i < requests.size(); ++i) {
@@ -161,8 +161,8 @@ std::vector<bool> ShareableReadDestinations(
         shareable[i] = requests[i].source_replica_id != 0;
         range_count += requests[i].slices.size();
     }
-    if (std::none_of(shareable.begin(), shareable.end(),
-                     [](bool value) { return value; }))
+    if (!aliased && std::none_of(shareable.begin(), shareable.end(),
+                                 [](bool value) { return value; }))
         return shareable;
     struct Range {
         uintptr_t begin;
@@ -177,6 +177,7 @@ std::vector<bool> ShareableReadDestinations(
             const auto begin = reinterpret_cast<uintptr_t>(slice.ptr);
             if (slice.size > std::numeric_limits<uintptr_t>::max() - begin) {
                 shareable[i] = false;
+                if (aliased) *aliased = true;
                 continue;
             }
             ranges.push_back({begin, begin + slice.size, i});
@@ -196,6 +197,7 @@ std::vector<bool> ShareableReadDestinations(
             ++next;
         }
         if (next - first > 1) {
+            if (aliased) *aliased = true;
             for (size_t i = first; i < next; ++i)
                 shareable[ranges[i].owner] = false;
         }
@@ -967,7 +969,10 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         validated[i] = std::move(*request);
         valid[i] = true;
     }
-    const auto shareable = ShareableReadDestinations(validated, valid);
+    bool aliased_destinations = false;
+    const auto shareable = ShareableReadDestinations(
+        validated, valid,
+        UsesObjectStorage() ? &aliased_destinations : nullptr);
     std::vector<std::optional<ReadFlights::Ticket>> tickets(requests.size());
     std::vector<DfsReadRequest> leaders;
     std::vector<size_t> leader_indices;
@@ -986,20 +991,17 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         leader_indices.push_back(i);
     }
 
-    // Submit every new source before waiting for joined work. This preserves
-    // native batching and avoids cycles between partially overlapping batches.
-    auto reads = BatchReadOnce(leaders);
-    if (reads.size() != leaders.size())
-        reads.assign(leaders.size(),
-                     tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-    for (size_t j = 0; j < leaders.size(); ++j) {
+    std::vector<bool> finished(leaders.size(), false);
+    auto publish = [&](size_t j, const tl::expected<void, ErrorCode>& read) {
+        if (j >= leaders.size() || finished[j]) return;
+        finished[j] = true;
         const size_t i = leader_indices[j];
-        results[i] = reads[j];
-        if (!tickets[i]) continue;
+        results[i] = read;
+        if (!tickets[i]) return;
         const bool joined = tickets[i]->Retire();
         SharedRead shared = std::shared_ptr<const std::vector<char>>{};
-        if (!reads[j]) {
-            shared = tl::make_unexpected(reads[j].error());
+        if (!read) {
+            shared = tl::make_unexpected(read.error());
         } else if (joined) {
             try {
                 auto bytes = CalculateSliceBytes(leaders[j].slices);
@@ -1020,7 +1022,15 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         }
         tickets[i]->Publish(std::move(shared));
         tickets[i].reset();
-    }
+    };
+    // Register every leader before any I/O or follower wait. The adapter can
+    // complete independent sub-batches without holding unrelated joined reads.
+    auto reads = BatchReadOnce(leaders, publish, !aliased_destinations);
+    if (reads.size() != leaders.size())
+        reads.assign(leaders.size(),
+                     tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+    for (size_t j = 0; j < leaders.size(); ++j)
+        if (!finished[j]) publish(j, reads[j]);
     for (size_t i = 0; i < requests.size(); ++i) {
         if (!tickets[i]) continue;
         try {
@@ -1046,7 +1056,8 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchReadOnce(
-    const std::vector<DfsReadRequest>& requests) {
+    const std::vector<DfsReadRequest>& requests,
+    const ReadCompletion& completed, bool allow_early_completion) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
     if (requests.empty()) return results;
     if (UsesObjectStorage()) {
@@ -1066,26 +1077,39 @@ DistributedStorageBackend::BatchReadOnce(
                 {request.key, buffer,
                  static_cast<size_t>(request.descriptor.object_size)});
         }
+        std::vector<bool> finished(requests.size(), false);
+        auto complete_object =
+            [&](size_t i, const tl::expected<size_t, ErrorCode>& read) {
+                if (i >= requests.size() || finished[i]) return;
+                if (!read) {
+                    results[i] = tl::make_unexpected(read.error());
+                } else if (*read != object_requests[i].size) {
+                    results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                } else if (!staging_buffers[i].empty()) {
+                    size_t offset = 0;
+                    for (const auto& slice : requests[i].slices) {
+                        std::memcpy(slice.ptr,
+                                    staging_buffers[i].data() + offset,
+                                    slice.size);
+                        offset += slice.size;
+                    }
+                }
+                finished[i] = true;
+                if (completed) completed(i, results[i]);
+            };
+        // Staging hides scatter aliases from the provider. For such batches,
+        // finish all provider writes before copying back in original order.
         auto object_results =
-            object_storage_adapter_->GetBatch(object_requests);
+            allow_early_completion
+                ? object_storage_adapter_->GetBatchWithCompletion(
+                      object_requests, complete_object)
+                : object_storage_adapter_->GetBatch(object_requests);
         if (object_results.size() != requests.size())
-            return std::vector<tl::expected<void, ErrorCode>>(
+            object_results.assign(
                 requests.size(),
                 tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-        for (size_t i = 0; i < object_results.size(); ++i) {
-            if (!object_results[i]) {
-                results[i] = tl::make_unexpected(object_results[i].error());
-            } else if (*object_results[i] != object_requests[i].size) {
-                results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            } else if (!staging_buffers[i].empty()) {
-                size_t offset = 0;
-                for (const auto& slice : requests[i].slices) {
-                    std::memcpy(slice.ptr, staging_buffers[i].data() + offset,
-                                slice.size);
-                    offset += slice.size;
-                }
-            }
-        }
+        for (size_t i = 0; i < requests.size(); ++i)
+            if (!finished[i]) complete_object(i, object_results[i]);
         return results;
     }
     const bool batch_io = fs_adapter_->SupportsBatchIo();

@@ -70,10 +70,61 @@ deployment variable is absent, the defaults are index `1` and mountpoint ID
 | `MOONCAKE_KVCS_MAX_VALUE_SIZE` | 4 MiB |
 | `MOONCAKE_KVCS_MAX_KEY_SIZE` | 256 bytes |
 | `MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` | 8 |
-| `MOONCAKE_KVCS_GET_WORKERS` | 1 |
-| `MOONCAKE_KVCS_SET_WORKERS` | 1 |
-| `MOONCAKE_KVCS_SIMPLE_WORKERS` | 1 |
+| `MOONCAKE_KVCS_GET_WORKERS` | 32 |
+| `MOONCAKE_KVCS_SET_WORKERS` | 4 |
+| `MOONCAKE_KVCS_SIMPLE_WORKERS` | 8 |
+| `MOONCAKE_KVCS_READ_WINDOW` | 8 |
 | `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` | 30000 ms |
+
+The three worker settings size pools inside the KVCS low-level SDK client
+(EFC), not DFS and not the Mooncake store server: GET dispatches read ring
+I/O, SET dispatches write ring I/O, and SIMPLE runs existence and layout
+queries. The SDK itself defaults to 4/4/2; Mooncake overrides them, because
+the generated config always carries a value and leaving it at one serializes
+a client the SDK expects to overlap four reads on.
+
+The Mooncake adapter that owns the client keeps a read window apart from
+those workers, set by `MOONCAKE_KVCS_READ_WINDOW`: it dispatches that many
+sub-batches at a time, and each SDK call carries at most
+`MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` keys. The two layers therefore have two
+defaults, 32 ring Get workers and a window of eight. Cold 720 KiB
+reads from 16 processes measured 3259/3558/3366/2996 MiB/s on the bare SDK at
+16/32/64/128 Get workers, and 3177/3212/3046/2886 MiB/s through Mooncake, so
+32 is the knee and raising `MOONCAKE_KVCS_GET_WORKERS` further adds shm while
+losing bandwidth. The window keeps the ring fed while a completed sub-batch
+is delivered, and it reserves no shm. Retune the workers when the EFC exposes
+more or fewer rings; setting the Get worker count to zero retains the SDK's
+disabled GET behavior.
+
+One process should keep several reads in flight. The Python binding releases
+the GIL inside `batch_get_into`, so threads in one process are concurrent
+calls. On the same cold read, 16 processes with four threads of four keys
+each reached a higher median than 16 processes issuing one 16-key call
+(3417 MiB/s versus 3207 MiB/s); eight threads of two keys did not improve on
+four. That concurrency is the caller's. `MOONCAKE_KVCS_READ_WINDOW` stays 8
+because it counts SDK sub-batches inside one call, not application threads.
+
+The defaults are sized for throughput, which costs IOV shm: every worker
+reserves `MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` times
+`MOONCAKE_KVCS_MAX_VALUE_SIZE`, and the adapter logs the resulting total at
+startup. With the defaults that is 1408 MiB across 44 workers. The adapter read
+window reserves nothing here. Lower the worker counts, the batch depth, or the
+value ceiling on deployments with a smaller shm budget.
+`MOONCAKE_KVCS_MAX_VALUE_SIZE` is a split threshold as well as a shm input:
+objects above it take the manifest path, so raising it trades shm for
+fewer split writes rather than for read bandwidth.
+
+Completed sub-batches release matching in-flight DFS readers without waiting
+for unrelated sub-batches. Each consumer is validated and scatter destinations
+are filled before completion is published. A request that needs a slow object
+still waits for that object; this is not a completed-value cache. Overlapping
+destination buffers retain ordinary batch I/O. A read batch captures one
+absolute `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` deadline before dispatch; queueing
+and subsequent SDK sub-batches consume the same budget. Reads that expire
+before reaching the SDK return `RPC_TIMEOUT` without accessing their output
+buffers. Already accepted SDK reads are drained before returning, including
+when a completion callback throws, so the deadline does not bypass buffer
+lifetime requirements.
 
 ## Capacity source
 
