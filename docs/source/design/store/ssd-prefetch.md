@@ -4,116 +4,25 @@ Related: RFC #2213, promotion-on-hit (PR #2071).
 
 ## Goal
 
-`is_exist` / `batch_is_exist` with `ExistOptions.prefetch_to_memory = true` may
-start a best-effort SSD→DRAM promotion for keys that only have a `LOCAL_DISK`
-replica, so a follow-up `get()` can be served from DRAM. Prefetch must not
-change exist/get semantics, must not block the caller, and may be dropped on
-any failure. If the disk replica is remote, the holder node reads its own SSD
-into its own DRAM.
+`is_exist` / `batch_is_exist` with `ExistOptions.prefetch_to_memory = true`
+triggers a best-effort SSD→DRAM promotion for keys that only have a
+`LOCAL_DISK` replica so a follow-up `get()` can hit DRAM. Prefetch never blocks
+the caller, does not alter exist/get semantics, and may be dropped on failure.
+For a remote disk replica, the holder reads its local SSD and writes into a
+cluster DRAM segment allocated by the master (`PromotionAllocStart` passes an
+empty `preferred_segments` list, not necessarily the holder's own DRAM).
 
-The feature is off by default (`enable_ssd_prefetch = false`); with the switch
-off the exist/get paths behave exactly as before.
+Off by default (`enable_ssd_prefetch = false`).
 
-## Path
+> **Backend scope:** On the disk holder, client prefetch queries on-disk size
+> via `StorageBackendInterface::GetObjectDataSize()`, currently implemented
+> **only by `BucketStorageBackend`**. Other backends return empty and skip
+> prefetch. (Master `promotion-on-hit` uses the task's `size` directly and is
+> unaffected.)
 
-```
-is_exist(..., prefetch_to_memory=true)          # synchronous, no RPC added
-  → SsdPrefetcher::triggerSsdPrefetch           # throttle.reserve() dedup
-    → prefetch thread pool (fixed size 4)
-      → 128-key chunks: BatchQueryReadOnly      # no lease, no promotion-on-hit
-        → classify: SSD-only (LOCAL_DISK complete, no MEMORY), size > 0
-          → local holder:  RegisterPrefetchTask + FileStorage::PrefetchKeys
-          → remote holder: prefetch_offload_object RPC (carries the keys'
-            tenant; a shared holder promotes under the object's own tenant)
-            → holder promotes locally
-```
+---
 
-`PrefetchKeys` shares the promotion execution chain with promotion-on-hit
-(`PromoteOneKeyFromLocalDisk`: `PromotionAllocStart` → staging `AllocateBatch`
-→ `BatchLoad` → `PromotionWrite` → `NotifyPromotionSuccess`). It does **not**
-reuse promotion-on-hit admission (frequency sketch, DRAM watermark gate), the
-lease-on-query, or the holder's promotion heartbeat mailbox.
-
-Metadata queries use the read-only admin replica RPCs
-(`GetReplicaListForAdmin` / `BatchGetReplicaListForAdmin`, also registered on
-the master RPC server), so prefetch never grants a lease, never triggers
-promotion-on-hit, and never counts `valid_get` metrics as a side effect.
-
-## Master side: RegisterPrefetchTask
-
-New additive RPC (older masters reject it and prefetch degrades to a no-op).
-Semantics differ from promotion-on-hit admission:
-
-- tenant-aware: the key is looked up under the caller's tenant;
-- holder-only: `holder_id == client_id`, others get `INVALID_PARAMS`;
-- no frequency/watermark admission, no heartbeat mailbox push;
-- shares the `promotion_in_flight_` / `promotion_queue_limit_` cap with
-  promotion-on-hit (both compete for the same DRAM);
-- idempotency is explicit: if a MEMORY replica or an in-flight promotion task
-  already exists, the call fails with `PROMOTION_ALREADY_EXISTS`, which the
-  caller treats as "skip quietly", not as an error. Prefetch and
-  promotion-on-hit therefore cannot double-promote the same key: both paths
-  allocate from the same per-key `promotion_tasks` entry.
-
-`NotifyPromotionSuccess` with `from_prefetch = true` grants the same read
-lease (`default_kv_lease_ttl`) as exist/get, so the promoted DRAM replica
-survives until the follow-up `get()`. If the exist→get gap can exceed the hard
-lease, raise `--default_kv_lease_ttl`; note that larger leases can raise Put
-`NO_AVAILABLE_HANDLE` under a high DRAM watermark (a capacity trade-off, not a
-prefetch bug).
-
-## Throttle, threads, failure handling
-
-Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
-
-- `ssd_prefetch_dedup_ttl_sec` (default 30): a key prefetches at most once per
-  window. Applies at trigger time (before any RPC) so hot probes on
-  DRAM-resident keys do not cause metadata-query storms; the async job still
-  re-classifies precisely after `BatchQueryReadOnly`.
-- Failed keys retry after the (shorter) cooldown window, not the full TTL.
-- `ssd_prefetch_cooldown_sec` (default 5): when promotion fails with
-  `NO_AVAILABLE_HANDLE` (DRAM saturated), prefetch backs off so it stops
-  competing with eviction/offload, which are what actually frees DRAM. 0
-  disables the backoff.
-- All prefetch work runs on a fixed-size thread pool (4 workers). If the pool
-  is down (shutdown), the job is dropped — prefetch never spawns a thread per
-  probe and never falls back to unbounded detached threads. Client teardown
-  drains the pool before releasing resources: `Shutdown()` refuses new work,
-  then runs queued and in-flight jobs to completion and joins the workers,
-  because jobs capture `shared_ptr`s locked at submission and must not
-  outlive the client/segment teardown beneath them.
-- Every failure past `PromotionAllocStart` releases the master-side staged
-  state eagerly (`NotifyPromotionFailure`, RAII guard) instead of waiting for
-  the reaper TTL.
-
-## get() demand-side kick
-
-Any get whose best replica is `LOCAL_DISK` — single-key or batched — fires
-one `TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the transfer. The
-bypass covers only the client-side throttle backoff — never a master-side
-gate (the shared in-flight cap, holder check, and dedup TTL all still
-apply). Rationale: an in-flight get is the strongest hotness signal there
-is, and a request whose exist-triggered promotion was dropped by a
-saturated backoff window should not pay SSD reads with no retry. The kick
-is cheap (one dedup lookup + one pool enqueue, no RPC on the caller's
-thread) and never blocks the get: the batch proceeds to the SSD read
-immediately, and a promoted replica benefits the *next* get.
-
-An earlier revision of this design also waited on in-flight promotions from
-the get path (`ssd_get_wait_ms`). Decomposition measurements (store-level
-get latency and engine TTFT, pure and mixed batches, DRAM-constrained)
-showed the wait never turned the pending get into a DRAM read in the tested
-regimes and added latency instead, so the wait was removed and the kick
-kept, decoupled from any wait knob. The data is in the PR description.
-
-Measured TTFT results and the A/B methodology (fill → overflow → settle →
-measure) are in PR #4272's description.
-
-
-## Detailed design
-
-The four pieces below are the load-bearing components. Everything here maps
-one-to-one onto the code named in [Code map](#code-map).
+## Architecture & Trigger Flow
 
 ### Component architecture
 
@@ -154,6 +63,14 @@ classDiagram
 
 ### End-to-end trigger flow (exist probe)
 
+On an embedded `RealClient`, `TriggerPrefetch` adds **no synchronous RPC** on
+the caller's thread — it deduplicates via `PrefetchThrottle` and enqueues onto
+a 4-worker pool. (`DummyClient` forwards `ExistOptions.prefetch_to_memory` to
+its standalone `mooncake_client` via additive RPCs.) Metadata classification
+uses read-only admin RPCs (`GetReplicaListForAdmin` /
+`BatchGetReplicaListForAdmin`), so it grants no lease, never triggers
+promotion-on-hit, and does not increment `valid_get`.
+
 ```mermaid
 sequenceDiagram
     participant E as Engine
@@ -162,7 +79,7 @@ sequenceDiagram
     participant M as Master
     participant H as Holder
 
-    E->>P: TriggerPrefetch(keys), sync, no RPC
+    E->>P: TriggerPrefetch(keys), sync on RealClient
     P->>T: reserve(keys), TTL dedup for local and remote alike
     T-->>P: unseen subset
     P->>P: enqueue pool job, caller returns here
@@ -172,9 +89,9 @@ sequenceDiagram
         P->>P: ClassifySsdPrefetchRoute, SSD-only, COMPLETE, size above 0
     end
     alt local holder
-        P->>H: LookupLocalObjectSize, authoritative
+        P->>H: LookupLocalObjectSize (BucketStorageBackend)
         H->>M: RegisterPrefetchTask with holder client_id and tenant
-        M-->>H: OK, or PROMOTION_ALREADY_EXISTS meaning skip quietly
+        M-->>H: OK, or PROMOTION_ALREADY_EXISTS (skip quietly)
         H->>H: PrefetchKeys then PromoteOneKeyFromLocalDisk
         H->>M: NotifyPromotionSuccess, grant read lease from_prefetch
     else remote holder
@@ -183,10 +100,17 @@ sequenceDiagram
     end
 ```
 
-### PrefetchThrottle
+During client teardown, `SsdPrefetcher::Shutdown()` rejects new jobs, drains
+queued and in-flight work, and joins the 4 workers before releasing client or
+segment resources.
 
-Sharded (16) per-key state machine; lazy expiry (per-entry deadline plus an
-amortized per-shard sweep), so a probe is O(batch) not O(table).
+---
+
+## PrefetchThrottle
+
+16-shard per-key state machine (`reserve()` locks the target shard; cooldown
+and disabled-TTL checks are lock-free atomics) with lazy per-entry expiry and
+amortized per-shard sweeps (`O(batch)` per probe):
 
 ```mermaid
 stateDiagram-v2
@@ -202,15 +126,19 @@ stateDiagram-v2
     kDelegated --> [*] : dedup TTL, holder owns execution state
 ```
 
-Dedup windows per state (see `EntryExpired`): healthy states block
-re-triggering for `ssd_prefetch_dedup_ttl_sec` (default 30 s); `kFailed`
-only for `ssd_prefetch_cooldown_sec` (default 5 s) so transient failures
-retry quickly. The memory-pressure cooldown is opened when
-`PromotionAllocStart` returns `NO_AVAILABLE_HANDLE`: while active,
-TriggerPrefetch is a no-op — prefetch (which adds DRAM) yields to
-eviction/offload (which frees DRAM).
+- **`ssd_prefetch_dedup_ttl_sec` (default 30 s)**: Suppresses re-triggering for
+  healthy states (`kCompleted`, `kAlreadyResident`, `kDelegated`) at trigger
+  time, preventing metadata-query storms on DRAM-resident keys.
+- **`ssd_prefetch_cooldown_sec` (default 5 s)**: Shorter retry window for
+  `kFailed` keys, and global backoff when `PromotionAllocStart` returns
+  `NO_AVAILABLE_HANDLE` so prefetch yields DRAM to eviction/offload (`0`
+  disables).
 
-### Master: RegisterPrefetchTask
+---
+
+## Master: RegisterPrefetchTask
+
+Additive RPC (older masters reject it and prefetch degrades to a no-op):
 
 ```mermaid
 flowchart TD
@@ -231,18 +159,19 @@ flowchart TD
     H -- pass --> I[pin source refcnt<br/>emplace PromotionTask from_prefetch=true]
 ```
 
-The task deliberately skips promotion-on-hit admission (frequency sketch,
-watermark) and the holder's heartbeat mailbox — an explicit probe is the
-hotness signal — but **shares** the `promotion_in_flight_` cap and the
-per-key `promotion_tasks` entry with promotion-on-hit, so the two paths
-cannot double-promote a key. `NotifyPromotionSuccess` on a
-`from_prefetch` task grants the normal `default_kv_lease_ttl` read lease:
-the DRAM replica survives until the follow-up get.
+- Skips promotion-on-hit's frequency sketch, DRAM watermark gate, and heartbeat
+  mailbox, but **shares** `promotion_in_flight_` / `promotion_queue_limit_` and
+  per-key `promotion_tasks` so the two paths cannot double-promote a key.
+- `NotifyPromotionSuccess` on a `from_prefetch` task grants the standard
+  `default_kv_lease_ttl` read lease so the promoted replica survives until the
+  follow-up `get()`.
 
-### FileStorage execution chain
+---
 
-`PromoteOneKeyFromLocalDisk` is shared verbatim by promotion-on-hit
-(`ProcessPromotionTasks`) and prefetch (`PrefetchKeys`):
+## FileStorage Execution
+
+`PromoteOneKeyFromLocalDisk` is shared verbatim by `ProcessPromotionTasks`
+(promotion-on-hit) and `PrefetchKeys` (prefetch):
 
 ```mermaid
 sequenceDiagram
@@ -261,75 +190,79 @@ sequenceDiagram
     Note over F: guard.Dismiss()
 ```
 
-Per-key failures never propagate (best-effort): they are logged, counted on
-`SsdMetric.prefetch_complete/fail_total`, and reported through the
-completion callback that drives the throttle states above.
+Failures past `PromotionAllocStart` release staged master state immediately via
+`NotifyPromotionFailure` (RAII guard). Per-key errors never propagate; they
+update `SsdMetric.prefetch_complete/fail_total` and `PrefetchThrottle`.
 
-### exist/get wiring
+---
 
-- **exist**: `ExistOptions.prefetch_to_memory` + `enable_ssd_prefetch` →
-  TriggerPrefetch. Synchronous cost: one dedup lookup + one pool enqueue.
-- **get**: a batch headed for SSD gets one demand-side kick (see "get()
-  demand-side kick" above) that bypasses only the client-side throttle
-  backoff, then proceeds to the transfer immediately — the get path never
-  waits on promotions.
+## exist / get Wiring
 
-## Rolling-upgrade compatibility
+- **`exist`**: `is_exist` / `batch_is_exist` with
+  `ExistOptions.prefetch_to_memory = true` and `enable_ssd_prefetch = true`
+  calls `TriggerPrefetch` (or forwards via `DummyClient`).
+- **`get` demand-side kick**: Supported read entrypoints whose best replica is
+  `LOCAL_DISK` fire `TriggerPrefetch(disk_keys, ignore_cooldown=true)` before
+  starting the SSD transfer, never blocking or waiting on promotions. The
+  bypass applies only to the requester's client-side cooldown (master gates,
+  dedup TTL, and remote holder cooldown still apply).
 
-- No existing RPC signature changes.
-- `RegisterPrefetchTask` and `prefetch_offload_object` are additive: old
-  masters/holders reject them, and prefetch degrades to a no-op.
-- The read-only replica queries reuse the pre-existing admin RPC handlers.
-
-## Configuration
-
-| key | default | meaning |
+| Read API family | Client demand-side kick | Master `promotion-on-hit` |
 |---|---|---|
-| `enable_ssd_prefetch` | false | master switch (client config) |
-| `ssd_prefetch_cooldown_sec` | 5 | DRAM-pressure backoff; 0 disables |
-| `ssd_prefetch_dedup_ttl_sec` | 30 | per-key trigger dedup TTL; 0 disables |
+| `get_buffer` (Python `get`, `get_tensor`; `DummyClient::get_buffer` shared-buffer fallback) | Yes (prefetch-enabled `RealClient`) | Yes |
+| `batch_get_into_multi_buffers` (C / Python / `DummyClient` wrappers) | Yes (prefetch-enabled `RealClient`) | Yes |
+| `batch_get_buffer` (Python `get_batch`, `batch_get_tensor`), `batch_get_into`, single-object `get_into` (`get_tensor_into`, `mooncake_store_get_into`), `batch_get_into_cuda_ipc`, `get_into_ranges*`, `batch_get_into_multi_buffer_ranges` | No | Yes |
 
-The SSD holder requires `enable_ssd_offload` and an SSD storage directory.
-A requesting RealClient can use `setup(dict)` with `enable_ssd_prefetch=true`
-without enabling local offload or contributing a DRAM segment. Both the
-requesting RealClient and the SSD holder must enable prefetch.
+---
 
-For an independent `mooncake_client` holder, set the offload directory using
-`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` and start it with:
+## Compatibility & Configuration
+
+- **Rolling-upgrade compatibility**: No existing RPC signature changes.
+  `RegisterPrefetchTask`, `prefetch_offload_object`, and `DummyClient`
+  exist-with-options RPCs are additive (older peers reject or fall back to
+  ordinary exist queries). Read-only queries reuse existing admin RPCs.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enable_ssd_prefetch` | `false` | Master switch (client config) |
+| `ssd_prefetch_cooldown_sec` | `5` | DRAM-pressure backoff in seconds; `0` disables |
+| `ssd_prefetch_dedup_ttl_sec` | `30` | Per-key trigger dedup TTL in seconds; `0` disables |
+
+- **Requester vs. Holder**: Both sides must enable prefetch. The SSD holder
+  needs `enable_ssd_offload` and a `BucketStorageBackend` storage directory; a
+  requesting `RealClient` can enable `enable_ssd_prefetch=true` via
+  `setup(dict)` without local offload or a DRAM segment.
+- **Standalone `mooncake_client` & `DummyClient`**: Set
+  `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` and enable `--enable_ssd_prefetch=true`
+  (replace `192.168.1.10` with your addresses). Keep
+  `--start_offload_rpc_server=true` for the dedicated offload RPC listener
+  (when `false`, the main client RPC listener serves remote disk reads and
+  prefetch). `DummyClient` (`setup_dummy()`) forwards
+  `ExistOptions.prefetch_to_memory=true` to its `mooncake_client`.
 
 ```bash
 mooncake_client \
-  --host=<holder-address> \
-  --master_server_address=<master-address> \
-  --metadata_server=P2PHANDSHAKE \
+  --host="192.168.1.10" \
+  --master_server_address="192.168.1.10:50051" \
+  --metadata_server="P2PHANDSHAKE" \
   --enable_offload=true \
   --enable_ssd_prefetch=true \
   --ssd_prefetch_cooldown_sec=5 \
   --ssd_prefetch_dedup_ttl_sec=30
 ```
 
-The prefetch CLI switch defaults to false. Durations are non-negative seconds;
-0 disables the corresponding backoff or deduplication window. Keep
-`--start_offload_rpc_server=true` to use the dedicated offload RPC listener.
-When it is false, the main client RPC listener serves remote disk reads and
-prefetch requests.
+---
 
-Clients connected through `setup_dummy()` can also pass
-`ExistOptions.prefetch_to_memory=true`. The dummy forwards the option to its
-`mooncake_client`, which must enable prefetch. These options use additive RPCs;
-a newer dummy connected to an older server falls back to the ordinary exist
-query. Existing exist RPC signatures remain unchanged.
+## Code Map
 
-## Code map
-
-- `prefetch_throttle.h` — throttle state machine (sharded).
-- `master_service.*` — `RegisterPrefetchTask`, `PromotionTask::from_prefetch`,
-  prefetch lease in `NotifyPromotionSuccess`.
+- `prefetch_throttle.h` — sharded throttle state machine.
+- `master_service.*` / `object_runtime_state.h` — `RegisterPrefetchTask`,
+  `PromotionTask::from_prefetch`, prefetch lease in `NotifyPromotionSuccess`.
 - `rpc_service.*` / `master_client.*` / `client_service.*` — RPC wiring.
-- `file_storage.*` — `PrefetchKeys`, `PromoteOneKeyFromLocalDisk` (shared with
-  promotion-on-hit), `LookupLocalObjectSize`.
-- `storage_backend.*` — `GetObjectDataSize`.
-- `ssd_prefetcher.*` — trigger/dedup/classify/delegate and the prefetch pool.
+- `file_storage.*` — `PrefetchKeys`, `PromoteOneKeyFromLocalDisk`,
+  `LookupLocalObjectSize`.
+- `storage_backend.*` — `GetObjectDataSize` (`BucketStorageBackend`).
+- `ssd_prefetcher.*` — trigger/dedup/classify/delegate and worker pool.
 - `real_client.*` — exist-path trigger, get-side kick.
 - `replica.h` (`ExistOptions`), `store_c`, `store_py`, `dummy_client` — API
   plumbing.
