@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import fnmatch
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -25,13 +25,37 @@ OTHER_RELEASE_WFS = (
 )
 
 
+def github_filter_matches(pattern: str, tag: str) -> bool:
+    """Match a GitHub Actions tag filter, which supports `+` and `[...]`."""
+    regex = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith("**", index):
+            regex.append(".*")
+            index += 2
+            continue
+        if char == "*":
+            regex.append("[^/]*")
+        elif char in "+?":
+            regex.append(char)
+        elif char == "[":
+            end = pattern.index("]", index)
+            regex.append(pattern[index : end + 1])
+            index = end
+        else:
+            regex.append(re.escape(char))
+        index += 1
+    return re.fullmatch("".join(regex), tag) is not None
+
+
 def matches_tags(patterns: list[str], tag: str) -> bool:
     matched = False
     for p in patterns:
         if p.startswith("!"):
-            if fnmatch.fnmatchcase(tag, p[1:]):
+            if github_filter_matches(p[1:], tag):
                 matched = False
-        elif fnmatch.fnmatchcase(tag, p):
+        elif github_filter_matches(p, tag):
             matched = True
     return matched
 
@@ -52,9 +76,11 @@ class ReleaseNpuWorkflowTest(unittest.TestCase):
             ("v0.3.15", True),
             ("v0.3.14.post1", False),
             ("v0.3.15-rc1", False),
+            ("v0.3.15rc1", False),
             ("npu-v0.3.14", True),
             ("npu-v0.3.14.post1", True),
             ("npu-v0.3.14-rc1", False),
+            ("npu-v0.3.14rc1", False),
         ):
             self.assertEqual(matches_tags(npu_tags, tag), expected, tag)
 

@@ -2,12 +2,13 @@ name: Release Ascend NPU
 
 on:
   push:
+    # Stable tags only: vX.Y.Z, plus npu-vX.Y.Z and npu-vX.Y.Z.postN for
+    # NPU-only hotfixes. PEP 440 pre-release tags such as v0.3.14rc1 must not
+    # reach production PyPI; pre-release.yaml handles them.
     tags:
-      - 'v*'
-      - '!v*-*'
-      - '!v*.post*'
-      - 'npu-v*'
-      - '!npu-v*-*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'npu-v[0-9]+.[0-9]+.[0-9]+'
+      - 'npu-v[0-9]+.[0-9]+.[0-9]+.post[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
