@@ -110,6 +110,10 @@ void MetricsExporter::addHistogram(Histogram* histogram) {
     if (histogram) histograms_.push_back(histogram);
 }
 
+void MetricsExporter::addTextSource(std::function<void(std::string&)> source) {
+    if (source) text_sources_.push_back(std::move(source));
+}
+
 void MetricsExporter::setSummaryProvider(
     std::function<std::string()> provider) {
     summary_provider_ = std::move(provider);
@@ -180,6 +184,7 @@ std::string MetricsExporter::prometheusText() {
         std::string result;
         for (auto* counter : counters_) counter->serialize(result);
         for (auto* entry : histograms_) entry->serialize(result);
+        for (const auto& source : text_sources_) source(result);
         return result;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to serialize " << name_

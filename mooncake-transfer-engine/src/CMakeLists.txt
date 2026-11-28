@@ -6,6 +6,7 @@ list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
 set(TRANSFER_ENGINE_METRICS_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/metrics_exporter.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/rail_metrics.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/transfer_engine_metrics.cpp")
 if(NOT WITH_METRICS)
   list(REMOVE_ITEM ENGINE_SOURCES ${TRANSFER_ENGINE_METRICS_SOURCES})

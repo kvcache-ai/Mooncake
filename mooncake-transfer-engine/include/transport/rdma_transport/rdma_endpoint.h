@@ -30,6 +30,9 @@
 namespace mooncake {
 
 class RdmaEndPointTestPeer;
+#ifdef WITH_METRICS
+struct RailCounters;
+#endif
 
 // RdmaEndPoint represents all QP connections between the local NIC1 (identified
 // by its RdmaContext) and the remote NIC2 (identified by peer_nic_path).
@@ -83,6 +86,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
     std::string peerNicPath() const;
+#ifdef WITH_METRICS
+    RailCounters *railCounters() const {
+        return rail_counters_.load(std::memory_order_relaxed);
+    }
+#endif
     Transport::Slice::RdmaCompletionToken autoGidCompletionToken() const;
 
     int setupConnectionsByActive();
@@ -291,6 +299,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     uint32_t peer_notify_qp_num_ = 0;
 
     std::string peer_nic_path_;
+#ifdef WITH_METRICS
+    std::atomic<RailCounters *> rail_counters_{nullptr};
+#endif
     std::vector<uint32_t> peer_qp_num_list_;
     std::optional<PeerAutoGidSelection> connected_auto_gid_;
     bool has_connected_;

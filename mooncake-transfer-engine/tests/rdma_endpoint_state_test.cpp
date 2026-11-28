@@ -20,6 +20,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -32,6 +34,9 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#ifdef WITH_METRICS
+#include "rail_metrics.h"
+#endif
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
 #include "topology.h"
@@ -184,6 +189,10 @@ class WorkerPoolTestPeer {
     static void performPostSend(WorkerPool &pool, int thread_id) {
         pool.performPostSend(thread_id);
     }
+
+#ifdef WITH_METRICS
+    static int performPollCq(WorkerPool &pool) { return pool.performPollCq(0); }
+#endif
 
     static void waitForSetups(WorkerPool &pool) {
         for (auto &owner : pool.pending_setups_)
@@ -370,6 +379,18 @@ class RdmaEndPointTestPeer {
         RWSpinlock::WriteGuard guard(endpoint.lock_);
         return endpoint.reconstruct();
     }
+
+#ifdef WITH_METRICS
+    static void bindRailCounters(RdmaEndPoint &endpoint, RailCounters *rail) {
+        endpoint.rail_counters_.store(rail, std::memory_order_relaxed);
+    }
+
+    static void seedPostedFifo(RdmaEndPoint &endpoint,
+                               std::initializer_list<Transport::Slice *> wrs) {
+        endpoint.posted_fifo_.resize(1);
+        endpoint.posted_fifo_[0].assign(wrs);
+    }
+#endif
 };
 
 }  // namespace mooncake
@@ -520,6 +541,80 @@ class RdmaEndPointStateTest : public ::testing::Test {
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<RdmaEndPoint> endpoint_;
 };
+
+#ifdef WITH_METRICS
+TEST(RdmaRailMetricsTest, CountsRetiredWrsOncePerCqe) {
+    struct TestVerbs : ibv_context {
+        ibv_wc cqe;
+    } verbs{};
+    RailCounters rail;
+    FakeRdmaPeer peer;
+    initFakePeer(peer, "rail-local:10000", "mlx5_0", nullptr);
+    verbs.ops.poll_cq = [](ibv_cq *cq, int, ibv_wc *wc) {
+        *wc = static_cast<TestVerbs *>(cq->context)->cqe;
+        return 1;
+    };
+    peer.cq.context = &verbs;
+    RdmaEndPoint endpoint(*peer.context);
+    RdmaEndPointTestPeer::bindRailCounters(endpoint, &rail);
+
+    Transport::TransferTask task{};
+    Transport::Slice slices[7]{};
+    for (size_t i = 0; i < std::size(slices); ++i) {
+        auto &slice = slices[i];
+        slice.task = &task;
+        slice.status = Transport::Slice::POSTED;
+        slice.peer_nic_path = "rail-peer:10000@mlx5_1";
+        slice.length = i + 1;
+        slice.rdma.endpoint = &endpoint;
+        slice.rdma.qp_index = 0;
+    }
+    const auto poll = [&](size_t index, ibv_wc_status status, int interval,
+                          int outstanding) {
+        peer.context->cqOutstandingCount(0)->store(outstanding);
+        verbs.cqe.wr_id = reinterpret_cast<uint64_t>(&slices[index]);
+        verbs.cqe.status = status;
+        auto &signal_interval = globalConfig().rdma_signal_interval;
+        const auto previous_interval = signal_interval;
+        signal_interval = interval;
+        EXPECT_EQ(WorkerPoolTestPeer::performPollCq(*peer.worker_pool), 1);
+        signal_interval = previous_interval;
+        EXPECT_EQ(peer.context->cqOutstandingCount(0)->load(), 0);
+        return WorkerPoolTestPeer::lastPollTs(*peer.worker_pool);
+    };
+
+    // Interval 1 has no FIFO and a zero timestamp is ignored.
+    slices[0].ts = 0;
+    poll(0, IBV_WC_SUCCESS, 1, 1);
+    EXPECT_EQ(rail.completions.load(), 1);
+    EXPECT_EQ(rail.latency_ns.load(), 0);
+
+    const auto post_ts = getCurrentTimeInNano();
+    slices[3].ts = post_ts;
+    RdmaEndPointTestPeer::seedPostedFifo(endpoint,
+                                         {&slices[1], &slices[2], &slices[3]});
+    const auto poll_ts = poll(3, IBV_WC_SUCCESS, 4, 3);
+    ASSERT_GT(poll_ts, static_cast<uint64_t>(post_ts));
+    const auto latency = 3 * (poll_ts - post_ts);
+    EXPECT_EQ(rail.completions.load(), 4);
+    EXPECT_EQ(rail.bytes.load(), 10);
+    EXPECT_EQ(rail.latency_ns.load(), latency);
+
+    // The FIFO suppresses a CQE for an already retired WR.
+    poll(3, IBV_WC_SUCCESS, 4, 0);
+    EXPECT_EQ(rail.completions.load(), 4);
+    EXPECT_EQ(rail.bytes.load(), 10);
+
+    slices[5].ts = std::numeric_limits<int64_t>::max();
+    RdmaEndPointTestPeer::seedPostedFifo(endpoint, {&slices[4], &slices[5]});
+    poll(5, IBV_WC_REM_ACCESS_ERR, 4, 2);
+    poll(6, IBV_WC_WR_FLUSH_ERR, 1, 1);
+    EXPECT_EQ(rail.completions.load(), 7);
+    EXPECT_EQ(rail.bytes.load(), 28);
+    EXPECT_EQ(rail.latency_ns.load(), latency);
+    EXPECT_EQ(rail.errors.load(), 1);
+}
+#endif
 
 TEST_F(RdmaEndPointStateTest, WaitingReadyAckIsConnectedButNotReadyToSend) {
     RdmaEndPointTestPeer::setStatus(*endpoint_,

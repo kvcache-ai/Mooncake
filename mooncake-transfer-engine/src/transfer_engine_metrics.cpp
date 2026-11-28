@@ -16,6 +16,8 @@
 #include <sstream>
 #include <vector>
 
+#include "rail_metrics.h"
+
 namespace mooncake {
 
 std::atomic<bool> TransferEngineMetrics::collection_enabled_{false};
@@ -76,6 +78,10 @@ TransferEngineMetrics::TransferEngineMetrics() {
         exporter_.addHistogram(&dir->size_bytes);
     }
     exporter_.setSummaryProvider([this]() { return buildSummary(); });
+    if (auto* rails = RailMetricsRegistry::instanceIfEnabled()) {
+        exporter_.addTextSource(
+            [rails](std::string& out) { rails->appendPrometheus(out); });
+    }
 }
 
 void TransferEngineMetrics::initializeFromEnv() {
