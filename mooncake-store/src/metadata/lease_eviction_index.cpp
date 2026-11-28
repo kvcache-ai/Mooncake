@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -43,6 +45,12 @@ constexpr uint64_t kFibonacciMultiplier = 11400714819323198485ULL;
 // Sampled age-band cutoff activates only above this population size.
 constexpr size_t kBandThresholdKeys = 262'144;
 constexpr size_t kSampleShards = 4;
+// Waves a walk on the range cursor takes, once every due rank is scheduled,
+// only to revisit entries refiled into buckets it already read. One meets a
+// read renewal found at its stale rank again; writes that keep refiling keys
+// into due buckets (a written postponed key goes back to its lease's rank)
+// would hold a walk without a bound.
+constexpr uint32_t kMaxRevisitWaves = 1;
 
 // Encodes and checks `Entry::identity` values so bit layout stays in one place:
 // - Bit 63 == 0: standalone publication (`KeySlot::generation` masked to 63b).
@@ -184,7 +192,9 @@ class Group {
 };
 
 // Per-shard hash table of non-empty 100ms buckets, with a 1-entry hot cache so
-// consecutive writes in the same tick bypass hash lookup.
+// consecutive writes in the same tick bypass hash lookup. Their ranks are also
+// kept in order, touched only as a bucket comes or goes, so a serial walk can
+// take the shard's buckets oldest first without visiting them all.
 class Buckets {
    public:
     struct Bucket {
@@ -221,6 +231,7 @@ class Buckets {
             if (hot_bucket_->Empty()) {
                 hot_bucket_ = nullptr;
                 buckets_.erase(rank);
+                ranks_.erase(rank);
                 ShrinkBucketsIfSparse(buckets_);
             }
             return;
@@ -246,6 +257,7 @@ class Buckets {
             if (hot_bucket_->Empty()) {
                 hot_bucket_ = nullptr;
                 buckets_.erase(rank);
+                ranks_.erase(rank);
                 ShrinkBucketsIfSparse(buckets_);
             }
             return;
@@ -285,12 +297,24 @@ class Buckets {
 
     [[nodiscard]] const Map& map() const { return buckets_; }
 
+    // The rank of the first bucket at or after `from`, if there is one.
+    [[nodiscard]] std::optional<Rank> FirstFrom(Rank from) const {
+        const auto it = ranks_.lower_bound(from);
+        if (it == ranks_.end()) {
+            return std::nullopt;
+        }
+        return *it;
+    }
+
    private:
     Bucket& GetOrCreate(Rank rank) {
         if (hot_bucket_ != nullptr && hot_rank_ == rank) {
             return *hot_bucket_;
         }
-        auto [it, _] = buckets_.try_emplace(rank);
+        auto [it, inserted] = buckets_.try_emplace(rank);
+        if (inserted) {
+            ranks_.insert(rank);
+        }
         hot_rank_ = rank;
         hot_bucket_ = &it->second;
         return *hot_bucket_;
@@ -319,12 +343,15 @@ class Buckets {
             if (hot_bucket_ == &it->second) {
                 hot_bucket_ = nullptr;
             }
+            ranks_.erase(it->first);
             buckets_.erase(it);
             ShrinkBucketsIfSparse(buckets_);
         }
     }
 
     Map buckets_;
+    // The keys of `buckets_`, in order.
+    std::set<Rank> ranks_;
     Rank hot_rank_ = std::numeric_limits<Rank>::min();
     Bucket* hot_bucket_ = nullptr;
 };
@@ -512,7 +539,10 @@ struct LeaseEvictionIndex::LockedShard {
 
 // Walks due (rank, shard) buckets in ascending rank order, either serially via
 // Next() or across parallel workers via VisitRange(). The initial wave schedule
-// is built eagerly at construction; Widen() runs only after workers join.
+// is built eagerly at construction, from every bucket of every shard, which a
+// walk on workers needs and a serial one does not (SerialCursor);
+// Widen() runs only after workers join, and once every due rank is scheduled
+// it revisits refiled entries kMaxRevisitWaves times at most.
 class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
    public:
     ShardedCursor(const LeaseEvictionIndex& index, Rank last_rank,
@@ -547,11 +577,7 @@ class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
 
     bool StillAt(const route::WriteGuard& guard,
                  const Entry& entry) const override {
-        if (!guard.has_object() ||
-            !EntryIdentity::MatchesSlot(entry.identity, guard)) {
-            return false;
-        }
-        return RankOf(guard.metadata()) <= entry.rank;
+        return StillFiledAt(guard, entry);
     }
 
     size_t Total() const override { return total_; }
@@ -580,6 +606,12 @@ class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
     bool Widen() override {
         if (total_ == 0) {
             return false;
+        }
+        if (band_rank_ == last_rank_) {
+            if (revisit_waves_ >= kMaxRevisitWaves) {
+                return false;
+            }
+            ++revisit_waves_;
         }
 
         // Record the shard sequence each visited bucket observed so only
@@ -781,11 +813,160 @@ class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
     std::array<uint64_t, kShards> born_cutoff_{};
     std::array<uint64_t, kShards> wave_seq_{};
     Rank band_rank_ = 0;
+    // Waves taken only to revisit refiled entries (kMaxRevisitWaves).
+    uint32_t revisit_waves_ = 0;
     std::vector<WorkUnit> schedule_;
     size_t unit_idx_ = 0;
     CopiedBucket serial_copy_;
     size_t pos_ = 0;
     mutable std::atomic<uint64_t> examined_{0};
+};
+
+// --- Serial cursor ----------------------------------------------------------
+
+// Walks due buckets oldest first, (rank, shard) as the range cursor orders
+// them, reading each only when the walk gets to it: a heap holds the next due
+// rank of every shard, which keeps its ranks in order. So a run that meets its
+// goal in its first buckets reads only those, however many the index holds.
+//
+// Each shard's part of the walk only moves forward, past each bucket it reads
+// or finds gone. A key refiled ahead of it (a read renewal met at its stale
+// rank) is met again in its turn, or, if its shard had no due bucket left,
+// when the heap first runs dry: the cursor then looks once more, and only
+// once, for buckets filed ahead of where each shard's walk stands. A key
+// refiled behind it waits for the next walk. So writes that keep filing keys
+// into due buckets cannot hold the walk: each pop of a shard's head moves that
+// shard's walk past at least one due rank.
+class LeaseEvictionIndex::SerialCursor final : public Cursor {
+   public:
+    SerialCursor(const LeaseEvictionIndex& index, Rank last_rank)
+        : index_(index), last_rank_(last_rank) {
+        from_.fill(std::numeric_limits<Rank>::min());
+        heads_.reserve(kShards);
+        size_t total = 0;
+        for (uint16_t s = 0; s < kShards; ++s) {
+            const Shard& shard = index_.shards_[s];
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            born_cutoff_[s] = shard.seq;
+            total += shard.size;
+            AddHead(s, shard);
+        }
+        total_ = total;
+        std::make_heap(heads_.begin(), heads_.end(), std::greater<>());
+    }
+
+    std::optional<Entry> Next() override {
+        while (pos_ == copy_.size()) {
+            if (!ReadNextBucket()) {
+                return std::nullopt;
+            }
+        }
+        return copy_[pos_++];
+    }
+
+    bool StillAt(const route::WriteGuard& guard,
+                 const Entry& entry) const override {
+        return StillFiledAt(guard, entry);
+    }
+
+    size_t Total() const override { return total_; }
+
+   private:
+    // A shard's next due rank as last seen, and the shard.
+    using Head = std::pair<Rank, uint16_t>;
+
+    // Under `shard`'s lock: appends its first due bucket from where its walk
+    // stands to `heads_`, out of heap order, if it has one.
+    bool AddHead(uint16_t s, const Shard& shard) {
+        const std::optional<Rank> rank = shard.buckets.FirstFrom(from_[s]);
+        if (!rank || *rank > last_rank_) {
+            return false;
+        }
+        heads_.emplace_back(*rank, s);
+        return true;
+    }
+
+    void PushHead(Head head) {
+        heads_.push_back(head);
+        std::push_heap(heads_.begin(), heads_.end(), std::greater<>());
+    }
+
+    // Copies the next due bucket into `copy_`; false once there is none.
+    bool ReadNextBucket() {
+        copy_.Clear();
+        pos_ = 0;
+        while (!heads_.empty() || Refill()) {
+            std::pop_heap(heads_.begin(), heads_.end(), std::greater<>());
+            const Head head = heads_.back();
+            heads_.pop_back();
+            const uint16_t s = head.second;
+            const Shard& shard = index_.shards_[s];
+            {
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                // The shard's head may have changed since it was queued. If
+                // the bucket queued went, nothing is filed between where the
+                // shard's walk stood and it, so the walk moves past it.
+                const std::optional<Rank> rank =
+                    shard.buckets.FirstFrom(from_[s]);
+                if (!rank || *rank > head.first) {
+                    from_[s] = head.first + 1;
+                    if (!rank || *rank > last_rank_) {
+                        continue;
+                    }
+                    const Head now_first{*rank, s};
+                    if (!heads_.empty() && heads_.front() < now_first) {
+                        PushHead(now_first);
+                        continue;
+                    }
+                }
+                shard.buckets.ReadMatching(*rank, born_cutoff_[s],
+                                           /*min_refile_seq=*/0, copy_);
+                from_[s] = *rank + 1;
+                if (AddHead(s, shard)) {
+                    std::push_heap(heads_.begin(), heads_.end(),
+                                   std::greater<>());
+                }
+            }
+            if (copy_.size() != 0) {
+                copy_.Seal();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The first time no shard is known to have a due bucket left, and only
+    // then: looks again, in each shard whose walk has not passed the last due
+    // rank, for a bucket filed since ahead of where that walk stands.
+    bool Refill() {
+        if (refilled_) {
+            return false;
+        }
+        refilled_ = true;
+        for (uint16_t s = 0; s < kShards; ++s) {
+            if (from_[s] > last_rank_) {
+                continue;
+            }
+            const Shard& shard = index_.shards_[s];
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            AddHead(s, shard);
+        }
+        std::make_heap(heads_.begin(), heads_.end(), std::greater<>());
+        return !heads_.empty();
+    }
+
+    const LeaseEvictionIndex& index_;
+    const Rank last_rank_;
+    size_t total_ = 0;
+    std::array<uint64_t, kShards> born_cutoff_{};
+    // Where each shard's walk stands: the rank after the last bucket read.
+    std::array<Rank, kShards> from_{};
+    // A min-heap on (rank, shard), at most one head per shard.
+    std::vector<Head> heads_;
+    // Whether Refill() has looked once more.
+    bool refilled_ = false;
+    CopiedBucket copy_;
+    size_t pos_ = 0;
 };
 
 // --- LeaseEvictionIndex public contract & shard routing ---------------------
@@ -812,6 +993,9 @@ void LeaseEvictionIndex::OnRead(const route::ReadGuard&) {}
 
 void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
     route::SlotEvictionState& state = guard.owner_state().eviction;
+    // Set only by a Postpone under this very guard: this release is the one
+    // that follows it. Every later write files the key by its lease again.
+    const bool postponed = std::exchange(state.postponed, false);
     if (!guard.has_object() || !Qualifies(guard.metadata())) {
         if (state.filed) {
             LockRecordedShard(state).shard.Unfile(guard.slot(), state);
@@ -826,6 +1010,11 @@ void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
         EntryIdentity::ForStandalone(guard.generation());
 
     if (Shard::IsSameFiledEntry(state, group_lease, standalone_id)) {
+        // The release that follows Postpone leaves the key where it was put,
+        // unless its lease now runs out later still.
+        if (postponed && group_lease == nullptr && rank <= state.rank) {
+            return;
+        }
         if (rank != state.rank) {
             LockRecordedShard(state).shard.UpdateRank(guard.slot(), state,
                                                       rank);
@@ -848,9 +1037,29 @@ void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
     }
 }
 
+void LeaseEvictionIndex::Postpone(const route::WriteGuard& guard,
+                                  Clock::time_point not_before) {
+    route::SlotEvictionState& state = guard.owner_state().eviction;
+    // A group stays where its shared lease files it.
+    if (!state.filed || state.group != nullptr) {
+        return;
+    }
+    // A refile within the key's own shard, as a rank update is: a later wave
+    // of a walk that already copied the old bucket meets it again only if
+    // the new rank is due, which a postponed key's is not. A key filed later
+    // already (by a run that met it first, or by its lease) stays there.
+    const Rank rank = BucketOf(not_before);
+    if (rank > state.rank) {
+        LockRecordedShard(state).shard.UpdateRank(guard.slot(), state, rank);
+    }
+    // Marked either way, so that the release of this guard, which files the
+    // key by its lease unless it is marked, leaves it where it is.
+    state.postponed = true;
+}
+
 std::unique_ptr<EvictionIndex::Cursor> LeaseEvictionIndex::Scan(
     Clock::time_point now) const {
-    return ScanRanges(now, /*target=*/0);
+    return std::make_unique<SerialCursor>(*this, BucketOf(now));
 }
 
 std::unique_ptr<EvictionIndex::RangeCursor> LeaseEvictionIndex::ScanRanges(
@@ -915,6 +1124,15 @@ uint16_t LeaseEvictionIndex::ShardForGroupLease(const Lease* group_lease) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(group_lease));
     return static_cast<uint16_t>((addr * kFibonacciMultiplier) >>
                                  (64 - kShardBits));
+}
+
+bool LeaseEvictionIndex::StillFiledAt(const route::WriteGuard& guard,
+                                      const Entry& entry) {
+    if (!guard.has_object() ||
+        !EntryIdentity::MatchesSlot(entry.identity, guard)) {
+        return false;
+    }
+    return RankOf(guard.metadata()) <= entry.rank;
 }
 
 Rank LeaseEvictionIndex::RankOf(const ObjectMetadata& metadata) {

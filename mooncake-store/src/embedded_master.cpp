@@ -87,6 +87,13 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         wms_cfg.enable_offload = config.enable_offload.has_value()
                                      ? config.enable_offload.value()
                                      : false;
+        if (config.offload_on_evict.has_value()) {
+            wms_cfg.offload_on_evict = config.offload_on_evict.value();
+        }
+        if (config.offload_on_evict_async.has_value()) {
+            wms_cfg.offload_on_evict_async =
+                config.offload_on_evict_async.value();
+        }
         wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
         wms_cfg.eviction_high_watermark_ratio =
             config.eviction_high_watermark_ratio.has_value()

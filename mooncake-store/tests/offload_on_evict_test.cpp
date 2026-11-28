@@ -4,6 +4,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -77,6 +79,57 @@ class OffloadOnEvictTest : public ::testing::Test {
         return queued;
     }
 };
+
+// A key whose memory replica an offload in flight holds has nothing to
+// release, so memory eviction skips it and postpones it
+// (EvictionIndex::Postpone) instead of locking and judging it again every
+// round. Every round opens with the sweep for expired work, which walks the
+// keys with work in flight; it write-held each of them, and the release of
+// each hold filed the key by its lease again. It holds for writing only the
+// keys whose work it ends.
+TEST_F(OffloadOnEvictTest, TheExpirySweepLeavesAnInFlightOffloadPostponed) {
+    MasterServiceConfig config;
+    config.enable_offload = true;  // PutEnd queues the offload.
+    config.default_kv_lease_ttl = 0;
+    config.put_start_release_timeout_sec = 60;
+    auto service = std::make_unique<MasterService>(config);
+    MasterServiceTestPeer peer(*service);
+    // The test drives every round.
+    peer.EvictionRunning(*service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(*service).joinable()) {
+        peer.EvictionThread(*service).join();
+    }
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              16 * 1024 * 1024);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    std::vector<std::string> keys;
+    for (int i = 0; i < 4; ++i) {
+        keys.push_back("in_flight_" + std::to_string(i));
+        PutObject(*service, ctx.client_id, keys.back());
+    }
+    // Every look at the index is as of one time, before the round: a postponed
+    // key is filed later than that however slow the test runs.
+    const auto at = std::chrono::system_clock::now();
+    const auto due = [&] {
+        auto due = peer.DueEvictionKeysForTesting(TenantId::Default(), at);
+        std::sort(due.begin(), due.end());
+        return due;
+    };
+    ASSERT_EQ(due(), keys);
+
+    // Each key's offload holds its one replica: skipped, postponed, kept.
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    ASSERT_TRUE(due().empty());
+
+    // The next round's sweep finds nothing expired and leaves them there.
+    peer.DiscardExpiredForTesting(at);
+    EXPECT_TRUE(due().empty());
+
+    // A sweep that ends the expired offloads writes the keys, which files
+    // them by their leases again.
+    peer.DiscardExpiredForTesting(at + std::chrono::minutes(2));
+    EXPECT_EQ(due(), keys);
+}
 
 // =============================================================================
 // UpsertStart interaction with an outstanding offload task.

@@ -104,6 +104,11 @@ bool LocalSsdTaskMailbox::TouchPromotion(const TenantId& tenant_id,
     return true;
 }
 
+bool LocalSsdTaskMailbox::OffloadingEnabled() const {
+    MutexLocker lock(&mutex_);
+    return enable_offloading_;
+}
+
 void LocalSsdTaskMailbox::RequestRemoveAll() {
     MutexLocker lock(&mutex_);
     pending_remove_all_ = true;
@@ -152,6 +157,16 @@ std::vector<UUID> LocalSsdManager::GetClientIds() const {
     client_ids.reserve(clients_.size());
     for (const auto& [client_id, record] : clients_) {
         client_ids.push_back(client_id);
+    }
+    return client_ids;
+}
+
+std::vector<UUID> LocalSsdManager::GetOffloadingClientIds() const {
+    std::vector<UUID> client_ids;
+    for (const auto& client : SnapshotClients()) {
+        if (client.record->mailbox.OffloadingEnabled()) {
+            client_ids.push_back(client.client_id);
+        }
     }
     return client_ids;
 }

@@ -297,6 +297,21 @@ DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_bool(offload_on_evict_async, false,
+            "Asynchronous offload-on-evict (needs --offload_on_evict=true and "
+            "no OpLog): queued offloads count toward each eviction round, "
+            "each store has at most offloading_queue_limit x "
+            "offload_cap_ratio copies in flight, and memory is freed as its "
+            "copy lands");
+DEFINE_uint64(offload_on_evict_stall_ms, 30000,
+              "Async offload-on-evict: a store whose copies in flight have not "
+              "ended (landed, failed or been cancelled) for this long is "
+              "stalled: it gets no new copies and its copies count as used "
+              "memory. Keep it at least 3x the stores' heartbeat interval");
+DEFINE_uint64(offload_on_evict_backoff_ms, 200,
+              "Async offload-on-evict: how long an eviction round that queued "
+              "and freed nothing holds back the next one, unless a copy ends "
+              "sooner");
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -644,6 +659,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
+    default_config.GetBool("offload_on_evict_async",
+                           &master_config.offload_on_evict_async,
+                           FLAGS_offload_on_evict_async);
+    default_config.GetUInt64("offload_on_evict_stall_ms",
+                             &master_config.offload_on_evict_stall_ms,
+                             FLAGS_offload_on_evict_stall_ms);
+    default_config.GetUInt64("offload_on_evict_backoff_ms",
+                             &master_config.offload_on_evict_backoff_ms,
+                             FLAGS_offload_on_evict_backoff_ms);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
@@ -1017,6 +1041,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_cap_ratio = FLAGS_offload_cap_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict_async", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict_async = FLAGS_offload_on_evict_async;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict_stall_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict_stall_ms =
+            FLAGS_offload_on_evict_stall_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict_backoff_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict_backoff_ms =
+            FLAGS_offload_on_evict_backoff_ms;
     }
     if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
          !info.is_default) ||
@@ -1740,6 +1781,11 @@ int main(int argc, char* argv[]) {
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
+        << ", offload_on_evict_async=" << master_config.offload_on_evict_async
+        << ", offload_on_evict_stall_ms="
+        << master_config.offload_on_evict_stall_ms
+        << ", offload_on_evict_backoff_ms="
+        << master_config.offload_on_evict_backoff_ms
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec

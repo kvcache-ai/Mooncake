@@ -85,7 +85,8 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
         tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(key),
-                                        .size = size});
+                                        .size = size,
+                                        .token = {}});
     }
     return tasks;
 }
@@ -126,6 +127,11 @@ FileStorage::FileStorage(const FileStorageConfig& config,
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
+    }
+    if (!config_.lease_free_offload_source_read) {
+        LOG(INFO) << "MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ=0: the sources "
+                     "of async offload-on-evict copies are read with a read "
+                     "lease";
     }
 
     if (config.pinned_restore_arena_size > 0) {
@@ -823,15 +829,31 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
         for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
-            std::vector<std::string> user_keys;
-            user_keys.reserve(storage_keys.size());
+            // A copy the master queued with a token (async offload-on-evict)
+            // is read without a read lease: its source is pinned and the
+            // master registers only that copy. The rest take the lease.
+            std::vector<std::string> leased_keys;
+            std::vector<std::string> lease_free_keys;
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key.at(storage_key).key);
+                const auto& task = task_by_storage_key.at(storage_key);
+                const bool lease_free =
+                    config_.lease_free_offload_source_read &&
+                    task.token.has_value();
+                (lease_free ? lease_free_keys : leased_keys)
+                    .push_back(task.key);
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object);
+            if (!leased_keys.empty()) {
+                [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+                    leased_keys, tenant_id, user_batch_object,
+                    /*lease_free=*/false);
+            }
+            if (!lease_free_keys.empty()) {
+                [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+                    lease_free_keys, tenant_id, user_batch_object,
+                    /*lease_free=*/true);
+            }
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
@@ -1960,8 +1982,11 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    bool lease_free) {
+    auto batched_query_results =
+        lease_free ? client_->BatchQueryReadOnly(keys, tenant_id)
+                   : client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty()) {
         return {};
     }

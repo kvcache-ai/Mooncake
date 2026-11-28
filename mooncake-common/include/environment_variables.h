@@ -25,6 +25,10 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint32_t,
                       MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS);
+    // Read the source of an async offload-on-evict copy (one the master
+    // queued with a token) without a read lease; default on, 0 opts out
+    // (FileStorageConfig::lease_free_offload_source_read).
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ);
 
     // Keep legacy bool/ratio values as strings so their custom parsing and
     // silent invalid-value behavior remain unchanged.

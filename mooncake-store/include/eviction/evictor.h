@@ -29,12 +29,17 @@
 // entries, so it never stops halfway through a group's deferred members.
 //
 // Serial execution holds at most one key lock at a time. Range workers hold
-// one per worker; callbacks must support parallel execution. All
+// one per worker; callbacks must support parallel execution. A run whose
+// callbacks support it walks the index's range cursor, which schedules the
+// due part of the index before it starts, on one worker or several; a serial
+// run walks the index's serial cursor, which reads the index only as far as
+// the walk goes. All
 // replicas are freed outside their key lock and workers join before fallback.
 // Parallel runs serialize access to their persistent pool. What the caller
 // holds across Run, it holds for the whole run.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -67,26 +72,50 @@ struct ObjectGoal {
     // short of this share, and only once nothing else qualifies. A minimum
     // above the target is lowered to it.
     double min_ratio = 0;
+    // Count an object queued for offload (Outcome::kOffloadQueued) as freed:
+    // its memory goes once the copy lands, and a run that did not count it
+    // would walk on past its share and queue everything it meets. An object
+    // the reclaimer keeps (Outcome::kKept) keeps its rank, so the oldest
+    // objects stay first in line for the room that frees up next. A range
+    // walk counts them the same way, though the OffloadingReclaimer, the one
+    // that queues offloads, keeps its runs serial.
+    bool count_queued = false;
 };
 
 // How much a run in one namespace frees, in released bytes: from the objects
 // the policy takes outright, then from those it deferred.
 struct ByteGoal {
     uint64_t target_bytes = 0;
+    // As ObjectGoal::count_queued, in the bytes pinned for offload.
+    bool count_queued = false;
 };
 
 class Evictor {
    public:
-    // Everything given outlives the evictor.
+    // How long memory eviction passes over a key it skipped as soft-pinned
+    // or with nothing to release (or until the key is written), so runs
+    // under pressure don't re-lock it.
+    static constexpr Clock::duration kSkippedKeyBackoff =
+        std::chrono::seconds(1);
+
+    // Everything given outlives the evictor. With `postpone_skipped` above
+    // zero, a run postpones each key it skips as soft-pinned or with nothing
+    // to release that long (EvictionIndex::Postpone). The key moves in its
+    // namespace's index, which every evictor over that namespace walks, so an
+    // evictor whose skips do not hold for memory eviction (the KVCS DFS
+    // evictor, for which a memory-only key has nothing to release) must
+    // leave it at zero, the default.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
             Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,
-            uint32_t worker_threads = 0);
+            uint32_t worker_threads = 0,
+            Clock::duration postpone_skipped = Clock::duration::zero());
     ~Evictor();
     Evictor(const Evictor&) = delete;
     Evictor& operator=(const Evictor&) = delete;
 
     // Evicts within `scope`, or in `tenant_id`'s namespace, until `goal` is
-    // met, nothing more qualifies, or an OpLog write fails. Namespaces created
+    // met, nothing more qualifies, an OpLog write fails, or the reclaimer can
+    // take nothing more (Report::exhausted). Namespaces created
     // during the run join the next one.
     Report Run(const Scope& scope, const ObjectGoal& goal);
     Report Run(const TenantId& tenant_id, const ByteGoal& goal);
@@ -111,6 +140,8 @@ class Evictor {
     // 0 = ceil(filed keys / 16M), capped at 64. Explicit values aid local
     // scaling tests. Policy/reclaimer/observers must permit parallel callbacks.
     const uint32_t worker_threads_;
+    // Zero: skipped keys stay where they are filed.
+    const Clock::duration postpone_skipped_;
     std::unique_ptr<ThreadPool> workers_;
     std::mutex run_mutex_;
 };

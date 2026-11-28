@@ -285,13 +285,20 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    // Async offload-on-evict: the master's id for this one copy; absent for
+    // write-through and legacy offload-on-evict copies, for rescans, and
+    // from older masters. A store reads the source of a copy that has one
+    // without a read lease, and reports the copy with it, so the master
+    // registers only the copy it is still waiting for. A compatible field,
+    // so peers on either side of the change still talk.
+    struct_pack::compatible<uint64_t, 1> token;
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
                size == other.size;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, token);
 
 struct PromotionTaskItem {
     std::string tenant_id;

@@ -357,6 +357,17 @@ struct FileStorageConfig {
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
 
+    // Look up the source of a copy the master queued with a token (async
+    // offload-on-evict) with the read-only replica query, which grants no
+    // read lease. The lease deadline is the eviction order, so the lease the
+    // store's own read took made an object it was evicting look like the
+    // most recently read one. The offload task's refcount pin keeps the
+    // source alive during the copy, and the token keeps the master from
+    // registering a copy whose source went away meanwhile. Copies without a
+    // token (write-through, legacy offload-on-evict, older masters) take the
+    // lease as before. MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ=0 opts out.
+    bool lease_free_offload_source_read = true;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 

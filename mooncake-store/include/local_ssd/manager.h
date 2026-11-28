@@ -35,6 +35,9 @@ class LocalSsdTaskMailbox {
     void RequestRemoveAll();
     bool ConsumeRemoveAll();
 
+    // Whether the store last said it accepts offloads.
+    bool OffloadingEnabled() const;
+
    private:
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
@@ -74,6 +77,8 @@ class LocalSsdManager {
     // UUIDs of all registered LocalSSD clients. Used to rebuild client
     // liveness records after an HA snapshot restore.
     std::vector<UUID> GetClientIds() const;
+    // UUIDs of the registered clients whose stores accept offloads now.
+    std::vector<UUID> GetOffloadingClientIds() const;
 
     tl::expected<CapacityChange, ErrorCode> ReportCapacity(
         const UUID& client_id, int64_t bytes);

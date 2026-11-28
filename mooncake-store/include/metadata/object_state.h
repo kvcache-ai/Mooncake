@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
@@ -27,6 +28,13 @@ struct ObjectState {
     // An in-place overwrite invalidates the old contents even if a pending
     // REMOVED replica still retains their tier. Consumed on write release.
     bool kv_content_invalidated{false};
+    // Async offload-on-evict: eviction does not try to queue this object's
+    // offload again before this second of the system clock (0: no wait), set
+    // when its copy failed or could not be queued for a reason other than a
+    // full destination. Unlike postponing the key in the eviction index, it
+    // leaves the key's rank alone, and a round that may drop (force_evict
+    // under pressure) ignores it. Fits in the padding after the fields above.
+    uint32_t offload_retry_after{0};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
@@ -42,6 +50,27 @@ struct ObjectState {
     bool HasWorkInFlight() const {
         return is_processing || replication_task || offloading_task ||
                promotion_task;
+    }
+
+    // Whether eviction may try to queue this object's offload at `now`.
+    bool OffloadRetryDue(std::chrono::system_clock::time_point now) const {
+        return offload_retry_after == 0 ||
+               SecondsOf(now) >= offload_retry_after;
+    }
+    // Holds eviction's next offload attempt back until at least `until`.
+    void DelayOffloadRetry(std::chrono::system_clock::time_point until) {
+        offload_retry_after = SecondsOf(until) + 1;
+    }
+
+   private:
+    static uint32_t SecondsOf(std::chrono::system_clock::time_point at) {
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                 at.time_since_epoch())
+                                 .count();
+        return seconds <= 0 ? 0
+               : seconds >= std::numeric_limits<uint32_t>::max() - 1
+                   ? std::numeric_limits<uint32_t>::max() - 1
+                   : static_cast<uint32_t>(seconds);
     }
 };
 

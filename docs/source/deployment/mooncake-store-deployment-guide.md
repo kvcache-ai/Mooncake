@@ -885,7 +885,7 @@ mooncake_master \
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
-| `--eviction_worker_threads` | `0` | Threads per memory eviction pass; `0` picks one per 16M keys (1–64), `1`–`64` sets the count |
+| `--eviction_worker_threads` | `0` | Threads per memory eviction pass; `0` picks one per 16M keys (1–64), `1`–`64` sets the count. No effect with `--offload_on_evict` (async or not) or `--enable_oplog`: those passes stay serial |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -958,6 +958,9 @@ Flags for controlling data movement between DRAM and SSD.
 | `--offload_force_evict` | `false` | Force-evict objects exceeding capacity without offload |
 | `--offloading_queue_limit` | `50000` | Max number of objects allowed in the offloading queue per local disk segment. Increase to allow more objects to be offloaded to SSD before force-eviction kicks in |
 | `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of `offloading_queue_limit` (range `[0.0, 1.0]`). Controls how many objects can be queued for offload in a single eviction cycle before falling back to force-evict |
+| `--offload_on_evict_async` | `false` | Asynchronous offload-on-evict (needs `--offload_on_evict=true`, no OpLog): queued offloads count toward each eviction cycle, each store has at most `offloading_queue_limit * offload_cap_ratio` copies in flight, and memory is freed as its copy lands. See the SSD offload guide |
+| `--offload_on_evict_stall_ms` | `30000` | Async offload-on-evict: a store none of whose copies has ended (landed, failed, cancelled) for this long is stalled and gets no new copies. Keep it at least 3x the stores' heartbeat interval |
+| `--offload_on_evict_backoff_ms` | `200` | Async offload-on-evict: how long a cycle that queued and freed nothing holds back the next one |
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
 | `--promotion_admission_threshold` | `2` | Min CountMinSketch count to allow promotion (`1` = disable gating) |
 | `--promotion_max_per_heartbeat` | `1` | Max promotion tasks handed to a single client per heartbeat. Each task is a synchronous SSD-read + RDMA-write on the client; serializing them avoids blocking past the client-liveness window |

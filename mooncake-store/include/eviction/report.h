@@ -48,6 +48,9 @@ struct Effect {
     uint64_t offload_bytes = 0;
     // The object holds nothing valid any more and must be torn down.
     bool needs_teardown = false;
+    // Nothing later in this run can be helped either (every offload
+    // destination is full): the run ends after this object.
+    bool exhausted = false;
     // The replicas taken off the object, freed when this is destroyed.
     std::vector<Replica> detached;
 
@@ -73,6 +76,9 @@ struct Report {
     uint64_t offload_rejected_drops = 0;
     // An OpLog write failed and cut the run short.
     bool stopped = false;
+    // The reclaimer could take nothing more (see Effect::exhausted) and the
+    // run ended early, leaving the keys where they are filed.
+    bool exhausted = false;
     uint64_t visited = 0;
     uint64_t moved = 0;
     uint64_t busy =
@@ -98,6 +104,7 @@ struct Report {
         offload_cap_drops += other.offload_cap_drops;
         offload_rejected_drops += other.offload_rejected_drops;
         stopped = stopped || other.stopped;
+        exhausted = exhausted || other.exhausted;
         visited += other.visited;
         moved += other.moved;
         busy += other.busy;
@@ -115,6 +122,9 @@ struct Report {
         offload_bytes += effect.offload_bytes;
         if (effect.released_bytes > 0) {
             ++evicted_objects;
+        }
+        if (effect.exhausted) {
+            exhausted = true;
         }
         if (effect.reason == DropReason::kOffloadCap) {
             ++offload_cap_drops;

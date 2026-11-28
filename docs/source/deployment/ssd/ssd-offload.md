@@ -115,6 +115,9 @@ These flags control when the master asks clients to persist objects to SSD, whet
 | `--offload_force_evict` | `false` | If offload-on-evict exceeds the per-cycle offload cap, force-evict excess objects instead of leaving them in DRAM |
 | `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
 | `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle |
+| `--offload_on_evict_async` | `false` | Asynchronous offload-on-evict, see {ref}`below <ssd-offload-async-offload-on-evict>`. Needs `--offload_on_evict=true` and no OpLog |
+| `--offload_on_evict_stall_ms` | `30000` | Async offload-on-evict: a store none of whose copies has ended for this long is stalled. Must be greater than `0` |
+| `--offload_on_evict_backoff_ms` | `200` | Async offload-on-evict: how long a cycle that queued and freed nothing holds back the next one |
 | `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
 | `--promotion_admission_threshold` | `2` | Minimum CountMinSketch count before promotion is admitted. Set `1` to disable second-touch gating |
 | `--promotion_max_per_heartbeat` | `1` | Maximum promotion tasks returned to one client per heartbeat. Keep conservative for large objects because each task does SSD read plus memory write |
@@ -122,7 +125,85 @@ These flags control when the master asks clients to persist objects to SSD, whet
 
 Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
 
----
+(ssd-offload-async-offload-on-evict)=
+
+### Asynchronous offload-on-evict (`--offload_on_evict_async`)
+
+Plain `--offload_on_evict=true` cannot keep up with a high put rate: an object queued for offload frees nothing until its copy lands, so every eviction cycle walks past its target and queues every expired object it meets; the trigger fires again every 10 ms while the copies are in flight; and the store's own read of the source grants the object a read lease, which moves it to the newest end of the eviction order, so its memory is freed only after the rest of DRAM has rotated through. Puts then wait on allocation failures.
+
+`--offload_on_evict_async=true` (default `false`) changes how eviction drives the offloads:
+
+| | `--offload_on_evict=true` | with `--offload_on_evict_async=true` |
+|---|---|---|
+| Cycle target | Queued objects do not count; the cycle queues every candidate | A queued object counts toward the target (`--eviction_ratio` of the objects, more when usage overshoots the watermark) |
+| Trigger | Memory usage over `--eviction_high_watermark_ratio`, or an allocation failure | Usage **minus the memory whose copy is in flight to a store that is not stalled** over the watermark, or an allocation failure. An allocation failure while at least `--eviction_ratio` of DRAM is in flight to stores that ended a copy (or got their first) within `max(5 x --offload_on_evict_backoff_ms, 1 s)` (at most `--offload_on_evict_stall_ms`) waits for those copies (a cycle then frees only objects already on disk); a store quiet for longer is not waited on |
+| Copies in flight | Unbounded (the mailbox limit only bounds what a store has not picked up yet) | At most `--offloading_queue_limit` x `--offload_cap_ratio` objects per store; a full store holds back only its own objects. A store none of whose copies has ended (landed, failed or been cancelled) for `--offload_on_evict_stall_ms` is stalled: it gets no more copies, and its copies in flight count as used memory, until one ends |
+| Memory freed | By a later cycle, once the store's read lease ran out | When the copy lands (`NotifyOffloadSuccess`), unless the object was read, pinned or taken by another task meanwhile, in which case eviction judges it again later |
+| `--offload_force_evict` | Drops past the per-cycle cap, also on watermark cycles | Drops an object it cannot queue only after a failed allocation (or with usage past halfway from the watermark to full) |
+| A cycle that achieved nothing | Retried every 10 ms | The next one waits `--offload_on_evict_backoff_ms`, or until a copy ends |
+| Victim order | Oldest lease first | Oldest lease first, also under sustained overload: an object kept because its store is full keeps its place for the next room, and a cycle ends once every store is full |
+
+Requirements and fallback: the master needs `--enable_offload=true` and `--offload_on_evict=true` and must not run with the OpLog (`--enable_oplog`), which uses its own reclaimer. If any is missing, the master logs one warning at startup and keeps the configured mode. HA with leader election and no OpLog is supported (see the failover caveat below). With the requirements met, `--offloading_queue_limit` x `--offload_cap_ratio` must be at least `1` and `--offload_on_evict_stall_ms` above `0`, or the master refuses to start. Memory eviction with offload-on-evict, async or not, walks the eviction index on one thread: `--eviction_worker_threads` does not apply to it. The three master settings can also be set in the master's configuration file (`offload_on_evict_async`, `offload_on_evict_stall_ms`, `offload_on_evict_backoff_ms`).
+
+| Setting | Where | Default | Description |
+|---|---|---|---|
+| `--offload_on_evict_async` | master | `false` | The behaviour above. The master hands each copy to its store with a token (`OffloadTaskItem::token`, a struct_pack compatible field, so older stores and masters still interoperate) and registers a landed copy only if its task still carries that token: the report of a copy whose object was removed or replaced, or whose task failed or expired, never creates or overwrites the key |
+| `MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ` | real clients | `true` | A real client reads the source replica of a copy that carries a token without taking a read lease, so the copy does not push the object to the newest end of the eviction order; the offload task pins the source during the copy. Copies without a token (write-through, plain offload-on-evict, older masters) take the lease as before. `0` opts out. Real clients built before the token ignore it and take the lease, which works, but every landing then finds the lease live and keeps the memory until a later cycle |
+| `--offload_on_evict_backoff_ms` | master | `200` | How long a cycle that queued and freed nothing holds back the next one, unless a copy ends sooner |
+| `--offload_on_evict_stall_ms` | master | `30000` | A store that has copies in flight and has ended none (nor received its first) for this long is stalled: a hung store, or a heartbeat reply that never reached it. Keep it at least three times the stores' `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` plus one bucket write (see the caveats) |
+| `--offloading_queue_limit` x `--offload_cap_ratio` | master | `50000` x `0.5` | Copies one store may have in flight. Each must cover what the store receives between two heartbeats, or eviction backs off (`master_offload_evict_no_room_total`) |
+| `--eviction_ratio` | master | `0.05` | Share of the evictable objects one cycle queues, plus the overshoot past the watermark. Also the amount in flight that makes an allocation failure wait for landings |
+| `--eviction_high_watermark_ratio` | master | `0.90` | The headroom above it (1 - ratio of DRAM) has to absorb the puts of one evict-to-land interval: the store's heartbeat pickup plus its bucket write |
+| `--offload_force_evict` | master | `false` | See the table above. Not recommended with this mode (see the caveats) |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | real clients | `10` | How often a store picks up its copies. Eviction hands work out in bursts, so a short interval (e.g. `1`) keeps the copies in flight, and the memory they pin, small |
+
+Example:
+
+```bash
+# master
+mooncake_master \
+    --rpc_port=50051 \
+    --enable_offload=true \
+    --offload_on_evict=true \
+    --offload_on_evict_async=true \
+    --offloading_queue_limit=20000 \
+    --offload_cap_ratio=0.5 \
+    --eviction_ratio=0.03 \
+    --eviction_high_watermark_ratio=0.9
+
+# every real client (lease-free source reads are on by default there)
+export MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1
+mooncake_client --enable_offload=true ...
+```
+
+Master metrics (only reported with the mode on):
+
+- `master_offload_evict_pending_bytes`, `master_offload_evict_pending_objects`: memory queued for offload whose copy has not ended.
+- `master_offload_evict_stalled_bytes`: of those, the bytes queued to stalled stores.
+- `master_offload_evict_freed_total`, `master_offload_evict_freed_bytes_total`: memory freed as copies landed. These frees are not counted in `master_evicted_key_count` / `master_evicted_size_bytes`, which count what the eviction cycles themselves released.
+- `master_offload_evict_kept_total{reason=read_again|pinned|busy}`: landed copies whose memory stayed.
+- `master_offload_evict_write_latency_ms`, `master_offload_evict_free_latency_ms`: from eviction queueing the copy to the copy being registered, and to its memory being freed as it landed. A copy whose memory stayed is not in the second.
+- `master_offload_evict_lease_wait_total`: landed copies whose memory stayed because a reader took a lease while the copy was written (`kept_total{reason=read_again}`); a later eviction frees it without another copy.
+- `master_offload_evict_no_room_total`: pushes refused because the store had its full share in flight (or has stalled).
+- `master_offload_evict_stale_landings_total`: copy reports whose token no task carries any more; never registered.
+- `master_offload_evict_round_skipped_total{reason=no_room|wait_for_landings|backoff}`: eviction ticks over the watermark that did not run a full cycle (`wait_for_landings`: a cycle that queues nothing new and frees only objects already on disk).
+- `master_offload_evict_waited_for_frees_total`: the `wait_for_landings` ticks alone.
+- `master_offload_evict_parked_total`: sources kept until their copy ended because their object was removed meanwhile.
+
+Caveats:
+
+- An object is written to SSD only when it leaves DRAM, so after a master restart without the OpLog the DRAM-only hot set is gone; write-through keeps it readable from SSD.
+- HA failover (leader election, no OpLog): the new leader does not know the copies the old one had in flight or their tokens. A store's later report of such a copy carries a token no task holds, so it is dropped as stale (`master_offload_evict_stale_landings_total`) and not registered: the new leader cannot tell whether the source stayed pinned while the store read it. The store's bucket still holds the copy, so a later copy of the same key is skipped by the store as a duplicate and reported as failed (the key stays in DRAM and is retried after 10 s) until the store's disk eviction removes that bucket, or the store re-registers its disk content after a restart or a re-mount (its rescan reports without tokens, which registers as before). The orphaned copies are at most what each store had in flight at the failover: `--offloading_queue_limit` x `--offload_cap_ratio` objects per store.
+- A remove of an object whose copy a store already took (`Remove`, forced or not, `RemoveAll`, `RemoveByRegex`, `BatchRemove`, `BatchReplicaClear`) succeeds at once, and a copy still queued is cancelled. The source's memory of a taken copy stays allocated, and charged to that store, until the copy is reported, its store's disk is unmounted, or it would have expired; the report registers nothing (`master_offload_evict_parked_total`). An upsert of such a key still waits for the copy (`OBJECT_HAS_REPLICATION_TASK`), as before.
+- Stall window: a store counts as stalled after `--offload_on_evict_stall_ms` in which none of its copies ended (landed, failed, or was cancelled or expired), and gets no new copies until one ends. A store's heartbeat alone does not count: a heartbeat reply lost on the way holds copies that will never land, and counting heartbeats would keep them in the in-flight discount until they expire. A store that took copies and then stays quiet longer than the window (several lost heartbeat replies, or a heartbeat interval at least as long as the window) is held there until a copy is reported or expires (`--put_start_release_timeout_sec`, 600 s by default); with a single store, eviction then frees only what is already on disk. The default window (30 s) is three times the default heartbeat interval (10 s); keep that ratio if you change either.
+- A store that hangs (or never receives its tasks) keeps getting copies until it counts as stalled, so it can pin up to its room (`--offloading_queue_limit` x `--offload_cap_ratio` objects) until the copies expire; a smaller stall window bounds how long the pool runs short meanwhile.
+- Overload: while every store is full and usage stays over the watermark, each eviction tick (10 ms) walks the expired objects again to find any already on disk, which keeps the eviction thread busy in proportion to the expired objects it walks.
+- Without `--offload_force_evict`, a failed allocation waits for the landings once `--eviction_ratio` of DRAM is in flight, so under sustained put pressure puts go only as fast as the stores pick up and land the copies they are handed. A store that waits a full `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` after every tick, including one that wrote, lands about one batch per interval, and puts then go no faster than with plain offload-on-evict; a store that polls again right after a tick that wrote keeps up. Run the stores with such adaptive offload polling, and a short heartbeat interval.
+- `--offload_force_evict` is not recommended with this mode. Under pressure a cycle stops counting queued copies toward its target and keeps queueing until every store is full, so SSD writes come in bursts, which raises read latency and the time from eviction to free; and, combined with a stall window too short for the heartbeat interval, a store judged stalled refuses copies that pressure cycles then drop.
+- A failed copy (`NotifyOffloadSuccess` NACK) releases the object's slot at once, and eviction does not queue the object again for 10 seconds, except a cycle that may drop it. A copy that is never reported is released by the offload task timeout (`--put_start_release_timeout_sec`), and a copy its store never picked up leaves the store's queue with it; unmounting a store's disk ends the copies queued to it at once.
+- A tenant's quota eviction subtracts what the tenant already has in flight to stores that are not stalled from its target, counts what it queues, and never drops.
+- The `[EVICT] No memory freed` warnings of a cycle that only queued copies are expected: the memory is freed as the copies land.
+- When the master declines to register a landed copy (stale token, removed object), the store's bucket still holds it until the store evicts the bucket; a later copy of the same key is then skipped by the store as a duplicate and reported as failed, so that key stays in DRAM (or is retried) until then. This is the same as for any registration the master refuses.
 
 ## SSD Offload Configuration
 
@@ -141,6 +222,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ` | `true` | Read the source of an async offload-on-evict copy without a read lease (see {ref}`Asynchronous offload-on-evict <ssd-offload-async-offload-on-evict>`); `0` opts out |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |

@@ -59,6 +59,7 @@
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
 #include "eviction/evictor.h"
+#include "eviction/offload_ledger.h"
 #include "eviction/offloading_reclaimer.h"
 #include "eviction/report_observers.h"
 
@@ -152,6 +153,13 @@ tl::expected<std::string, ErrorCode> GetResidencyAffinityIdForKey(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return config.residency_affinity_ids->at(key_index);
+}
+
+// Microseconds of the system clock since `since`.
+int64_t MicrosSince(std::chrono::system_clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now() - since)
+        .count();
 }
 
 }  // namespace
@@ -352,12 +360,28 @@ struct MasterService::MemoryEviction {
        public:
         explicit OffloadQueue(MasterService& service) : service_(service) {}
 
-        bool Push(const TenantId& tenant_id, const std::string& key,
-                  Replica& source, std::vector<UUID>* mirror_clients) override {
-            return service_
-                .PushOffloadingQueue(ObjectIdentity{tenant_id, key}, source,
-                                     mirror_clients)
-                .has_value();
+        // Async, each push checks its owner's room and takes a credit.
+        Pushed Push(const TenantId& tenant_id, const std::string& key,
+                    Replica& source,
+                    std::vector<UUID>* mirror_clients) override {
+            Pushed pushed;
+            const uint64_t token =
+                service_.offload_async_ ? service_.NextOffloadToken() : 0;
+            const auto queued = service_.PushOffloadingQueue(
+                ObjectIdentity{tenant_id, key}, source, mirror_clients,
+                service_.offload_async_ ? &pushed.credit : nullptr, token);
+            if (queued) {
+                pushed.result = Pushed::Result::kQueued;
+                pushed.token = token;
+            } else if (queued.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                pushed.result = Pushed::Result::kOwnerFull;
+            }
+            return pushed;
+        }
+
+        bool AllFull() const override {
+            return service_.offload_async_ &&
+                   !service_.AnyOffloadOwnerHasRoom();
         }
 
        private:
@@ -385,7 +409,8 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  {&metrics, &log}, settings.worker_threads) {}
+                  {&metrics, &log}, settings.worker_threads,
+                  eviction::Evictor::kSkippedKeyBackoff) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -395,6 +420,8 @@ struct MasterService::MemoryEviction {
     Policy policy;
     ImmediateReclaimer immediate;
     OpLogReclaimer oplog;
+    // Async offload-on-evict: the offloads queued and not yet ended.
+    eviction::OffloadLedger ledger;
     OffloadQueue offload_queue;
     eviction::OffloadingReclaimer offloading;
     eviction::MetricsObserver metrics;
@@ -443,6 +470,9 @@ struct MasterService::KvcsDfsEviction {
         : policy(service, allow_soft_pinned,
                  MemoryEviction::ReplicaKind::kKvcsDfs),
           reclaimer(service),
+          // Postpones nothing: it walks the index memory eviction walks, and
+          // a memory-only key it skips (nothing to release for it) is one
+          // memory eviction may take.
           evictor(service.namespaces_, policy, reclaimer, {&metrics}) {}
 
     MemoryEviction::Policy policy;
@@ -658,6 +688,59 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "cap will be evicted without disk offload";
         }
     }
+    if (config.offload_on_evict_async) {
+        if (!offload_on_evict_ || enable_oplog_) {
+            LOG(WARNING) << "offload_on_evict_async is set but ignored: "
+                            "it needs --enable_offload=true, "
+                            "--offload_on_evict=true and no OpLog "
+                            "(enable_offload="
+                         << enable_offload_
+                         << ", offload_on_evict=" << config.offload_on_evict
+                         << ", oplog=" << enable_oplog_
+                         << "); offload stays as configured";
+        } else {
+            const double room = static_cast<double>(offloading_queue_limit_) *
+                                config.offload_cap_ratio;
+            offload_owner_room_ = room >= 1.0 ? static_cast<uint64_t>(room) : 0;
+            if (offload_owner_room_ == 0 ||
+                config.offload_on_evict_stall_ms == 0) {
+                LOG(ERROR) << "offload_on_evict_async needs "
+                              "offloading_queue_limit x offload_cap_ratio of "
+                              "at least 1 and offload_on_evict_stall_ms above "
+                              "0 (offloading_queue_limit="
+                           << offloading_queue_limit_
+                           << ", offload_cap_ratio=" << config.offload_cap_ratio
+                           << ", offload_on_evict_stall_ms="
+                           << config.offload_on_evict_stall_ms << ")";
+                throw std::invalid_argument(
+                    "offload_on_evict_async needs offloading_queue_limit x "
+                    "offload_cap_ratio >= 1 and offload_on_evict_stall_ms > 0");
+            }
+            offload_async_ = true;
+            offload_force_evict_ = config.offload_force_evict;
+            // Random, so a copy queued before a restart is never taken for
+            // one queued after it.
+            next_offload_token_.store(
+                randomUniform<uint64_t>(1,
+                                        std::numeric_limits<uint64_t>::max()),
+                std::memory_order_relaxed);
+            offload_async_backoff_ =
+                std::chrono::milliseconds(config.offload_on_evict_backoff_ms);
+            offload_stall_window_ =
+                std::chrono::milliseconds(config.offload_on_evict_stall_ms);
+            LOG(INFO) << "offload_on_evict_async: eviction queues up to "
+                      << offload_owner_room_
+                      << " offloads in flight per owner, counts them toward "
+                         "its goal and frees their memory as they land; "
+                      << (config.offload_force_evict
+                              ? "force_evict drops what it cannot queue only "
+                                "after a failed allocation or above usage "
+                                "(1 + eviction_high_watermark_ratio) / 2"
+                              : "force_evict off: nothing is dropped")
+                      << ", backoff_ms=" << offload_async_backoff_.count()
+                      << ", stall_ms=" << offload_stall_window_.count();
+        }
+    }
     // With offload-on-evict and offload_force_evict, a round that has queued
     // offload_cap_ratio of the offloading queue limit lets the rest of the
     // memory it takes go without an offload.
@@ -670,7 +753,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .offload_on_evict = offload_on_evict_,
             .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
                                                  config.offload_cap_ratio),
-                        .force_evict = config.offload_force_evict}});
+                        .force_evict = config.offload_force_evict,
+                        .async = offload_async_}});
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
     // (otherwise no LOCAL_DISK replicas exist in the first place).
@@ -2172,7 +2256,10 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
-    if (state.offloading_task) {
+    if (state.offloading_task && offload_async_) {
+        // A store may be reading the source right now.
+        ParkOrCancelOffload(metadata, state, ObjectIdentity{tenant_id, key});
+    } else if (state.offloading_task) {
         auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
@@ -2662,6 +2749,9 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 MasterMetricManager::instance().dec_total_file_capacity(
                     *capacity);
                 quota_recompute_needed = true;
+            }
+            if (capacity) {
+                EndOffloadsQueuedTo(job.client_id);
             }
             job.local_ssd_unregistered = true;
         }
@@ -4552,6 +4642,17 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
+            // Async: a store may be reading the source of the object's copy
+            // from this segment.
+            if (offload_async_ && accessor.GetState().offloading_task) {
+                const Replica* source = metadata.GetReplicaByID(
+                    accessor.GetState().offloading_task->source_id);
+                if (source != nullptr && match_replica_on_segment(*source)) {
+                    ParkOrCancelOffload(
+                        metadata, accessor.GetState(),
+                        MakeObjectIdentity(key, normalized_tenant));
+                }
+            }
             EraseReplicasWithCacheTotalAccounting(metadata,
                                                   match_replica_on_segment);
 
@@ -5575,7 +5676,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         if (source_id.has_value() && !state.offloading_task) {
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)};
+                               std::move(mirror_clients), /*credit=*/{},
+                               /*token=*/0};
         }
     }
 
@@ -8228,6 +8330,10 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
         MasterMetricManager::instance().dec_total_file_capacity(
             *reported_capacity);
     }
+    if (offload_async_) {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        EndOffloadsQueuedTo(client_id);
+    }
 
     // Explicit unmount removes this owner's disk replicas even while its
     // session still retains resources; generic stale-session cleanup would
@@ -8353,6 +8459,13 @@ auto MasterService::NotifyOffloadSuccess(
                                          : TenantId::Default();
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task_tenant);
+        // Async: the report is for the copy queued with this token, and only
+        // the task that still carries it is that copy's (0: no token, any
+        // task, as before).
+        const uint64_t token = task.token.value_or(0);
+        const auto is_this_copy = [token](const OffloadingTask& offload) {
+            return token == 0 || offload.token == token;
+        };
 
         // NACK sentinel: offload failed on worker. Clean up the
         // offloading_task + dec_refcnt but skip AddReplica.
@@ -8360,9 +8473,13 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
+            // A failed copy of a removed object frees its parked source.
+            if (token != 0) {
+                DropParkedOffload(token);
+            }
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
+                if (offloading_task && is_this_copy(*offloading_task)) {
                     auto source = accessor.Get().GetReplicaByID(
                         offloading_task->source_id);
                     if (source != nullptr) {
@@ -8371,6 +8488,14 @@ auto MasterService::NotifyOffloadSuccess(
                     offloading_task.reset();
                     MasterMetricManager::instance().inc_offload_failed(
                         UuidToString(client_id));
+                    // Async: the next round would queue the key again at
+                    // once, for the store that just failed it. The key keeps
+                    // its rank, and a round that may drop ignores the wait.
+                    if (offload_async_) {
+                        accessor.GetState().DelayOffloadRetry(
+                            std::chrono::system_clock::now() +
+                            kOffloadNackBackoff);
+                    }
                 }
             }
             continue;
@@ -8384,6 +8509,8 @@ auto MasterService::NotifyOffloadSuccess(
         {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
+            // Async: the memory a landed offload freed, let go after the key.
+            std::vector<Replica> freed_on_landing;
             // A disk replica may only be registered for a client whose
             // LOCAL_DISK segment entry still exists. Checked inside this
             // shared-lock section, before the key's lock, so the check and
@@ -8405,8 +8532,9 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task &&
-                    replica.type() != ReplicaType::LOCAL_DISK) {
+                const bool ours =
+                    offloading_task && is_this_copy(*offloading_task);
+                if (ours && replica.type() != ReplicaType::LOCAL_DISK) {
                     LOG(ERROR) << "Invalid replica type: " << replica.type()
                                << ". Expected ReplicaType::LOCAL_DISK.";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -8415,12 +8543,17 @@ auto MasterService::NotifyOffloadSuccess(
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
-                if (offloading_task) {
+                if (ours) {
                     auto source =
                         obj_metadata.GetReplicaByID(offloading_task->source_id);
                     if (source != nullptr) {
                         source->dec_refcnt();
                     }
+                    // Async: when eviction queued this copy.
+                    const auto evict_queued_at =
+                        offloading_task->token != 0
+                            ? std::optional(offloading_task->start_time)
+                            : std::nullopt;
                     offloading_task.reset();
 
                     if (!segment_mounted) {
@@ -8459,11 +8592,32 @@ auto MasterService::NotifyOffloadSuccess(
                                         .object_size;
                             });
                     }
+                    // Under the key's lock, so the release that publishes
+                    // the KV delta reports the memory gone.
+                    if (offload_async_ && segment_mounted) {
+                        if (evict_queued_at) {
+                            MasterMetricManager::instance()
+                                .observe_offload_evict_write_latency(
+                                    MicrosSince(*evict_queued_at));
+                        }
+                        freed_on_landing =
+                            FreeLandedOffloadSource(accessor, evict_queued_at);
+                    }
                     handled_existing_object = true;
                 }
             }
         }
 
+        if (!handled_existing_object && token != 0) {
+            // A copy the master no longer waits for: its object was removed
+            // or replaced, or its task ended (failed, expired, unmounted).
+            // Its source may have been freed and reused meanwhile, so its
+            // bytes are never registered, nor do they create the key. A
+            // source parked for it is freed now.
+            DropParkedOffload(token);
+            MasterMetricManager::instance().inc_offload_evict_stale_landing();
+            continue;
+        }
         if (!handled_existing_object) {
             auto normalized_tenant_result =
                 ResolveTenantIdForWrite(request_object_id.tenant_id);
@@ -8511,7 +8665,8 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
-    std::vector<UUID>* mirror_clients) {
+    std::vector<UUID>* mirror_clients, std::shared_ptr<void>* credit,
+    uint64_t token) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
     // offload from. Returning a silent {} here caused the caller to record an
@@ -8523,6 +8678,25 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
                      [](const auto& name) { return name.has_value(); })) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    // Async: every destination must have room before any mirror is queued,
+    // so a refusal leaves no mailbox entry behind. Checked first, as it is
+    // the common refusal while a store is busy.
+    if (credit != nullptr) {
+        for (const auto& segment_name : segment_names) {
+            if (!segment_name.has_value()) {
+                continue;
+            }
+            std::optional<UUID> owner;
+            {
+                auto allocator_access = segment_manager_.getAllocatorAccess();
+                owner = allocator_access.GetOwnerClientId(*segment_name);
+            }
+            if (owner && !OffloadOwnerHasRoom(*owner)) {
+                MasterMetricManager::instance().inc_offload_evict_no_room();
+                return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+            }
+        }
+    }
     Replica::Descriptor source_descriptor;
     if (!TryGetReadableReplicaDescriptor(replica, source_descriptor) ||
         !source_descriptor.is_memory_replica()) {
@@ -8530,6 +8704,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     bool any_enqueued = false;
     std::string client_id_str;
+    std::vector<UUID> owners;
+    int64_t enqueued_size = 0;
     const auto source_session = replica.getClientSession();
     if (!source_session) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -8564,12 +8740,15 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         }
         const int64_t size =
             source_descriptor.get_memory_descriptor().buffer_descriptor.size_;
+        OffloadTaskItem item{.tenant_id = object_id.tenant_id.value(),
+                             .key = object_id.user_key,
+                             .size = size,
+                             .token = {}};
+        if (token != 0) {
+            item.token = token;
+        }
         auto err = local_ssd_manager_.EnqueueOffload(
-            *client_id,
-            OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
-                            .key = object_id.user_key,
-                            .size = size},
-            offloading_queue_limit_);
+            *client_id, std::move(item), offloading_queue_limit_);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
@@ -8583,6 +8762,10 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        if (credit != nullptr) {
+            owners.push_back(*client_id);
+            enqueued_size = size;
+        }
         client_id_str = UuidToString(*client_id);
         any_enqueued = true;
     }
@@ -8591,6 +8774,11 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     // never report success when no task was actually submitted.
     if (!any_enqueued) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+    }
+    if (credit != nullptr) {
+        *credit = memory_eviction_->ledger.Take(
+            object_id.tenant_id, std::move(owners),
+            static_cast<uint64_t>(std::max<int64_t>(enqueued_size, 0)));
     }
     MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
@@ -9560,10 +9748,27 @@ void MasterService::EvictionThreadFunc() {
             continue;
         }
 
+        if (offload_async_) {
+            PublishOffloadLedgerGauges();
+        }
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+        if (offload_async_) {
+            if (RunAsyncOffloadEvictionTick() == AsyncEvictionTick::kRan) {
+                last_discard_time = now;
+            } else if (now - last_discard_time >
+                       put_start_release_timeout_sec_) {
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    master_state_mutex_);
+                VisitNamespaces([&](const TenantId& /*tenant_id*/,
+                                    metadata::Namespace& ns) {
+                    DiscardExpiredProcessingReplicas(ns, now);
+                });
+                ReleaseExpiredDiscardedReplicas(now);
+                last_discard_time = now;
+            }
+        } else if (used_ratio > eviction_high_watermark_ratio_ ||
+                   (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
@@ -9657,7 +9862,47 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // holds now.
     const auto keys = ns.InFlightKeys();
 
+    // A pass write-holds a key only once a look under a read lock finds work
+    // it acts on, and judges that work again under the write lock: the
+    // release of every write guard files its key in the eviction index again,
+    // which would undo, every round, the postponement (EvictionIndex::Postpone)
+    // of a key whose memory an offload in flight holds.
+    const auto acts_on = [&](const std::string& key, const auto& acts) {
+        const MetadataAccessorRO reader(this, tenant_id, key);
+        return reader.IsPublished() && acts(reader.Get(), reader.GetState());
+    };
+    const auto expired = [&](std::chrono::system_clock::time_point start) {
+        return start + put_start_release_timeout_sec_ <= now;
+    };
+    // A write that finished, or ran out of time before it did.
+    const auto processing_ended = [&](const ObjectMetadata& metadata,
+                                      const route::ObjectState& state) {
+        return state.is_processing &&
+               (!metadata.IsValid() ||
+                metadata.AllReplicas(&Replica::fn_is_completed) ||
+                metadata.put_start_time + put_start_release_timeout_sec_ < now);
+    };
+    const auto replication_expired = [&](const ObjectMetadata&,
+                                         const route::ObjectState& state) {
+        return state.replication_task &&
+               !state.replication_task->durable_cleanup_pending &&
+               expired(state.replication_task->start_time);
+    };
+    const auto offload_expired = [&](const ObjectMetadata&,
+                                     const route::ObjectState& state) {
+        return state.offloading_task &&
+               expired(state.offloading_task->start_time);
+    };
+    const auto promotion_expired = [&](const ObjectMetadata&,
+                                       const route::ObjectState& state) {
+        return state.promotion_task &&
+               expired(state.promotion_task->start_time);
+    };
+
     for (const auto& key : keys) {
+        if (!acts_on(key, processing_ended)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.InProcessing()) {
@@ -9731,6 +9976,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, replication_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.HasReplicationTask()) {
@@ -9822,6 +10070,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, offload_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.IsPublished()) {
@@ -9842,9 +10093,19 @@ void MasterService::DiscardExpiredProcessingReplicas(
         LOG(WARNING) << "Offloading task expired for key: " << key
                      << " tenant=" << tenant_id;
         task.reset();
+        // Async: a copy its store never took leaves a mailbox entry, which
+        // would refuse every later push of the key (OBJECT_ALREADY_EXISTS)
+        // and hand the store a copy no task waits for. Taken copies have
+        // none; their late reports are dropped as stale.
+        if (offload_async_) {
+            local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
+        }
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, promotion_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.IsPublished()) {
@@ -9886,7 +10147,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     const std::chrono::system_clock::time_point& now) {
-    uint64_t released_cnt = 0;
+    // Async: parked sources of copies that would have expired by now.
+    uint64_t released_cnt = offload_async_ ? DropParkedOffloads(now) : 0;
     std::lock_guard lock(discarded_replicas_mutex_);
     discarded_replicas_.remove_if(
         [&now, &released_cnt](const DiscardedReplicas& item) {
@@ -9904,15 +10166,320 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
     if (target_bytes == 0) {
         return {};
     }
+    eviction::ByteGoal goal{.target_bytes = target_bytes};
+    if (offload_async_) {
+        // What the tenant has queued for offload to owners that are landing
+        // goes once it lands, and what this run queues counts; with no
+        // pressure set it never drops.
+        const uint64_t pending = memory_eviction_->ledger.LiveBytes(
+            tenant_id, std::chrono::steady_clock::now(), offload_stall_window_);
+        if (pending >= target_bytes) {
+            return {};
+        }
+        goal.target_bytes = target_bytes - pending;
+        goal.count_queued = true;
+    }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const eviction::Report report = memory_eviction_->evictor.Run(
-        tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
+    const eviction::Report report =
+        memory_eviction_->evictor.Run(tenant_id, goal);
     return {.freed_bytes = report.released_bytes,
             .evicted_objects = report.evicted_objects};
 }
 
-void MasterService::BatchEvict(double evict_ratio_target,
-                               double evict_ratio_lowerbound) {
+void MasterService::PublishOffloadLedgerGauges() {
+    const eviction::OffloadLedger& ledger = memory_eviction_->ledger;
+    auto& metrics = MasterMetricManager::instance();
+    const uint64_t bytes = ledger.bytes();
+    metrics.set_offload_evict_pending(static_cast<int64_t>(bytes),
+                                      static_cast<int64_t>(ledger.objects()));
+    const uint64_t live = ledger.LiveBytes(std::chrono::steady_clock::now(),
+                                           offload_stall_window_);
+    metrics.set_offload_evict_stalled_bytes(
+        static_cast<int64_t>(bytes > live ? bytes - live : 0));
+}
+
+uint64_t MasterService::NextOffloadToken() {
+    uint64_t token;
+    do {
+        token = next_offload_token_.fetch_add(1, std::memory_order_relaxed);
+    } while (token == 0);
+    return token;
+}
+
+const eviction::OffloadLedger& MasterService::offload_ledger() const {
+    return memory_eviction_->ledger;
+}
+
+eviction::Evictor& MasterService::memory_evictor() {
+    return memory_eviction_->evictor;
+}
+
+bool MasterService::OffloadOwnerHasRoom(const UUID& owner) const {
+    const eviction::OffloadLedger& ledger = memory_eviction_->ledger;
+    // A stalled owner (a hung store, a lost heartbeat reply) is not handed
+    // more memory to pin until it ends a copy.
+    return ledger.objects(owner) < offload_owner_room_ &&
+           !ledger.Stalled(owner, std::chrono::steady_clock::now(),
+                           offload_stall_window_);
+}
+
+bool MasterService::AnyOffloadOwnerHasRoom() const {
+    // A store that turned offloading off refuses every push.
+    for (const UUID& owner : local_ssd_manager_.GetOffloadingClientIds()) {
+        if (OffloadOwnerHasRoom(owner)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+MasterService::AsyncEvictionTick MasterService::RunAsyncOffloadEvictionTick() {
+    const StorageUsage usage = segment_manager_.GetMemoryUsage();
+    if (usage.capacity_bytes == 0) {
+        return AsyncEvictionTick::kIdle;
+    }
+    const eviction::OffloadLedger& ledger = memory_eviction_->ledger;
+    auto& metrics = MasterMetricManager::instance();
+    const auto steady_now = std::chrono::steady_clock::now();
+    // Memory whose offload is in flight goes once its copy lands, but only
+    // an owner that keeps ending its copies is landing them: a hung or
+    // vanished store's copies count as used memory once it has stalled.
+    const uint64_t pending =
+        ledger.LiveBytes(steady_now, offload_stall_window_);
+    const double capacity = static_cast<double>(usage.capacity_bytes);
+    const double used_ratio = usage.used_ratio();
+    const double effective_ratio =
+        static_cast<double>(usage.used_bytes -
+                            std::min<uint64_t>(pending, usage.used_bytes)) /
+        capacity;
+    const double high_watermark = eviction_high_watermark_ratio_;
+    const bool allocation_failed =
+        need_mem_eviction_.load(std::memory_order_relaxed) &&
+        eviction_ratio_ > 0.0;
+    // With force_evict, usage halfway from the watermark to full is pressure
+    // too: the landings are not keeping up and the next puts would fail.
+    const bool watermark_pressure =
+        offload_force_evict_ && used_ratio > (1.0 + high_watermark) / 2;
+    const bool pressure = allocation_failed || watermark_pressure;
+    if (effective_ratio <= high_watermark && !pressure) {
+        return AsyncEvictionTick::kIdle;
+    }
+    if (!pressure && !AnyOffloadOwnerHasRoom()) {
+        metrics.inc_offload_evict_round_skipped("no_room");
+        return AsyncEvictionTick::kNoRoom;
+    }
+    // The copies in flight to stores that are landing right now (that
+    // ended a copy, or got their first, within MaxLandingWait()) free at
+    // least a round's worth once they land; a round now would only queue
+    // more for the same stores. A store that has gone quiet for that long
+    // is not waited on, so a stuck one holds the pool back for at most
+    // MaxLandingWait().
+    const bool wait =
+        pressure && !offload_force_evict_ &&
+        static_cast<double>(ledger.LiveBytes(steady_now, MaxLandingWait())) >=
+            eviction_ratio_ * capacity;
+    if (!async_last_round_progressed_ &&
+        steady_now - async_last_round_end_ < offload_async_backoff_ &&
+        ledger.release_seq() == async_last_round_release_seq_) {
+        metrics.inc_offload_evict_round_skipped("backoff");
+        return AsyncEvictionTick::kBackoff;
+    }
+
+    const double target = std::max(
+        eviction_ratio_, effective_ratio - high_watermark + eviction_ratio_);
+    const double lowerbound =
+        std::max(target * 0.5, effective_ratio - high_watermark);
+    LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+              << " effective_ratio=" << effective_ratio
+              << " offload_pending_bytes=" << pending
+              << " high_watermark=" << high_watermark
+              << " need_mem_eviction=" << allocation_failed
+              << " pressure=" << pressure << " wait_for_landings=" << wait
+              << " eviction_ratio=" << eviction_ratio_;
+    async_last_round_release_seq_ = ledger.release_seq();
+    async_last_round_progressed_ =
+        BatchEvict(target, lowerbound, watermark_pressure,
+                   /*queue_offloads=*/!wait);
+    async_last_round_end_ = std::chrono::steady_clock::now();
+    LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+    if (wait) {
+        // The next failed allocation raises the flag again.
+        need_mem_eviction_.store(false, std::memory_order_relaxed);
+        metrics.inc_offload_evict_round_skipped("wait_for_landings");
+        metrics.inc_offload_evict_waited_for_frees();
+        return AsyncEvictionTick::kWaitForLandings;
+    }
+    return AsyncEvictionTick::kRan;
+}
+
+std::vector<Replica> MasterService::FreeLandedOffloadSource(
+    MetadataAccessorRW& accessor,
+    std::optional<std::chrono::system_clock::time_point> evict_queued_at) {
+    ObjectMetadata& metadata = accessor.Get();
+    // A refused registration landed nothing, and an object with no memory
+    // left has nothing to free.
+    if (!metadata.HasReplica([](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed();
+        }) ||
+        !metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+        return {};
+    }
+    auto& metrics = MasterMetricManager::instance();
+    // Not const: ObjectMetadata::IsLeaseExpired takes it by reference.
+    auto now = std::chrono::system_clock::now();
+    // The lease ran out when eviction queued the object, and the store's own
+    // read of the source takes none; a lease now means a reader came back.
+    if (metadata.IsHardPinned()) {
+        metrics.inc_offload_evict_kept("pinned");
+        return {};
+    }
+    if (!metadata.IsLeaseExpired(now)) {
+        metrics.inc_offload_evict_kept("read_again");
+        metrics.inc_offload_evict_lease_wait();
+        return {};
+    }
+    auto plan = memory_eviction_->policy.Decide(eviction::Candidate{
+        accessor.GetTenantId(), accessor.GetKey(), metadata, now,
+        /*fallback=*/false});
+    if (!plan) {
+        metrics.inc_offload_evict_kept(
+            plan.error() == eviction::SkipReason::kNothingToRelease ? "busy"
+                                                                    : "pinned");
+        return {};
+    }
+    auto effect = memory_eviction_->immediate.Apply(
+        accessor.Ns(), accessor.Guard(), *plan, eviction::Report{});
+    if (!effect) {
+        return {};
+    }
+    metrics.inc_offload_evict_freed(
+        static_cast<int64_t>(effect->released_bytes));
+    if (evict_queued_at) {
+        metrics.observe_offload_evict_free_latency(
+            MicrosSince(*evict_queued_at));
+    }
+    return std::move(effect->detached);
+}
+
+void MasterService::ParkOrCancelOffload(ObjectMetadata& metadata,
+                                        route::ObjectState& state,
+                                        const ObjectIdentity& object_id) {
+    OffloadingTask& task = *state.offloading_task;
+    // Still queued: no store reads the source; drop the mirrors.
+    if (task.mirror_clients.empty() ||
+        local_ssd_manager_.CancelOffloadsIfAllPending(
+            task.mirror_clients, object_id.tenant_id, object_id.user_key)) {
+        if (Replica* source = metadata.GetReplicaByID(task.source_id)) {
+            source->dec_refcnt();
+        }
+        if (!task.mirror_clients.empty()) {
+            MasterMetricManager::instance().inc_offload_cancelled(
+                UuidToString(task.mirror_clients[0]));
+        }
+        state.offloading_task.reset();
+        return;
+    }
+    // A store took the copy and may be reading the source: keep its memory,
+    // and the owner's room, until the copy is reported or expires.
+    const ReplicaID source_id = task.source_id;
+    ParkedOffloadSource parked{
+        .replicas = PopReplicasWithCacheTotalAccounting(
+            metadata,
+            [source_id](const Replica& replica) {
+                return replica.id() == source_id;
+            }),
+        .credit = std::move(task.credit),
+        .owners = task.mirror_clients,
+        .expires = task.start_time + put_start_release_timeout_sec_};
+    for (Replica& source : parked.replicas) {
+        source.dec_refcnt();
+    }
+    const uint64_t token = task.token;
+    state.offloading_task.reset();
+    // Any other mirror's entry, as the non-async erase drops it.
+    local_ssd_manager_.RemoveOffloadFromAll(object_id.tenant_id,
+                                            object_id.user_key);
+    MasterMetricManager::instance().inc_offload_evict_parked();
+    std::lock_guard lock(parked_offloads_mutex_);
+    parked_offloads_[token] = std::move(parked);
+}
+
+void MasterService::DropParkedOffload(uint64_t token) {
+    std::optional<ParkedOffloadSource> dropped;
+    {
+        std::lock_guard lock(parked_offloads_mutex_);
+        const auto it = parked_offloads_.find(token);
+        if (it == parked_offloads_.end()) {
+            return;
+        }
+        dropped = std::move(it->second);
+        parked_offloads_.erase(it);
+    }
+    // Freed here, outside the map's lock.
+}
+
+size_t MasterService::DropParkedOffloads(
+    std::chrono::system_clock::time_point now, const UUID* owner) {
+    std::vector<ParkedOffloadSource> dropped;
+    {
+        std::lock_guard lock(parked_offloads_mutex_);
+        for (auto it = parked_offloads_.begin();
+             it != parked_offloads_.end();) {
+            const auto& owners = it->second.owners;
+            const bool goes = owner != nullptr
+                                  ? std::find(owners.begin(), owners.end(),
+                                              *owner) != owners.end()
+                                  : it->second.expires <= now;
+            if (goes) {
+                dropped.push_back(std::move(it->second));
+                it = parked_offloads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return dropped.size();
+}
+
+void MasterService::EndOffloadsQueuedTo(const UUID& owner) {
+    if (!offload_async_) {
+        return;
+    }
+    size_t ended = 0;
+    VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        for (const auto& key : ns.InFlightKeys()) {
+            MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                        MetadataAccessorRW::AsIs{});
+            if (!accessor.IsPublished()) {
+                continue;
+            }
+            auto& task = accessor.GetState().offloading_task;
+            if (!task || std::find(task->mirror_clients.begin(),
+                                   task->mirror_clients.end(),
+                                   owner) == task->mirror_clients.end()) {
+                continue;
+            }
+            if (Replica* source =
+                    accessor.Get().GetReplicaByID(task->source_id)) {
+                source->dec_refcnt();
+            }
+            task.reset();
+            // Any other mirror's entry goes too, as EraseMetadata does.
+            local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
+            ++ended;
+        }
+    });
+    ended += DropParkedOffloads(std::chrono::system_clock::now(), &owner);
+    if (ended > 0) {
+        LOG(INFO) << "client_id=" << owner
+                  << ", action=end_offloads_queued_to_unmounted_disk"
+                  << ", count=" << ended;
+    }
+}
+
+bool MasterService::BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound,
+                               bool watermark_pressure, bool queue_offloads) {
     // Consume the allocation-pressure signal before this round. A new failure
     // during the round remains visible to the next iteration.
     const bool allocation_pressure =
@@ -9927,10 +10494,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
-    const eviction::Report report = memory_eviction_->evictor.Run(
-        eviction::Scope::All(),
-        eviction::ObjectGoal{.target_ratio = evict_ratio_target,
-                             .min_ratio = evict_ratio_lowerbound});
+    eviction::ObjectGoal goal{.target_ratio = evict_ratio_target,
+                              .min_ratio = evict_ratio_lowerbound};
+    std::optional<eviction::OffloadingReclaimer::RunScope> offload_scope;
+    if (offload_async_) {
+        // Queued offloads count toward the goal, except when force_evict
+        // may drop: under pressure the round must release memory now.
+        const bool pressure = allocation_pressure || watermark_pressure;
+        goal.count_queued = !(pressure && offload_force_evict_);
+        offload_scope.emplace(memory_eviction_->offloading, pressure,
+                              queue_offloads);
+    }
+    const eviction::Report report =
+        memory_eviction_->evictor.Run(eviction::Scope::All(), goal);
+    if (offload_async_) {
+        offload_scope.reset();
+        PublishOffloadLedgerGauges();
+    }
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {
@@ -9950,6 +10530,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         metrics.inc_eviction_fail();
         metrics.inc_mem_eviction_fail();
     }
+    return made_progress;
 }
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,

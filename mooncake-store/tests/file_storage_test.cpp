@@ -458,6 +458,159 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
+    // Offloads one object a write-through master queued (no copy token)
+    // and checks the store's read of its source took the default read
+    // lease, whatever MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ says on the
+    // store: a plain remove right after the landing is refused
+    // (OBJECT_HAS_LEASE).
+    void RunSourceLeaseScenario(const char* store_env) {
+        if (store_env != nullptr) {
+            SetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ", store_env);
+        } else {
+            UnsetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ");
+        }
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(60'000)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        SourceLeaseFixture fixture(master);
+        ASSERT_TRUE(fixture.Put("source-lease"));
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(fixture.client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(1, tasks.size());
+        EXPECT_FALSE(tasks[0].token.has_value());
+
+        FileStorage storage(fixture.StorageConfig(data_path, "leased"),
+                            fixture.client, fixture.endpoint);
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        EXPECT_EQ(fixture.Media("source-lease"),
+                  (std::pair<size_t, size_t>{1, 1}));
+
+        auto removed = fixture.client->Remove("source-lease");
+        ASSERT_FALSE(removed.has_value());
+        EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_LEASE);
+        EXPECT_TRUE(fixture.client->Remove("source-lease", /*force=*/true));
+        UnsetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ");
+    }
+
+    // An async offload-on-evict master queues the object's copy with a
+    // token; the store reads its source without a lease (unless opted out
+    // with MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ=0), so the landing finds
+    // the lease run out and frees the memory.
+    void RunAsyncSourceScenario(bool store_opts_out) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_offload_on_evict(true)
+                                     .set_offload_on_evict_async(true)
+                                     .set_eviction_high_watermark_ratio(0.0)
+                                     .set_default_kv_lease_ttl(60'000)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        if (store_opts_out) {
+            SetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ", "0");
+        }
+        SourceLeaseFixture fixture(master);
+        ASSERT_TRUE(fixture.Put("async-source"));
+        // The master's eviction thread queues it (watermark 0).
+        std::vector<OffloadTaskItem> tasks;
+        for (int i = 0; i < 300 && tasks.empty(); ++i) {
+            ASSERT_TRUE(fixture.client->OffloadObjectHeartbeat(true, tasks));
+            if (tasks.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        ASSERT_EQ(1, tasks.size());
+        EXPECT_TRUE(tasks[0].token.has_value());
+
+        FileStorage storage(
+            fixture.StorageConfig(data_path,
+                                  store_opts_out ? "async_leased" : "async"),
+            fixture.client, fixture.endpoint);
+        EXPECT_EQ(storage.config_.lease_free_offload_source_read,
+                  !store_opts_out);
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        // Lease-free: freed as the copy landed. Leased: kept for the lease.
+        EXPECT_EQ(fixture.Media("async-source"),
+                  (std::pair<size_t, size_t>{store_opts_out ? 1 : 0, 1}));
+        UnsetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ");
+    }
+
+    // A client with a 16 MiB segment and a local disk on `master`.
+    struct SourceLeaseFixture {
+        static constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+
+        explicit SourceLeaseFixture(testing::InProcMaster& master)
+            : segment(allocate_buffer_allocator_memory(kSegmentSize),
+                      &std::free),
+              allocator(kSegmentSize),
+              endpoint("127.0.0.1:" + std::to_string(getFreeTcpPort())) {
+            auto created =
+                Client::Create(endpoint, master.metadata_url(), "tcp",
+                               std::nullopt, master.master_address());
+            EXPECT_TRUE(created);
+            client = *created;
+            EXPECT_TRUE(
+                client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+            EXPECT_TRUE(client->RegisterLocalMemory(
+                allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+            EXPECT_TRUE(client->MountLocalDiskSegment(true));
+        }
+
+        ~SourceLeaseFixture() {
+            EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+            EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+        }
+
+        bool Put(const std::string& key) {
+            auto* buffer = allocator.allocate(128);
+            if (buffer == nullptr) {
+                return false;
+            }
+            std::memset(buffer, 's', 128);
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            std::vector<Slice> slices{{buffer, 128}};
+            const bool put = client->Put(key, slices, replicate).has_value();
+            allocator.deallocate(buffer, 128);
+            return put;
+        }
+
+        FileStorageConfig StorageConfig(const std::string& root,
+                                        const std::string& name) const {
+            FileStorageConfig config = FileStorageConfig::FromEnvironment();
+            config.storage_filepath = root + "/source_lease_" + name;
+            config.local_buffer_size = 1024 * 1024;
+            config.storage_backend_type = StorageBackendType::kFilePerKey;
+            fs::create_directories(config.storage_filepath);
+            return config;
+        }
+
+        // (memory, local disk) replicas of `key`, read without a lease.
+        std::pair<size_t, size_t> Media(const std::string& key) {
+            auto queried = client->BatchQueryReadOnly({key});
+            EXPECT_EQ(1, queried.size());
+            if (queried.empty() || !queried[0]) {
+                return {0, 0};
+            }
+            std::pair<size_t, size_t> media{0, 0};
+            for (const auto& replica : queried[0]->replicas) {
+                media.first += replica.is_memory_replica();
+                media.second += replica.is_local_disk_replica();
+            }
+            return media;
+        }
+
+        std::unique_ptr<void, decltype(&std::free)> segment;
+        SimpleAllocator allocator;
+        std::string endpoint;
+        std::shared_ptr<Client> client;
+    };
+
     void RunManagedRemoveAllScenario(bool file_per_key = false,
                                      bool protected_prefix = false) {
         testing::InProcMaster master;
@@ -954,6 +1107,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
+        UnsetEnv("MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
@@ -1813,6 +1967,30 @@ TEST_F(FileStorageTest, SkippedOffloadAllFileWritesFailReleasesSourceTasks) {
 
 TEST_F(FileStorageTest, SkippedOffloadWriteFailureReleasesAllSourceTasks) {
     RunSkippedOffloadScenario(1, true);
+}
+
+// A copy an async offload-on-evict master queued carries a token; the store
+// reads its source without a lease, so the copy lands with the lease still
+// run out and the master frees the memory at once.
+TEST_F(FileStorageTest, AnAsyncCopyIsReadWithoutALease) {
+    RunAsyncSourceScenario(/*store_opts_out=*/false);
+}
+
+// MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ=0 on the store keeps the lease for
+// every copy.
+TEST_F(FileStorageTest, AStoreCanOptOutOfLeaseFreeReads) {
+    RunAsyncSourceScenario(/*store_opts_out=*/true);
+}
+
+// A copy without a token (here from a write-through master) takes the read
+// lease, whatever MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ says: only an async
+// master guards a source the store reads without one.
+TEST_F(FileStorageTest, OffloadSourceReadGrantsALeaseByDefault) {
+    RunSourceLeaseScenario(/*store_env=*/nullptr);
+}
+
+TEST_F(FileStorageTest, OffloadSourceReadGrantsALeaseWithoutAToken) {
+    RunSourceLeaseScenario(/*store_env=*/"1");
 }
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
