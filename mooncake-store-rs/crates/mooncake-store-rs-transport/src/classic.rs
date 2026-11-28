@@ -744,6 +744,31 @@ mod tests {
     }
 
     #[test]
+    fn p2p_local_segment_descriptor_preserves_tcp_endpoint_fields() {
+        let config = ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1");
+        let engine = ClassicTransferEngine::new(&config, "127.0.0.1")
+            .expect("classic p2p engine should start");
+        let descriptor = engine
+            .local_segment_descriptor_json()
+            .expect("local segment descriptor should be readable")
+            .expect("tcp transport should publish a local segment descriptor");
+        let descriptor: serde_json::Value =
+            serde_json::from_str(&descriptor).expect("descriptor should be valid JSON");
+
+        let host = descriptor["tcp_data_host"]
+            .as_str()
+            .expect("tcp_data_host should be exported for classic TCP peers");
+        assert!(!host.is_empty(), "empty tcp_data_host fails startTransfer");
+        let proto_version = descriptor["tcp_proto_version"]
+            .as_u64()
+            .expect("tcp_proto_version should be exported");
+        assert!(
+            proto_version >= 2,
+            "classic TCP peers fall back to v1 framing without the advertised version"
+        );
+    }
+
+    #[test]
     fn classic_request_encoding_is_explicit_and_checked() {
         let request = TransferRequest {
             opcode: Opcode::Write,
