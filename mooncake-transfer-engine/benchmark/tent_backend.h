@@ -168,7 +168,7 @@ class TENTBenchRunner : public BenchRunner {
     // batch did not finish within the drain timeout after the stop; the batch
     // is then counted in abandoned_batches_.
     Status waitForBatch(BatchID batch_id, TransferStatus& status,
-                        uint64_t& polls);
+                        uint64_t& polls, bool backoff);
 
    private:
     std::unique_ptr<TransferEngine> engine_;

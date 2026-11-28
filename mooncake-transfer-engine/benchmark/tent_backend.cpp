@@ -488,7 +488,7 @@ void TENTBenchRunner::pinThread(int thread_id) {
 static constexpr uint64_t kStopDrainTimeoutNs = 5ull * 1000 * 1000 * 1000;
 
 Status TENTBenchRunner::waitForBatch(BatchID batch_id, TransferStatus& status,
-                                     uint64_t& polls) {
+                                     uint64_t& polls, bool backoff) {
     uint64_t stop_seen_ns = 0;
     while (true) {
         auto polled = engine_->getTransferStatus(batch_id, status);
@@ -502,7 +502,15 @@ Status TENTBenchRunner::waitForBatch(BatchID batch_id, TransferStatus& status,
             status.s != TransferStatusEnum::INITIAL) {
             return Status::OK();
         }
-        if (running()) continue;
+        if (running()) {
+            if (backoff) {
+                if (polls < 128)
+                    PAUSE();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(1));
+            }
+            continue;
+        }
         const uint64_t now_ns = getCurrentTimeInNano();
         if (stop_seen_ns == 0) {
             stop_seen_ns = now_ns;
@@ -587,7 +595,8 @@ double TENTBenchRunner::runSingleTransfer(
     const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     TransferStatus overall_status;
-    auto polled = waitForBatch(batch_id, overall_status, polls);
+    auto polled = waitForBatch(batch_id, overall_status, polls,
+                               XferBenchConfig::poll_backoff);
     if (!polled.ok()) {
         LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
         noteTransferFailed();
