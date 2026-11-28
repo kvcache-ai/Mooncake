@@ -450,6 +450,39 @@ impl EmbeddedWrhRouteDirectory {
         )
     }
 
+    fn read_authority_batches<T>(
+        &self,
+        batches: &[(&ClientLease, &[ObjectKey])],
+        local_read: impl Fn(&ClientLease, &[ObjectKey]) -> Result<Vec<Result<T>>>,
+        remote_read: impl Fn(&[(&ClientLease, &[ObjectKey])]) -> Vec<Result<Vec<Result<T>>>>,
+    ) -> Vec<Result<Vec<Result<T>>>> {
+        let local = batches
+            .iter()
+            .map(|(authority, keys)| {
+                self.authority_is_local(authority)
+                    .then(|| local_read(authority, keys))
+            })
+            .collect::<Vec<_>>();
+        let remote = batches
+            .iter()
+            .zip(&local)
+            .filter_map(|(batch, outcome)| outcome.is_none().then_some(*batch))
+            .collect::<Vec<_>>();
+        let mut replies = remote_read(&remote).into_iter();
+        local
+            .into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| {
+                    replies.next().unwrap_or_else(|| {
+                        Err(StoreError::Transport(
+                            "route authority batch reply missing".to_string(),
+                        ))
+                    })
+                })
+            })
+            .collect()
+    }
+
     fn get_allocation_route_references_from_authority(
         &self,
         authority: &ClientLease,
@@ -929,12 +962,45 @@ impl EmbeddedWrhRouteDirectory {
             return Ok(false);
         }
 
-        for (_, (authority, indices)) in groups {
-            let batch_keys = indices
-                .iter()
-                .map(|index| keys[*index].clone())
+        let mut replies = (groups.len() > 1).then(|| {
+            let batch_keys = groups
+                .values()
+                .map(|(_, indices)| {
+                    indices
+                        .iter()
+                        .map(|index| keys[*index].clone())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>();
-            match self.contains_authority_batch(&authority, &batch_keys) {
+            let batches = groups
+                .values()
+                .zip(&batch_keys)
+                .map(|((authority, _), keys)| (authority, keys.as_slice()))
+                .collect::<Vec<_>>();
+            let outcomes = self.read_authority_batches(
+                &batches,
+                |authority, keys| self.contains_authority_batch(authority, keys),
+                |remote| {
+                    self.authority_client
+                        .batch_contains_routes_many(&self.namespace, remote)
+                },
+            );
+            batch_keys.into_iter().zip(outcomes)
+        });
+        for (_, (authority, indices)) in groups {
+            let (batch_keys, outcome) =
+                replies
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .unwrap_or_else(|| {
+                        let batch_keys = indices
+                            .iter()
+                            .map(|index| keys[*index].clone())
+                            .collect::<Vec<_>>();
+                        let outcome = self.contains_authority_batch(&authority, &batch_keys);
+                        (batch_keys, outcome)
+                    });
+            match outcome {
                 Ok(results) => {
                     if results.len() != batch_keys.len() {
                         if let Some(retry) = probe.retry_on_error.as_deref_mut() {
@@ -1036,12 +1102,45 @@ impl EmbeddedWrhRouteDirectory {
             return Ok(false);
         }
 
-        for (_, (authority, indices)) in groups {
-            let batch_keys = indices
-                .iter()
-                .map(|index| keys[*index].clone())
+        let mut replies = (groups.len() > 1).then(|| {
+            let batch_keys = groups
+                .values()
+                .map(|(_, indices)| {
+                    indices
+                        .iter()
+                        .map(|index| keys[*index].clone())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>();
-            match self.read_authority_batch(&authority, &batch_keys) {
+            let batches = groups
+                .values()
+                .zip(&batch_keys)
+                .map(|((authority, _), keys)| (authority, keys.as_slice()))
+                .collect::<Vec<_>>();
+            let outcomes = self.read_authority_batches(
+                &batches,
+                |authority, keys| self.read_authority_batch(authority, keys),
+                |remote| {
+                    self.authority_client
+                        .batch_get_routes_many(&self.namespace, remote)
+                },
+            );
+            batch_keys.into_iter().zip(outcomes)
+        });
+        for (_, (authority, indices)) in groups {
+            let (batch_keys, outcome) =
+                replies
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .unwrap_or_else(|| {
+                        let batch_keys = indices
+                            .iter()
+                            .map(|index| keys[*index].clone())
+                            .collect::<Vec<_>>();
+                        let outcome = self.read_authority_batch(&authority, &batch_keys);
+                        (batch_keys, outcome)
+                    });
+            match outcome {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
                         match result.map(value_from_authority_record) {
@@ -1549,8 +1648,26 @@ impl EmbeddedWrhRouteDirectory {
                 entry.2.push((index, rank));
             }
         }
+        let mut replies = (groups.len() > 1).then(|| {
+            let batches = groups
+                .values()
+                .map(|(authority, keys, _)| (authority, keys.as_slice()))
+                .collect::<Vec<_>>();
+            self.read_authority_batches(
+                &batches,
+                |authority, keys| self.presence_authority_batch(authority, keys),
+                |remote| {
+                    self.authority_client
+                        .batch_get_route_presence_many(&self.namespace, remote)
+                },
+            )
+            .into_iter()
+        });
         for (authority, batch_keys, assignments) in groups.into_values() {
-            let outcome = self.presence_authority_batch(&authority, &batch_keys);
+            let outcome = replies
+                .as_mut()
+                .and_then(Iterator::next)
+                .unwrap_or_else(|| self.presence_authority_batch(&authority, &batch_keys));
             match outcome {
                 Ok(results) => {
                     if results.len() != batch_keys.len() {

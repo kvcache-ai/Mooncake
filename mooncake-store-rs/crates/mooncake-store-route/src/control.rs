@@ -123,6 +123,16 @@ pub enum RouteControlResponse {
 }
 
 pub trait RouteControlTransport: Send + Sync {
+    fn send_route_control_batch(
+        &self,
+        requests: Vec<(ClientLease, RouteControlRequest)>,
+    ) -> Vec<Result<RouteControlResponse>> {
+        requests
+            .into_iter()
+            .map(|(lease, request)| self.send_route_control(&lease, request))
+            .collect()
+    }
+
     fn send_route_control(
         &self,
         lease: &ClientLease,
@@ -216,9 +226,126 @@ impl RouteControlAuthorityClient {
     pub(crate) fn new(transport: Arc<dyn RouteControlTransport>) -> Self {
         Self { transport }
     }
+
+    fn send_batch(
+        &self,
+        requests: Vec<(ClientLease, RouteControlRequest)>,
+    ) -> Vec<Result<RouteControlResponse>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        let expected = requests.len();
+        let replies = self.transport.send_route_control_batch(requests);
+        if replies.len() != expected {
+            return (0..expected)
+                .map(|_| {
+                    Err(StoreError::Transport(format!(
+                        "route control batch reply length mismatch: expected={expected} actual={}",
+                        replies.len()
+                    )))
+                })
+                .collect();
+        }
+        replies
+    }
 }
 
 impl RouteAuthorityClient for RouteControlAuthorityClient {
+    fn batch_get_routes_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<RouteAuthorityRecord>>>> {
+        let requests = batches
+            .iter()
+            .map(|(lease, keys)| {
+                (
+                    (*lease).clone(),
+                    RouteControlRequest::BatchGet {
+                        namespace: namespace.to_string(),
+                        authority: lease.runtime.stable_id.clone(),
+                        keys: keys.to_vec(),
+                    },
+                )
+            })
+            .collect();
+        self.send_batch(requests)
+            .into_iter()
+            .zip(batches)
+            .map(|(reply, (_, keys))| {
+                let RouteControlResponse::BatchGet(results) = reply? else {
+                    return unexpected_response("batch_get_routes");
+                };
+                ensure_batch_len("batch_get_routes", keys.len(), results.len())?;
+                Ok(results)
+            })
+            .collect()
+    }
+
+    fn batch_get_route_presence_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<RouteAuthorityPresence>>>> {
+        let requests = batches
+            .iter()
+            .map(|(lease, keys)| {
+                (
+                    (*lease).clone(),
+                    RouteControlRequest::BatchContains {
+                        namespace: namespace.to_string(),
+                        authority: lease.runtime.stable_id.clone(),
+                        keys: keys.to_vec(),
+                        include_presence: true,
+                    },
+                )
+            })
+            .collect();
+        self.send_batch(requests)
+            .into_iter()
+            .zip(batches)
+            .map(|(reply, (_, keys))| {
+                let RouteControlResponse::BatchGetPresence(results) = reply? else {
+                    return unexpected_response("batch_get_route_presence");
+                };
+                ensure_batch_len("batch_get_route_presence", keys.len(), results.len())?;
+                Ok(results)
+            })
+            .collect()
+    }
+
+    fn batch_contains_routes_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<bool>>>> {
+        let requests = batches
+            .iter()
+            .map(|(lease, keys)| {
+                (
+                    (*lease).clone(),
+                    RouteControlRequest::BatchContains {
+                        namespace: namespace.to_string(),
+                        authority: lease.runtime.stable_id.clone(),
+                        keys: keys.to_vec(),
+                        include_presence: false,
+                    },
+                )
+            })
+            .collect();
+        self.send_batch(requests)
+            .into_iter()
+            .zip(batches)
+            .map(|(reply, (_, keys))| {
+                let RouteControlResponse::BatchContains(results) = reply? else {
+                    return unexpected_response("batch_contains_routes");
+                };
+                ensure_batch_len("batch_contains_routes", keys.len(), results.len())?;
+                Ok(results)
+            })
+            .collect()
+    }
+
     fn get_allocation_route_references(
         &self,
         lease: &ClientLease,
@@ -448,4 +575,143 @@ fn unexpected_response<T>(operation: &str) -> Result<T> {
     Err(StoreError::Transport(format!(
         "route control {operation} reply type mismatch"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
+    };
+
+    use super::*;
+
+    struct BatchTransport {
+        replies: Mutex<VecDeque<Result<RouteControlResponse>>>,
+        requests: Mutex<Vec<RouteControlRequest>>,
+        malformed_batch: bool,
+    }
+
+    impl RouteControlTransport for BatchTransport {
+        fn send_route_control(
+            &self,
+            _lease: &ClientLease,
+            request: RouteControlRequest,
+        ) -> Result<RouteControlResponse> {
+            self.requests.lock().unwrap().push(request);
+            self.replies.lock().unwrap().pop_front().unwrap()
+        }
+
+        fn send_route_control_batch(
+            &self,
+            requests: Vec<(ClientLease, RouteControlRequest)>,
+        ) -> Vec<Result<RouteControlResponse>> {
+            if self.malformed_batch {
+                return Vec::new();
+            }
+            requests
+                .into_iter()
+                .map(|(lease, request)| self.send_route_control(&lease, request))
+                .collect()
+        }
+    }
+
+    fn lease(id: &str) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(id, ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            expires_at_ms: u64::MAX,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            endpoints: ClientEndpointSet::default(),
+        }
+    }
+
+    #[test]
+    fn multi_authority_contains_preserves_order_duplicates_and_item_errors() {
+        let transport = Arc::new(BatchTransport {
+            replies: Mutex::new(VecDeque::from([
+                Ok(RouteControlResponse::BatchContains(vec![
+                    Ok(true),
+                    Ok(false),
+                ])),
+                Ok(RouteControlResponse::BatchContains(vec![Err(
+                    StoreError::Unsupported("item".to_string()),
+                )])),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            malformed_batch: false,
+        });
+        let client = RouteControlAuthorityClient::new(transport.clone());
+        let first = lease("b");
+        let second = lease("a");
+        let duplicate = vec![ObjectKey::new("same"), ObjectKey::new("same")];
+        let keys = vec![ObjectKey::new("other")];
+        let mut replies = client
+            .batch_contains_routes_many("ns", &[(&first, &duplicate), (&second, &keys)])
+            .into_iter();
+        let first_reply = replies.next().unwrap().unwrap();
+        assert!(matches!(first_reply.as_slice(), [Ok(true), Ok(false)]));
+        assert!(matches!(
+            replies.next().unwrap().unwrap().as_slice(),
+            [Err(StoreError::Unsupported(_))]
+        ));
+        let requests = transport.requests.lock().unwrap();
+        assert!(
+            matches!(&requests[0], RouteControlRequest::BatchContains { authority, keys, .. }
+            if authority == &first.runtime.stable_id && keys == &duplicate)
+        );
+        assert!(
+            matches!(&requests[1], RouteControlRequest::BatchContains { authority, .. }
+            if authority == &second.runtime.stable_id)
+        );
+    }
+
+    #[test]
+    fn multi_authority_presence_validates_each_reply() {
+        let transport = Arc::new(BatchTransport {
+            replies: Mutex::new(VecDeque::from([
+                Ok(RouteControlResponse::BatchContains(vec![Ok(true)])),
+                Ok(RouteControlResponse::BatchGetPresence(Vec::new())),
+                Err(StoreError::Unsupported("legacy".to_string())),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            malformed_batch: false,
+        });
+        let client = RouteControlAuthorityClient::new(transport);
+        let authority = lease("a");
+        let keys = vec![ObjectKey::new("key")];
+        let replies = client.batch_get_route_presence_many(
+            "ns",
+            &[
+                (&authority, &keys),
+                (&authority, &keys),
+                (&authority, &keys),
+            ],
+        );
+        assert!(
+            matches!(&replies[0], Err(StoreError::Transport(message)) if message.contains("type mismatch"))
+        );
+        assert!(
+            matches!(&replies[1], Err(StoreError::Transport(message)) if message.contains("length mismatch"))
+        );
+        assert!(matches!(&replies[2], Err(StoreError::Unsupported(_))));
+    }
+
+    #[test]
+    fn multi_authority_reads_reject_missing_transport_replies() {
+        let transport = Arc::new(BatchTransport {
+            replies: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            malformed_batch: true,
+        });
+        let client = RouteControlAuthorityClient::new(transport);
+        let authority = lease("a");
+        let keys = vec![ObjectKey::new("key")];
+        let replies = client.batch_get_routes_many("ns", &[(&authority, &keys)]);
+        assert_eq!(replies.len(), 1);
+        assert!(
+            matches!(&replies[0], Err(StoreError::Transport(message)) if message.contains("length mismatch"))
+        );
+    }
 }

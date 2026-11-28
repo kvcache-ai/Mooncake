@@ -58,6 +58,45 @@ impl RouteOwnerPage {
 }
 
 pub(crate) trait RouteAuthorityClient: Send + Sync {
+    fn batch_get_routes_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<RouteAuthorityRecord>>>> {
+        batches
+            .iter()
+            .map(|(lease, keys)| {
+                self.batch_get_routes(lease, namespace, &lease.runtime.stable_id, keys)
+            })
+            .collect()
+    }
+
+    fn batch_get_route_presence_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<RouteAuthorityPresence>>>> {
+        batches
+            .iter()
+            .map(|(lease, keys)| {
+                self.batch_get_route_presence(lease, namespace, &lease.runtime.stable_id, keys)
+            })
+            .collect()
+    }
+
+    fn batch_contains_routes_many(
+        &self,
+        namespace: &str,
+        batches: &[(&ClientLease, &[ObjectKey])],
+    ) -> Vec<Result<Vec<Result<bool>>>> {
+        batches
+            .iter()
+            .map(|(lease, keys)| {
+                self.batch_contains_routes(lease, namespace, &lease.runtime.stable_id, keys)
+            })
+            .collect()
+    }
+
     fn batch_get_routes(
         &self,
         lease: &ClientLease,

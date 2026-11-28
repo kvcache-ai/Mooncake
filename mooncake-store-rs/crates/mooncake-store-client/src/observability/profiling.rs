@@ -52,7 +52,7 @@ pub(crate) struct ProfilingSpan {
 }
 
 #[derive(Clone)]
-struct ProfilingFrame {
+pub(crate) struct ProfilingFrame {
     context: Context,
     request_id: u64,
     root_operation: &'static str,
@@ -194,6 +194,26 @@ struct LocalSpanRecord<'a> {
 }
 
 impl ProfilingSpan {
+    pub(crate) fn current_parent() -> Option<ProfilingFrame> {
+        profiling_control()
+            .enabled
+            .load(Ordering::Relaxed)
+            .then(current_profiling_frame)
+            .flatten()
+    }
+
+    pub(crate) fn start_detached(operation: &'static str, parent: Option<&ProfilingFrame>) -> Self {
+        let semantics = operation_semantics(operation);
+        let mut span = Self::start_named_with_parent(
+            || Cow::Borrowed(semantics.span_name),
+            semantics,
+            parent.cloned(),
+        );
+        span.set_str("mooncake.operation", operation);
+        span.pop_stack_frame();
+        span
+    }
+
     pub(crate) fn start(operation: &'static str) -> Self {
         let semantics = operation_semantics(operation);
         let mut span = Self::start_named(|| Cow::Borrowed(semantics.span_name), semantics);
@@ -259,6 +279,14 @@ impl ProfilingSpan {
         name: impl FnOnce() -> Cow<'static, str>,
         semantics: OperationSemantics,
     ) -> Self {
+        Self::start_named_with_parent(name, semantics, Self::current_parent())
+    }
+
+    fn start_named_with_parent(
+        name: impl FnOnce() -> Cow<'static, str>,
+        semantics: OperationSemantics,
+        parent: Option<ProfilingFrame>,
+    ) -> Self {
         let control = profiling_control();
         if !control.enabled.load(Ordering::Relaxed) {
             return Self::disabled();
@@ -269,7 +297,6 @@ impl ProfilingSpan {
         }
 
         let span_name = name();
-        let parent = current_profiling_frame();
         let request_id = parent
             .as_ref()
             .map(|frame| frame.request_id)
@@ -1179,6 +1206,71 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
+
+    #[test]
+    fn detached_rpc_spans_keep_the_captured_root_across_threads() {
+        use crate::observability::OperationTracker;
+
+        let _guard = crate::observability::test_process_lock().lock();
+        let control = profiling_control();
+        let previous = control.snapshot();
+        control
+            .update(
+                None,
+                None,
+                None,
+                Some(1.0),
+                Some(Some("/dev/null".to_string())),
+                Some(true),
+            )
+            .expect("local profiling should enable");
+        let root = ProfilingSpan::start("batch_is_exist");
+        let parent = ProfilingSpan::current_parent().expect("root should enter the calling thread");
+        let request_id = parent.request_id;
+        std::thread::spawn(move || {
+            let worker_root = ProfilingSpan::start("batch_get");
+            let worker_id = worker_root.request_id();
+            let first = OperationTracker::new_detached("batch_contains_routes", Some(&parent));
+            let second = OperationTracker::new_detached("batch_get_routes", Some(&parent));
+            for tracker in [&first, &second] {
+                assert_eq!(tracker.trace_request_id(), Some(request_id));
+                assert_eq!(
+                    tracker
+                        .profiling_span
+                        .local
+                        .as_ref()
+                        .unwrap()
+                        .root_operation,
+                    "store.batch_is_exist"
+                );
+            }
+            first.finish(&Ok(()), 0);
+            second.finish(&Ok(()), 0);
+            assert_eq!(
+                ProfilingSpan::current_parent().map(|frame| frame.request_id),
+                worker_id
+            );
+            worker_root.finish("ok", 0);
+            assert!(ProfilingSpan::current_parent().is_none());
+        })
+        .join()
+        .expect("worker should preserve its profiling stack");
+        assert_eq!(
+            ProfilingSpan::current_parent().map(|frame| frame.request_id),
+            Some(request_id)
+        );
+        root.finish("ok", 0);
+        control
+            .update(
+                None,
+                None,
+                None,
+                Some(previous.sample_ratio),
+                Some(previous.file),
+                Some(previous.enabled),
+            )
+            .expect("profiling configuration should restore");
+    }
 
     #[test]
     fn normalizes_http_trace_endpoint() {

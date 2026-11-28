@@ -72,18 +72,26 @@ pub struct OperationTracker {
 
 impl OperationTracker {
     pub fn new(operation: &'static str) -> Self {
+        Self::with_profiling_span(operation, ProfilingSpan::start(operation))
+    }
+
+    pub(crate) fn new_detached(
+        operation: &'static str,
+        parent: Option<&profiling::ProfilingFrame>,
+    ) -> Self {
+        Self::with_profiling_span(operation, ProfilingSpan::start_detached(operation, parent))
+    }
+
+    fn with_profiling_span(operation: &'static str, mut profiling_span: ProfilingSpan) -> Self {
         let scope = default_scope(operation);
+        profiling_span.set_str("mooncake.scope", scope);
         Self {
             operation,
             scope,
             start: Instant::now(),
             bytes_in: 0,
             registry: registry::global_metrics_registry().clone(),
-            profiling_span: {
-                let mut span = ProfilingSpan::start(operation);
-                span.set_str("mooncake.scope", scope);
-                span
-            },
+            profiling_span,
             _inflight: InflightGuard::enter(operation, scope),
         }
     }
