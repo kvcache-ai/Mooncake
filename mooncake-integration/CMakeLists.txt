@@ -348,15 +348,15 @@ endif()
 if(WITH_EP)
   install(TARGETS _ep LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                               COMPONENT python)
-  if(USE_CUDA)
-    install(
-      FILES "${EP_PG_STAGING_DIR}/libmooncake_ep_device.so"
-      DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
-      COMPONENT python)
+  if(USE_CUDA OR USE_MUSA)
+    if(USE_CUDA)
+      install(
+        FILES "${EP_PG_STAGING_DIR}/libmooncake_ep_device.so"
+        DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
+        COMPONENT python)
+    endif()
 
-    # The CUDA EP JIT runs nvcc on the user's machine, so nvcc needs the kernel
-    # headers there too. Put them in the wheel, in a mooncake_ep_jit/ directory
-    # next to libmooncake_ep_device.so.
+    # Runtime EP JIT compilers need the kernel headers after installation.
     install(
       DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
       DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
