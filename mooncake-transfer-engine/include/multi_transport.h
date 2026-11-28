@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "transport/transport.h"
@@ -40,12 +42,14 @@ class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
 class MultiTransportBatchTestPeer;
+class UnregisterQuiesceTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
     friend class MultiTransportTestPeer;
     friend class MultiTransportBatchTestPeer;
+    friend class UnregisterQuiesceTestPeer;
 
    public:
     using BatchID = Transport::BatchID;
@@ -124,6 +128,13 @@ class MultiTransport {
 
     std::vector<Transport *> listTransports();
 
+    // Block until no live/deferred batch still references [addr,
+    // addr+length). Used by unregisterLocalMemory so ibv_dereg_mr
+    // cannot race outstanding RDMA WRs (local protection → sticky
+    // Device-not-active). length==0 matches exact source pointer.
+    // Returns BatchBusy if timeout_ms elapses while still busy.
+    Status waitMemoryIdle(void *addr, size_t length, int64_t timeout_ms);
+
     void *getBaseAddr();
 
     // Conservative peer routes, without constructing/routing a descriptor
@@ -171,6 +182,14 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
+    void trackLiveBatch(BatchID batch_id);
+    void untrackLiveBatch(BatchID batch_id);
+    bool memoryReferencedByBatch(BatchID batch_id, void *addr,
+                                 size_t length) const;
+    // Scans live batches. A clean result is confirmed under every shard
+    // lock so a batch inserted into an already-scanned shard is not missed.
+    bool memoryBusy(void *addr, size_t length) const;
+
     // Stop a future or already-published event record from being delivered.
     // Does not delete the batch.
     void suppressCompletion(BatchDesc *batch);
@@ -193,6 +212,34 @@ class MultiTransport {
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
     std::mutex deferred_cleanup_mutex_;
+    // Always-on live batch index for unregister quiesce (#5481).
+    // Distinct from optional CONFIG_USE_BATCH_DESC_SET ownership map.
+    // Sharded so concurrent allocate/free only contend on one stripe;
+    // waitMemoryIdle (unregister) is the only full scan.
+    static constexpr size_t kLiveBatchShards = 64;
+    struct LiveBatchShard {
+        mutable std::mutex mu;
+        std::unordered_set<BatchID> batches;
+    };
+    std::array<LiveBatchShard, kLiveBatchShards> live_batch_shards_{};
+    // BatchID is a BatchDesc address. Drop alignment bits and mix the
+    // rest so 16-byte allocation does not collapse onto 4 of 64 shards.
+    static size_t liveBatchShard(BatchID batch_id) {
+        uint64_t x = batch_id >> 4;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        return static_cast<size_t>(x % kLiveBatchShards);
+    }
+
+    void beginQuiescePublish(BatchID batch_id);
+    void commitQuiesceSpans(BatchID batch_id,
+                            const BatchDesc::QuiesceSpan *spans,
+                            size_t span_count);
+    // Marks tasks whose submit has returned. One release store per task,
+    // on the submit thread, after post. Not on the completion path.
+    void settleQuiesceTasks(BatchID batch_id, size_t task_base);
+    void cancelQuiescePublish(BatchID batch_id);
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;

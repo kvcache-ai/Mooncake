@@ -890,6 +890,16 @@ int TransferEngineImpl::unregisterReusableMemory(
     }
     if (!expired.empty()) {
         int ret = releaseReusableRegions(expired);
+        if (ret == ERR_BATCH_BUSY) {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            for (auto addr : expired) {
+                auto region = local_memory_regions_.find(
+                    reinterpret_cast<uintptr_t>(addr));
+                if (region != local_memory_regions_.end())
+                    region->second.releasing = false;
+            }
+            return ret;
+        }
         if (ret) return ret;
     }
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -908,6 +918,9 @@ int TransferEngineImpl::unregisterReusableMemory(
 
 int TransferEngineImpl::releaseReusableRegions(
     const std::vector<void*>& regions) {
+    for (auto addr : regions) {
+        if (int busy = quiesceBeforeDeregister(addr)) return busy;
+    }
     // On retry, some transports may have already unregistered the region.
     auto transports = multi_transports_->listTransports();
     int first_error = 0;
@@ -989,6 +1002,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
     if (memory_registration_reuse_) return unregisterReusableMemory({addr});
+    if (int busy = quiesceBeforeDeregister(addr)) return busy;
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
@@ -1230,6 +1244,9 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatchImpl(
     const std::vector<void*>& addr_list) {
+    for (auto* addr : addr_list) {
+        if (int busy = quiesceBeforeDeregister(addr)) return busy;
+    }
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
@@ -1314,6 +1331,36 @@ void TransferEngineImpl::releaseMemoryRegions(
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
+}
+
+int TransferEngineImpl::quiesceBeforeDeregister(void* addr) {
+    if (!multi_transports_ || !addr) return 0;
+    uint64_t region_length = 0;
+    // Unknown addresses keep the transport's own not-registered contract.
+    if (!lookupLocalRegionLength(addr, &region_length)) return 0;
+    Status st = multi_transports_->waitMemoryIdle(
+        addr, static_cast<size_t>(region_length), /*timeout_ms=*/5000);
+    if (st.IsBatchBusy()) {
+        LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
+                      "refusing deregister addr="
+                   << addr;
+        return ERR_BATCH_BUSY;
+    }
+    if (!st.ok()) {
+        LOG(WARNING) << "unregisterLocalMemory waitMemoryIdle: "
+                     << st.ToString();
+    }
+    return 0;
+}
+
+bool TransferEngineImpl::lookupLocalRegionLength(void* addr, uint64_t* length) {
+    if (!addr || !length) return false;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
+    if (it == local_memory_regions_.end() || it->second.length == 0)
+        return false;
+    *length = it->second.length;
+    return true;
 }
 
 void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {

@@ -521,6 +521,15 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
+    // Full registered length for [addr, addr+length) overlap checks.
+    // False when addr is not an exact registered base.
+    bool lookupLocalRegionLength(void* addr, uint64_t* length);
+
+    // Returns ERR_BATCH_BUSY when transfers still reference this registered
+    // region. Unknown addresses return 0 and leave the transport's own
+    // not-registered result in place.
+    int quiesceBeforeDeregister(void* addr);
+
     void clearSkipRegistrationLocked(void* addr);
 
     std::shared_ptr<TransferMetadata> metadata_;

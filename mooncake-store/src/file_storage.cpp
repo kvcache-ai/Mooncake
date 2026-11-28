@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -557,6 +558,20 @@ FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
     // Pinned and ordinary staging are separate source-buffer contracts.
     flight_key.push_back(prefer_pinned ? '\1' : '\0');
     auto flight = inflight_cold_reads_.Acquire(flight_key);
+    if (cold_read_overlap_gate_ != nullptr) {
+        cold_read_overlap_gate_->entered.fetch_add(1,
+                                                   std::memory_order_acq_rel);
+        if (flight.IsLeader()) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (cold_read_overlap_gate_->entered.load(
+                       std::memory_order_acquire) <
+                       cold_read_overlap_gate_->need &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        }
+    }
     if (!flight.IsLeader()) {
         try {
             return flight.Result().get();
