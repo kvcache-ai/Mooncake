@@ -25,40 +25,6 @@ bool AddOverflows(uint64_t a, uint64_t b) {
 
 void ClearCudaError() { cudaGetLastError(); }
 
-tl::expected<int32_t, ErrorCode> ResolveCudaDevice(
-    const CudaIpcBufferHandle &handle) {
-    if (!handle.has_device_uuid) {
-        if (handle.device_id < 0) {
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        return handle.device_id;
-    }
-
-    if (cuInit(0) != CUDA_SUCCESS) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    int device_count = 0;
-    if (cuDeviceGetCount(&device_count) != CUDA_SUCCESS) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    for (int device_id = 0; device_id < device_count; ++device_id) {
-        CUdevice device = 0;
-        CUuuid uuid{};
-        if (cuDeviceGet(&device, device_id) != CUDA_SUCCESS ||
-            cuDeviceGetUuid(&uuid, device) != CUDA_SUCCESS) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        static_assert(sizeof(uuid.bytes) == kCudaDeviceUuidSize,
-                      "Unexpected CUDA UUID size");
-        if (std::memcmp(uuid.bytes, handle.device_uuid.data(),
-                        kCudaDeviceUuidSize) == 0) {
-            return device_id;
-        }
-    }
-    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-}
-
 using CuMemGetAddressRangeFn = CUresult (*)(CUdeviceptr *, size_t *,
                                             CUdeviceptr);
 
@@ -137,6 +103,13 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
 
     cudaIpcMemHandle_t ipc_handle{};
     cudaError_t ret = cudaIpcGetMemHandle(&ipc_handle, (void *)base_ptr);
+
+    // PCI bus ID survives CUDA_VISIBLE_DEVICES remapping across processes
+    // (#4980). Prefer this over attr.device when the peer opens the handle.
+    char pci_bus_id[kCudaPciBusIdSize] = {};
+    const cudaError_t pci_ret =
+        cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), attr.device);
+
     if (current_device >= 0) cudaSetDevice(current_device);
     if (ret != cudaSuccess) {
         ClearCudaError();
@@ -148,16 +121,12 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
     exported.offset = offset;
     exported.size = payload_size;
     exported.device_id = attr.device;
-    CUdevice device = 0;
-    CUuuid uuid{};
-    if (cuDeviceGet(&device, attr.device) != CUDA_SUCCESS ||
-        cuDeviceGetUuid(&uuid, device) != CUDA_SUCCESS) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    if (pci_ret == cudaSuccess && pci_bus_id[0] != '\0') {
+        std::memcpy(exported.pci_bus_id.data(), pci_bus_id, kCudaPciBusIdSize);
+        exported.has_pci_bus_id = true;
+    } else {
+        ClearCudaError();
     }
-    static_assert(sizeof(uuid.bytes) == kCudaDeviceUuidSize,
-                  "Unexpected CUDA UUID size");
-    std::memcpy(exported.device_uuid.data(), uuid.bytes, kCudaDeviceUuidSize);
-    exported.has_device_uuid = true;
     return exported;
 #else
     (void)ptr;
@@ -222,21 +191,39 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
                   "Unexpected CUDA IPC handle size");
 
+    // Never cudaSetDevice(handle.device_id): that ordinal is relative to the
+    // peer's CUDA_VISIBLE_DEVICES and may map to a different physical GPU
+    // (or an invalid index) in this process (#4980). Prefer pci_bus_id.
     if (handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto resolved_device = ResolveCudaDevice(handle);
-    if (!resolved_device.has_value()) {
-        return tl::unexpected(resolved_device.error());
-    }
-
-    int current_device = -1;
-    cudaGetDevice(&current_device);
-    if (cudaSetDevice(*resolved_device) != cudaSuccess) {
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess || previous_device < 0) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
+
+    int open_device = previous_device;
+    bool switched_device = false;
+    if (handle.has_pci_bus_id && handle.pci_bus_id[0] != '\0') {
+        if (cudaDeviceGetByPCIBusId(&open_device, handle.pci_bus_id.data()) !=
+            cudaSuccess) {
+            ClearCudaError();
+            // Exporter GPU is not visible under this process's
+            // CUDA_VISIBLE_DEVICES.
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (open_device != previous_device) {
+            if (cudaSetDevice(open_device) != cudaSuccess) {
+                ClearCudaError();
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            switched_device = true;
+        }
+    }
+    // Legacy handles without pci_bus_id: open on the caller's current device
+    // (same as TENT NVLinkTransport). Do not trust handle.device_id.
 
     cudaIpcMemHandle_t ipc_handle{};
     std::memcpy(&ipc_handle, handle.handle.data(), sizeof(ipc_handle));
@@ -257,14 +244,16 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
             ret = cudaErrorInvalidValue;
         }
     }
-    if (current_device >= 0) cudaSetDevice(current_device);
+    if (switched_device) {
+        if (cudaSetDevice(previous_device) != cudaSuccess) ClearCudaError();
+    }
     if (ret != cudaSuccess || base == nullptr) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, *resolved_device);
+    return CudaIpcBufferMapping(base, ptr, open_device);
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);
