@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 import re
@@ -495,6 +496,81 @@ def test_engine_typing_ships_from_one_authoritative_source() -> None:
             name for name in set(bound_names) if not re.search(rf"\b{name}\b", stub)
         )
         assert not missing, f"{binding} binds names missing from engine.pyi: {missing}"
+
+
+def test_store_typing_ships_from_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    stub_path = package_root / "_store.pyi"
+    facade_stub_path = package_root / "store" / "__init__.pyi"
+
+    assert stub_path.is_file()
+    assert facade_stub_path.is_file()
+    assert not (legacy_package_root / "_store.pyi").exists()
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert "_store.pyi" in migrated_modules
+    assert 'cp -R "${STORE_FACADE_SOURCE_DIR}"' in legacy_build_script
+
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    package_data = legacy["tool"]["setuptools"]["package-data"]
+    assert "*.pyi" in package_data["mooncake"]
+    assert "*.pyi" in package_data["mooncake.store"]
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    assert "../python/mooncake/_store.pyi" in integration_cmake
+    assert 'PATTERN "*.pyi"' in integration_cmake
+
+    stub = stub_path.read_text()
+    for binding in (
+        "mooncake-integration/store/store_py.cpp",
+        "mooncake-integration/store/buffer_pool.cpp",
+    ):
+        source = (REPOSITORY_ROOT / binding).read_text()
+        bound_names = re.findall(
+            r'(?:\.def\w*|m\.attr|py::(?:class_|enum_)<[^;]*?>)\(\s*(?:m,\s*)?"(\w+)"',
+            source,
+        )
+        bound_names += re.findall(r'\.value\(\s*"(\w+)"', source)
+        assert bound_names, binding
+        missing = sorted(
+            name for name in set(bound_names) if not re.search(rf"\b{name}\b", stub)
+        )
+        assert not missing, f"{binding} binds names missing from _store.pyi: {missing}"
+
+    facade = ast.parse(facade_stub_path.read_text())
+    stub_all = next(
+        ast.literal_eval(node.value)
+        for node in facade.body
+        if isinstance(node, ast.Assign) and node.targets[0].id == "__all__"
+    )
+    reexports = {
+        alias.asname
+        for node in facade.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    runtime = ast.parse((package_root / "store" / "__init__.py").read_text())
+    export_sets = {
+        node.targets[0].id: set(ast.literal_eval(node.value.args[0]))
+        for node in runtime.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"_CPP_EXPORTS", "_CPP_INTERNAL_EXPORTS"}
+    }
+    assert set(stub_all) == export_sets["_CPP_EXPORTS"]
+    assert (
+        reexports == export_sets["_CPP_EXPORTS"] | export_sets["_CPP_INTERNAL_EXPORTS"]
+    )
 
 
 def test_ssd_administration_modules_have_one_authoritative_source() -> None:

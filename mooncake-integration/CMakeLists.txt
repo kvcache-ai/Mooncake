@@ -293,7 +293,8 @@ if(NOT SKBUILD)
     DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/store"
     COMPONENT python
     FILES_MATCHING
-    PATTERN "*.py")
+    PATTERN "*.py"
+    PATTERN "*.pyi")
 
   if(WITH_TE)
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/engine.pyi"
@@ -301,6 +302,9 @@ if(NOT SKBUILD)
   endif()
 
   if(WITH_STORE)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_store.pyi"
+            DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
+
     install(
       FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"

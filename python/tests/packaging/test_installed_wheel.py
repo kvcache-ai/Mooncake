@@ -46,6 +46,7 @@ def test_wheel_imports_outside_the_repository(
     assert "mooncake/store/__init__.py" in wheel_files
     assert "mooncake/_structured_ranges.py" in wheel_files
     assert {"mooncake/py.typed", "mooncake/engine.pyi"} <= wheel_files
+    assert {"mooncake/_store.pyi", "mooncake/store/__init__.pyi"} <= wheel_files
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
     assert not any(name.startswith("mooncake_store_rs/") for name in wheel_files)
     assert not any("_shim.py" in name or "meta_path" in name for name in wheel_files)
