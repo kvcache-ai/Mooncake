@@ -29,6 +29,8 @@
 #include "types.h"
 
 namespace mooncake {
+struct SsdMetric;
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -1481,7 +1483,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    public:
     OffsetAllocatorStorageBackend(
         const FileStorageConfig& file_storage_config_,
-        const OffsetAllocatorBackendConfig& offset_backend_config = {});
+        const OffsetAllocatorBackendConfig& offset_backend_config = {},
+        SsdMetric* ssd_metric = nullptr);
 
     ~OffsetAllocatorStorageBackend();
     OffsetAllocatorStorageBackend(OffsetAllocatorStorageBackend&&) = default;
@@ -1870,6 +1873,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // ===== Eviction-related members =====
     OffsetAllocatorBackendConfig cfg_;
+    SsdMetric* ssd_metric_;
 
     // Counter for keys skipped due to fallback eviction exhaustion.
     // See GetEvictionSkips() for the public accessor.
@@ -1993,6 +1997,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config);
+CreateStorageBackend(const FileStorageConfig& config,
+                     SsdMetric* ssd_metric = nullptr);
 
 }  // namespace mooncake

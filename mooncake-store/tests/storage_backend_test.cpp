@@ -32,6 +32,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "client_metric.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "utils/common.h"
@@ -4636,6 +4637,89 @@ std::unordered_map<std::string, std::vector<Slice>> MakeSingleKeyBatch(
     batch.emplace(
         key, std::vector<Slice>{Slice{buffers.back().get(), value.size()}});
     return batch;
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_CountsFinalAllocationFailure) {
+    const struct {
+        int64_t capacity;
+        uint32_t max_nodes;
+        int node_failures;
+        int region_failures;
+    } cases[] = {{64 * 1024, 2, 1, 0}, {8 * 1024, 128, 0, 1}};
+    const auto complete = [](const std::vector<std::string>&,
+                             std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    const std::string value(1024, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.max_nodes);
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+        config.total_size_limit = test_case.capacity;
+        config.total_keys_limit = 100;
+
+        OffsetAllocatorBackendConfig offset_config;
+        offset_config.max_capacity_nodes = test_case.max_nodes;
+        SsdMetric metrics;
+        OffsetAllocatorStorageBackend backend(config, offset_config, &metrics);
+        ASSERT_TRUE(backend.Init());
+
+        const auto first = MakeSingleKeyBatch("first", value, buffers);
+        ASSERT_EQ(backend.BatchOffload(first, complete).value_or(-1), 1);
+
+        auto remaining = MakeSingleKeyBatch("second", value, buffers);
+        remaining.merge(MakeSingleKeyBatch("third", value, buffers));
+        ASSERT_EQ(backend.BatchOffload(remaining, complete).value_or(-1), 0);
+        EXPECT_EQ(metrics.ssd_offload_node_exhausted.value(),
+                  test_case.node_failures);
+        EXPECT_EQ(metrics.ssd_offload_no_fitting_region.value(),
+                  test_case.region_failures);
+    }
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DoesNotCountSuccessfulAllocationRetry) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 64 * 1024;
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorBackendConfig offset_config;
+    offset_config.max_capacity_nodes = 2;
+    offset_config.eviction_policy = OffsetEvictionPolicy::FIFO;
+    offset_config.fallback_evict_batch = 1;
+
+    SsdMetric metrics;
+    OffsetAllocatorStorageBackend backend(config, offset_config, &metrics);
+    ASSERT_TRUE(backend.Init());
+
+    const auto complete = [](const std::vector<std::string>&,
+                             std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    std::vector<std::string> evicted;
+    const auto evict = [&evicted](const std::vector<std::string>& keys) {
+        evicted.insert(evicted.end(), keys.begin(), keys.end());
+        return tl::expected<void, ErrorCode>{};
+    };
+
+    const std::string value(1024, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+    const auto first = MakeSingleKeyBatch("first", value, buffers);
+    const auto second = MakeSingleKeyBatch("second", value, buffers);
+    ASSERT_EQ(backend.BatchOffload(first, complete, evict).value_or(-1), 1);
+    ASSERT_TRUE(evicted.empty());
+    ASSERT_EQ(backend.BatchOffload(second, complete, evict).value_or(-1), 1);
+
+    EXPECT_EQ(evicted, std::vector<std::string>{"first"});
+    EXPECT_TRUE(backend.IsExist("second").value_or(false));
+    EXPECT_EQ(metrics.ssd_offload_node_exhausted.value(), 0);
+    EXPECT_EQ(metrics.ssd_offload_no_fitting_region.value(), 0);
 }
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {

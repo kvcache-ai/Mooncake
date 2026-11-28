@@ -529,6 +529,12 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_offload_node_exhausted(
+              "mooncake_ssd_offload_node_exhausted_total",
+              "SSD offload allocation failures at the node limit", labels),
+          ssd_offload_no_fitting_region(
+              "mooncake_ssd_offload_no_fitting_region_total",
+              "SSD offload allocation failures with no fitting region", labels),
           ssd_disk_fenced("mooncake_ssd_disk_fenced",
                           "1 after a disk failure fenced the SSD tier", labels),
           start_time_(std::chrono::steady_clock::now()) {}
@@ -545,6 +551,8 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::counter_t ssd_offload_node_exhausted;
+    ylt::metric::counter_t ssd_offload_no_fitting_region;
     ylt::metric::gauge_t ssd_disk_fenced;
     std::chrono::steady_clock::time_point start_time_;
 
@@ -567,6 +575,8 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_offload_node_exhausted.serialize(str);
+        ssd_offload_no_fitting_region.serialize(str);
         ssd_disk_fenced.serialize(str);
     }
 

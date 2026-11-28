@@ -149,7 +149,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 
-    auto create_storage_backend_result = CreateStorageBackend(config_);
+    auto create_storage_backend_result =
+        CreateStorageBackend(config_, ssd_metric_);
     if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
         throw std::runtime_error("Failed to create storage backend");
