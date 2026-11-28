@@ -89,6 +89,62 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 
 enum class TransferOperationKind { kRead, kWrite };
 
+enum class ReadOperationStage { kMetadata, kPostQuery };
+
+enum class OperationOutcome { kOk, kPartial, kError };
+
+inline const char* ToStageLabel(ReadOperationStage stage) {
+    switch (stage) {
+        case ReadOperationStage::kMetadata:
+            return "metadata";
+        case ReadOperationStage::kPostQuery:
+            return "post_query";
+    }
+    return "unknown";
+}
+
+inline const char* ToOutcomeLabel(OperationOutcome outcome) {
+    switch (outcome) {
+        case OperationOutcome::kOk:
+            return "ok";
+        case OperationOutcome::kPartial:
+            return "partial";
+        case OperationOutcome::kError:
+            return "error";
+    }
+    return "unknown";
+}
+
+inline const std::string& BatchGetMultiBuffersOpName() {
+    static const auto* kName = new std::string("batch_get_into_multi_buffers");
+    return *kName;
+}
+
+inline const std::array<std::string, 3>& BatchGetStageLabel(
+    ReadOperationStage stage, OperationOutcome outcome) {
+    static const auto* kLabels =
+        new std::array<std::array<std::array<std::string, 3>, 3>, 2>{{
+            {{
+                {"batch_get_into_multi_buffers", "metadata", "ok"},
+                {"batch_get_into_multi_buffers", "metadata", "partial"},
+                {"batch_get_into_multi_buffers", "metadata", "error"},
+            }},
+            {{
+                {"batch_get_into_multi_buffers", "post_query", "ok"},
+                {"batch_get_into_multi_buffers", "post_query", "partial"},
+                {"batch_get_into_multi_buffers", "post_query", "error"},
+            }},
+        }};
+    const size_t stage_idx = stage == ReadOperationStage::kMetadata ? 0 : 1;
+    size_t outcome_idx = 2;
+    if (outcome == OperationOutcome::kOk) {
+        outcome_idx = 0;
+    } else if (outcome == OperationOutcome::kPartial) {
+        outcome_idx = 1;
+    }
+    return (*kLabels)[stage_idx][outcome_idx];
+}
+
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
         : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
@@ -336,6 +392,8 @@ struct MasterClientMetric {
 
 struct TransferOperationMetric {
     std::array<std::string, 1> op_names = {"op_name"};
+    std::array<std::string, 3> stage_label_names = {"op_name", "stage",
+                                                    "outcome"};
 
     explicit TransferOperationMetric(
         std::map<std::string, std::string> labels = {})
@@ -347,6 +405,11 @@ struct TransferOperationMetric {
           read_op_latency_us("mooncake_transfer_read_operation_latency",
                              "Read operation latency by interface type (us)",
                              kLatencyBucket, labels, op_names),
+          read_op_stage_latency_us(
+              "mooncake_transfer_read_operation_stage_latency",
+              "Read operation stage latency by interface, stage, and outcome "
+              "(us)",
+              kLatencyBucket, labels, stage_label_names),
           write_op_count("mooncake_transfer_write_operation_count",
                          "Total write operations by interface type", labels,
                          op_names),
@@ -360,6 +423,7 @@ struct TransferOperationMetric {
     ylt::metric::hybrid_counter_1t read_op_count;
     ylt::metric::hybrid_counter_1t read_op_bytes;
     ylt::metric::hybrid_histogram_1t read_op_latency_us;
+    ylt::metric::hybrid_histogram_3t read_op_stage_latency_us;
     ylt::metric::hybrid_counter_1t write_op_count;
     ylt::metric::hybrid_counter_1t write_op_bytes;
     ylt::metric::hybrid_histogram_1t write_op_latency_us;
@@ -387,10 +451,24 @@ struct TransferOperationMetric {
         }
     }
 
+    void ObserveReadStage(const std::string& op_name, ReadOperationStage stage,
+                          OperationOutcome outcome, uint64_t latency_us) {
+        if (op_name == BatchGetMultiBuffersOpName()) {
+            read_op_stage_latency_us.observe(BatchGetStageLabel(stage, outcome),
+                                             static_cast<int64_t>(latency_us));
+            return;
+        }
+        const std::array<std::string, 3> label = {op_name, ToStageLabel(stage),
+                                                  ToOutcomeLabel(outcome)};
+        read_op_stage_latency_us.observe(label,
+                                         static_cast<int64_t>(latency_us));
+    }
+
     void serialize(std::string& str) {
         read_op_count.serialize(str);
         read_op_bytes.serialize(str);
         read_op_latency_us.serialize(str);
+        read_op_stage_latency_us.serialize(str);
         write_op_count.serialize(str);
         write_op_bytes.serialize(str);
         write_op_latency_us.serialize(str);
@@ -403,6 +481,7 @@ struct TransferOperationMetric {
                   "Read Interfaces", snapshot_operations(observed_read_ops_),
                   read_op_count, read_op_bytes, read_op_latency_us)
            << "\n";
+        ss << format_read_stage_summary() << "\n";
         ss << format_operation_group_summary(
             "Write Interfaces", snapshot_operations(observed_write_ops_),
             write_op_count, write_op_bytes, write_op_latency_us);
@@ -413,6 +492,94 @@ struct TransferOperationMetric {
     std::mutex observed_ops_mutex_;
     std::unordered_set<std::string> observed_read_ops_;
     std::unordered_set<std::string> observed_write_ops_;
+
+    std::string format_read_stage_summary() {
+        std::stringstream ss;
+        ss << "Read Stage Breakdown:\n";
+        if (read_op_stage_latency_us.label_value_count() == 0) {
+            ss << "No data";
+            return ss.str();
+        }
+
+        std::vector<std::string> ops = snapshot_operations(observed_read_ops_);
+        if (std::find(ops.begin(), ops.end(), BatchGetMultiBuffersOpName()) ==
+            ops.end()) {
+            ops.push_back(BatchGetMultiBuffersOpName());
+            std::sort(ops.begin(), ops.end());
+        }
+
+        static constexpr std::array<ReadOperationStage, 2> kStages = {
+            ReadOperationStage::kMetadata, ReadOperationStage::kPostQuery};
+        static constexpr std::array<OperationOutcome, 3> kOutcomes = {
+            OperationOutcome::kOk, OperationOutcome::kPartial,
+            OperationOutcome::kError};
+
+        auto bucket_counts = read_op_stage_latency_us.get_bucket_counts();
+        bool found_any = false;
+        for (const auto& op_name : ops) {
+            for (const auto stage : kStages) {
+                for (const auto outcome : kOutcomes) {
+                    const std::array<std::string, 3> label = {
+                        op_name, ToStageLabel(stage), ToOutcomeLabel(outcome)};
+                    int64_t total_count = 0;
+                    for (auto& bucket : bucket_counts) {
+                        total_count += bucket->value(label);
+                    }
+                    if (total_count == 0) {
+                        continue;
+                    }
+
+                    found_any = true;
+                    ss << op_name << " [stage=" << label[1]
+                       << ", outcome=" << label[2]
+                       << "]: count=" << total_count;
+
+                    // Round rank upward (ceil(0.95 * total_count)) so small
+                    // samples do not underestimate p95 into an earlier bucket.
+                    const int64_t p95_target = (total_count * 95 + 99) / 100;
+                    int64_t cumulative = 0;
+                    for (size_t i = 0; i < bucket_counts.size(); ++i) {
+                        cumulative += bucket_counts[i]->value(label);
+                        if (cumulative >= p95_target) {
+                            if (i < kLatencyBucket.size()) {
+                                ss << ", p95<"
+                                   << static_cast<int64_t>(kLatencyBucket[i])
+                                   << "μs";
+                            } else {
+                                ss << ", p95>"
+                                   << static_cast<int64_t>(
+                                          kLatencyBucket.back())
+                                   << "μs";
+                            }
+                            break;
+                        }
+                    }
+
+                    for (size_t i = bucket_counts.size(); i > 0; --i) {
+                        const size_t idx = i - 1;
+                        if (bucket_counts[idx]->value(label) > 0) {
+                            if (idx < kLatencyBucket.size()) {
+                                ss << ", max<"
+                                   << static_cast<int64_t>(kLatencyBucket[idx])
+                                   << "μs";
+                            } else {
+                                ss << ", max>"
+                                   << static_cast<int64_t>(
+                                          kLatencyBucket.back())
+                                   << "μs";
+                            }
+                            break;
+                        }
+                    }
+                    ss << "\n";
+                }
+            }
+        }
+        if (!found_any) {
+            ss << "No data";
+        }
+        return ss.str();
+    }
 
     std::vector<std::string> snapshot_operations(
         const std::unordered_set<std::string>& source) {
@@ -1007,6 +1174,16 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveReadOperationBreakdown(const std::string& op_name,
+                                       OperationOutcome outcome,
+                                       uint64_t metadata_us,
+                                       uint64_t post_query_us) {
+        transfer_operation_metric.ObserveReadStage(
+            op_name, ReadOperationStage::kMetadata, outcome, metadata_us);
+        transfer_operation_metric.ObserveReadStage(
+            op_name, ReadOperationStage::kPostQuery, outcome, post_query_us);
     }
 
     void serialize(std::string& str);

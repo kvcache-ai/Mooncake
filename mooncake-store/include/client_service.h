@@ -823,12 +823,34 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    [[nodiscard]] bool MetricsEnabled() const { return metrics_ != nullptr; }
+
     void ObserveTransferOperation(TransferOperationKind kind,
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         if (metrics_ != nullptr) {
             metrics_->ObserveTransferOperation(kind, op_name, bytes,
                                                latency_us);
+        }
+    }
+
+    /**
+     * @brief Record the stage latency breakdown of a read operation.
+     * @param op_name Read operation interface name (e.g.
+     *        "batch_get_into_multi_buffers")
+     * @param outcome Terminal outcome of the operation (ok, partial, error)
+     * @param metadata_us Time spent querying object metadata from the master
+     * @param post_query_us Time spent in all post-query work (prefetch kick,
+     *        replica selection, slice/buffer setup, data transfer, checksum
+     *        verification, host/device scatter, and duplicate fan-out)
+     */
+    void ObserveReadOperationBreakdown(const std::string& op_name,
+                                       OperationOutcome outcome,
+                                       uint64_t metadata_us,
+                                       uint64_t post_query_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveReadOperationBreakdown(op_name, outcome,
+                                                    metadata_us, post_query_us);
         }
     }
 

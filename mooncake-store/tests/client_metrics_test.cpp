@@ -3,14 +3,19 @@
 
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
+#include <unistd.h>
+
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
@@ -80,14 +85,125 @@ class ScopedEnv {
 tl::expected<void, ErrorCode> SetupClientWithHttp(
     const std::shared_ptr<RealClient>& client, const std::string& client_addr,
     const std::string& master_addr, bool enable_http, int http_port,
-    size_t global_segment_size = 0) {
+    size_t global_segment_size = 0, size_t local_buffer_size = 0) {
     return client->setup_internal(
-        client_addr, "P2PHANDSHAKE", global_segment_size,
-        /*local_buffer_size=*/0, "tcp", "", master_addr, nullptr, "",
+        client_addr, "P2PHANDSHAKE", global_segment_size, local_buffer_size,
+        "tcp", "", master_addr, nullptr, "",
         /*local_rpc_port=*/50052, /*enable_ssd_offload=*/false,
         /*start_offload_rpc_server=*/false, /*ssd_offload_path=*/"",
         /*tenant_id=*/"default", enable_http, http_port);
 }
+
+int64_t SumMatchingMetricLines(const std::string& body,
+                               const std::string& prefix,
+                               const std::vector<std::string>& label_filters) {
+    int64_t total = 0;
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.starts_with(prefix)) continue;
+        bool matches = true;
+        for (const auto& filter : label_filters) {
+            if (line.find(filter) == std::string::npos) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches) continue;
+        const auto space_pos = line.rfind(' ');
+        if (space_pos == std::string::npos) continue;
+        total += std::stoll(line.substr(space_pos + 1));
+    }
+    return total;
+}
+
+bool WaitForDiskOnlyReplica(const std::shared_ptr<RealClient>& client,
+                            const std::string& key,
+                            const std::string& segment_name,
+                            std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool has_disk = false;
+    while (std::chrono::steady_clock::now() < deadline && !has_disk) {
+        for (const auto& replica : client->get_replica_desc(key)) {
+            if (replica.is_disk_replica()) {
+                has_disk = true;
+                break;
+            }
+        }
+        if (!has_disk)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!has_disk) return false;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto cleared = client->batch_replica_clear({key}, segment_name);
+        if (cleared.size() == 1 && cleared[0] == key) {
+            const auto descs = client->get_replica_desc(key);
+            return descs.size() == 1 && descs.front().is_disk_replica();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+struct StageBreakdownEnv {
+    std::filesystem::path tmp_dir;
+    mooncake::testing::InProcMaster master;
+    std::shared_ptr<RealClient> client;
+    std::string client_addr;
+    int http_port = -1;
+
+    ~StageBreakdownEnv() {
+        if (client) client->tearDownAll();
+        master.Stop();
+        if (!tmp_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(tmp_dir, ec);
+        }
+    }
+
+    void Start(bool with_disk) {
+        std::unordered_set<int> used_ports;
+        const int master_rpc = GetTestPort(used_ports);
+        const int master_http = GetTestPort(used_ports);
+        http_port = GetTestPort(used_ports);
+        const int client_port = GetTestPort(used_ports);
+        ASSERT_GT(master_rpc, 0);
+        ASSERT_GT(master_http, 0);
+        ASSERT_GT(http_port, 0);
+        ASSERT_GT(client_port, 0);
+
+        auto builder = mooncake::InProcMasterConfigBuilder()
+                           .set_rpc_port(master_rpc)
+                           .set_http_metrics_port(master_http)
+                           .set_http_metadata_port(0);
+        if (with_disk) {
+            const auto ts =
+                std::chrono::steady_clock::now().time_since_epoch().count();
+            tmp_dir = std::filesystem::temp_directory_path() /
+                      ("mc_metrics_disk_" + std::to_string(::getpid()) + "_" +
+                       std::to_string(ts));
+            std::filesystem::create_directories(tmp_dir);
+            builder.set_root_fs_dir(tmp_dir.string())
+                .set_default_kv_lease_ttl(10);
+        }
+        ASSERT_TRUE(master.Start(builder.build()));
+
+        client = RealClient::create();
+        client_addr = "127.0.0.1:" + std::to_string(client_port);
+        auto res = SetupClientWithHttp(
+            client, client_addr, master.master_address(), /*enable_http=*/true,
+            http_port, /*global_segment_size=*/16 * 1024 * 1024,
+            /*local_buffer_size=*/4 * 1024 * 1024);
+        ASSERT_TRUE(res.has_value()) << toString(res.error());
+    }
+
+    HttpResponse FetchMetrics() const {
+        return FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
+                        "/metrics");
+    }
+};
 
 }  // namespace
 
@@ -758,6 +874,206 @@ TEST_F(ClientMetricsTest, HttpMetricsPortConflictDoesNotFailSetup) {
 
     EXPECT_EQ(second_client->tearDownAll(), 0);
     EXPECT_EQ(first_client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, ReadOperationStageBreakdownIsReported) {
+    auto stage_count = [](const std::string& text, const std::string& stage,
+                          const std::string& outcome) {
+        return SumMatchingMetricLines(
+            text, "mooncake_transfer_read_operation_stage_latency_count{",
+            {"op_name=\"batch_get_into_multi_buffers\"",
+             "stage=\"" + stage + "\"", "outcome=\"" + outcome + "\""});
+    };
+
+    ClientMetric metrics;
+    EXPECT_NE(metrics.summary_metrics().find("Read Stage Breakdown:\nNo data"),
+              std::string::npos);
+
+    // 1) Single-sample ok/partial formatting + upward-rounded p95.
+    metrics.ObserveReadOperationBreakdown("batch_get_into_multi_buffers",
+                                          OperationOutcome::kOk, 300, 1500);
+    metrics.ObserveReadOperationBreakdown(
+        "batch_get_into_multi_buffers", OperationOutcome::kPartial, 250, 2000);
+    std::string summary = metrics.summary_metrics();
+    EXPECT_NE(summary.find("batch_get_into_multi_buffers [stage=metadata, "
+                           "outcome=ok]: count=1, p95<300μs, max<300μs"),
+              std::string::npos);
+    EXPECT_NE(summary.find("batch_get_into_multi_buffers [stage=post_query, "
+                           "outcome=ok]: count=1, p95<1500μs, max<1500μs"),
+              std::string::npos);
+    EXPECT_NE(summary.find("batch_get_into_multi_buffers [stage=post_query, "
+                           "outcome=partial]: count=1, p95<2000μs, max<2000μs"),
+              std::string::npos);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_EQ(stage_count(serialized, "metadata", "ok"), 1);
+    EXPECT_EQ(stage_count(serialized, "post_query", "ok"), 1);
+    EXPECT_EQ(stage_count(serialized, "metadata", "partial"), 1);
+    EXPECT_EQ(stage_count(serialized, "post_query", "partial"), 1);
+
+    // 2) Five-sample ceil(0.95 * 5) = 5 rank + >20s overflow bucket +
+    // multi-thread contention check.
+    ClientMetric edge_metrics;
+    for (int i = 0; i < 4; ++i) {
+        edge_metrics.ObserveReadOperationBreakdown(
+            "batch_get_into_multi_buffers", OperationOutcome::kOk, 100, 300);
+    }
+    edge_metrics.ObserveReadOperationBreakdown(
+        "batch_get_into_multi_buffers", OperationOutcome::kOk, 100, 20000);
+    edge_metrics.ObserveReadOperationBreakdown(
+        "batch_get_into_multi_buffers", OperationOutcome::kError, 300, 300);
+    edge_metrics.ObserveReadOperationBreakdown("batch_get_into_multi_buffers",
+                                               OperationOutcome::kError, 300,
+                                               30000000);
+    summary = edge_metrics.summary_metrics();
+    EXPECT_NE(summary.find("batch_get_into_multi_buffers [stage=post_query, "
+                           "outcome=ok]: count=5, p95<20000μs, max<20000μs"),
+              std::string::npos)
+        << summary;
+    EXPECT_NE(summary.find("batch_get_into_multi_buffers [stage=post_query, "
+                           "outcome=error]: count=2, p95>20000000μs, "
+                           "max>20000000μs"),
+              std::string::npos)
+        << summary;
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.emplace_back([&]() {
+            for (int i = 0; i < 500; ++i) {
+                edge_metrics.ObserveReadOperationBreakdown(
+                    "batch_get_into_multi_buffers", OperationOutcome::kOk, 100,
+                    500);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    serialized.clear();
+    edge_metrics.serialize(serialized);
+    EXPECT_EQ(stage_count(serialized, "metadata", "ok"), 2005);
+    EXPECT_EQ(stage_count(serialized, "post_query", "ok"), 2005);
+}
+
+TEST_F(ClientMetricsTest, BatchGetStageBreakdownProductionPaths) {
+    StageBreakdownEnv env;
+    ASSERT_NO_FATAL_FAILURE(env.Start(/*with_disk=*/true));
+
+    const std::string mem_payload(1024, 'M');
+    const std::string disk_payload(2048, 'D');
+    const std::string mem_key = "stage_mem_key";
+    const std::string disk_key = "stage_disk_key";
+    ASSERT_EQ(env.client->put(mem_key, std::span<const char>(mem_payload)), 0);
+    ASSERT_EQ(env.client->put(disk_key, std::span<const char>(disk_payload)),
+              0);
+    ASSERT_TRUE(WaitForDiskOnlyReplica(env.client, disk_key, env.client_addr,
+                                       std::chrono::seconds(10)));
+
+    std::vector<char> mem_dst(mem_payload.size(), '\0');
+    std::vector<char> disk_dst(disk_payload.size(), '\0');
+    ASSERT_EQ(env.client->register_buffer(mem_dst.data(), mem_dst.size()), 0);
+    ASSERT_EQ(env.client->register_buffer(disk_dst.data(), disk_dst.size()), 0);
+
+    auto stage_count = [](const std::string& body, const std::string& stage,
+                          const std::string& outcome) {
+        return SumMatchingMetricLines(
+            body, "mooncake_transfer_read_operation_stage_latency_count{",
+            {"op_name=\"batch_get_into_multi_buffers\"",
+             "stage=\"" + stage + "\"", "outcome=\"" + outcome + "\""});
+    };
+
+    // 1) No-transfer calls (missing keys + undersized buffer) are skipped.
+    auto miss = env.client->batch_get_into_multi_buffers(
+        {"missing_a", "missing_b"}, {{mem_dst.data()}, {mem_dst.data()}},
+        {{mem_dst.size()}, {mem_dst.size()}}, false);
+    EXPECT_LT(miss[0], 0);
+    EXPECT_LT(miss[1], 0);
+    auto small = env.client->batch_get_into_multi_buffers(
+        {mem_key}, {{mem_dst.data()}}, {{1}}, false);
+    EXPECT_LT(small[0], 0);
+
+    auto m = env.FetchMetrics();
+    ASSERT_EQ(m.status, 200);
+    EXPECT_EQ(SumMatchingMetricLines(
+                  m.body, "mooncake_transfer_read_operation_count{",
+                  {"op_name=\"batch_get_into_multi_buffers\""}),
+              2);
+    EXPECT_EQ(
+        SumMatchingMetricLines(
+            m.body, "mooncake_transfer_read_operation_stage_latency_count{",
+            {"op_name=\"batch_get_into_multi_buffers\""}),
+        0);
+
+    // 2) Successful MEMORY read -> +1 sample per stage.
+    auto r_mem = env.client->batch_get_into_multi_buffers(
+        {mem_key}, {{mem_dst.data()}}, {{mem_dst.size()}}, false);
+    ASSERT_EQ(r_mem, std::vector<int>({static_cast<int>(mem_payload.size())}));
+    EXPECT_EQ(std::string(mem_dst.data(), mem_dst.size()), mem_payload);
+    m = env.FetchMetrics();
+    EXPECT_EQ(stage_count(m.body, "metadata", "ok"), 1);
+    EXPECT_EQ(stage_count(m.body, "post_query", "ok"), 1);
+
+    // 3) Successful DISK read -> +1 sample per stage.
+    auto r_disk = env.client->batch_get_into_multi_buffers(
+        {disk_key}, {{disk_dst.data()}}, {{disk_dst.size()}}, false);
+    ASSERT_EQ(r_disk,
+              std::vector<int>({static_cast<int>(disk_payload.size())}));
+    EXPECT_EQ(std::string(disk_dst.data(), disk_dst.size()), disk_payload);
+    m = env.FetchMetrics();
+    EXPECT_EQ(stage_count(m.body, "metadata", "ok"), 2);
+    EXPECT_EQ(stage_count(m.body, "post_query", "ok"), 2);
+
+    // 4) Mixed MEMORY + DISK batch invokes Client::BatchGet twice (+2), while
+    // stage breakdown emits only +1 per stage.
+    std::fill(mem_dst.begin(), mem_dst.end(), '\0');
+    std::fill(disk_dst.begin(), disk_dst.end(), '\0');
+    auto r_mix = env.client->batch_get_into_multi_buffers(
+        {mem_key, disk_key}, {{mem_dst.data()}, {disk_dst.data()}},
+        {{mem_dst.size()}, {disk_dst.size()}}, false);
+    ASSERT_EQ(r_mix, std::vector<int>({static_cast<int>(mem_payload.size()),
+                                       static_cast<int>(disk_payload.size())}));
+    EXPECT_EQ(std::string(mem_dst.data(), mem_dst.size()), mem_payload);
+    EXPECT_EQ(std::string(disk_dst.data(), disk_dst.size()), disk_payload);
+
+    // 5) Partial batch ({hit, miss}) -> +1 under outcome="partial".
+    auto r_partial = env.client->batch_get_into_multi_buffers(
+        {mem_key, "missing_c"}, {{mem_dst.data()}, {disk_dst.data()}},
+        {{mem_dst.size()}, {disk_dst.size()}}, false);
+    EXPECT_EQ(r_partial[0], static_cast<int>(mem_payload.size()));
+    EXPECT_LT(r_partial[1], 0);
+
+    m = env.FetchMetrics();
+    EXPECT_EQ(SumMatchingMetricLines(
+                  m.body, "mooncake_transfer_batch_get_latency_count", {}),
+              5);
+    EXPECT_EQ(stage_count(m.body, "metadata", "ok"), 3);
+    EXPECT_EQ(stage_count(m.body, "post_query", "ok"), 3);
+    EXPECT_EQ(stage_count(m.body, "metadata", "partial"), 1);
+    EXPECT_EQ(stage_count(m.body, "post_query", "partial"), 1);
+
+    EXPECT_EQ(env.client->unregister_buffer(disk_dst.data()), 0);
+    EXPECT_EQ(env.client->unregister_buffer(mem_dst.data()), 0);
+}
+
+TEST_F(ClientMetricsTest, BatchGetStageBreakdownWhenMetricsDisabled) {
+    ScopedEnv metrics_env(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC.name);
+    setenv(ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC.name, "0",
+           1);
+
+    StageBreakdownEnv env;
+    ASSERT_NO_FATAL_FAILURE(env.Start(/*with_disk=*/false));
+
+    const std::string payload = "metrics_disabled_payload";
+    ASSERT_EQ(env.client->put("disabled_key", std::span<const char>(payload)),
+              0);
+    std::vector<char> dst(payload.size(), '\0');
+    ASSERT_EQ(env.client->register_buffer(dst.data(), dst.size()), 0);
+    auto res = env.client->batch_get_into_multi_buffers(
+        {"disabled_key"}, {{dst.data()}}, {{dst.size()}}, false);
+    ASSERT_EQ(res, std::vector<int>({static_cast<int>(payload.size())}));
+    EXPECT_EQ(std::string(dst.data(), dst.size()), payload);
+    EXPECT_EQ(env.FetchMetrics().status, 503);
+    EXPECT_EQ(env.client->unregister_buffer(dst.data()), 0);
 }
 
 }  // namespace mooncake::test
