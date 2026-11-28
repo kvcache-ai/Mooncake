@@ -616,6 +616,9 @@ static adxl::Status g_initialize_result = adxl::SUCCESS;
 static adxl::Status g_transfer_async_result = adxl::SUCCESS;
 static adxl::Status g_get_transfer_status_result = adxl::SUCCESS;
 static adxl::Status g_register_mem_result = adxl::SUCCESS;
+static int g_register_mem_block_remaining = 0;
+static bool g_register_mem_entered = false;
+static bool g_release_register_mem = false;
 static bool g_block_get_status = false;
 static bool g_get_status_entered = false;
 static bool g_release_get_status = false;
@@ -669,6 +672,9 @@ void reset() {
     g_transfer_async_result = adxl::SUCCESS;
     g_get_transfer_status_result = adxl::SUCCESS;
     g_register_mem_result = adxl::SUCCESS;
+    g_register_mem_block_remaining = 0;
+    g_register_mem_entered = false;
+    g_release_register_mem = true;
     g_transfer_status_enum = adxl::TransferStatus::COMPLETED;
     g_transfer_results.clear();
     g_transfer_async_results.clear();
@@ -711,6 +717,26 @@ void set_connect_result(adxl::Status status) {
 void set_disconnect_result(adxl::Status status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_disconnect_result = status;
+}
+
+void arm_register_mem_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_register_mem_block_remaining = 1;
+    g_register_mem_entered = false;
+    g_release_register_mem = false;
+}
+
+void release_register_mem_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_register_mem_block_remaining = 0;
+    g_release_register_mem = true;
+    g_adxl_cv.notify_all();
+}
+
+bool wait_register_mem_entered() {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    return g_adxl_cv.wait_for(lock, std::chrono::seconds(5),
+                              [] { return g_register_mem_entered; });
 }
 
 void arm_transfer_sync_block() {
@@ -1005,7 +1031,7 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
 Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
                                MemHandle& mem_handle) {
     (void)type;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::unique_lock<std::mutex> lock(g_mutex);
     g_register_mem_count++;
     g_last_local_only = mem.local_only;
     if (!g_register_mem_results.empty()) {
@@ -1015,6 +1041,12 @@ Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
     }
     if (g_register_mem_result != adxl::SUCCESS) {
         return g_register_mem_result;
+    }
+    if (g_register_mem_block_remaining > 0) {
+        --g_register_mem_block_remaining;
+        g_register_mem_entered = true;
+        g_adxl_cv.notify_all();
+        g_adxl_cv.wait(lock, [] { return g_release_register_mem; });
     }
     mem_handle =
         reinterpret_cast<MemHandle>(static_cast<uintptr_t>(g_next_handle++));
@@ -1862,6 +1894,30 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterFailureRollsBackMetadata) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(getLocalBufferCount(transport.get()), buffer_count_before);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Memory_RegisterDoesNotPublishBeforeRegistrationCompletes) {
+    adxl_mock::arm_register_mem_block();
+    setenv("ASCEND_THREAD_POOL_SIZE", "1", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    const size_t buffer_count_before = getLocalBufferCount(transport.get());
+    std::atomic<int> register_rc{-999};
+    std::thread registrar([this, &transport, &register_rc] {
+        register_rc = transport->registerLocalMemory(
+            test_buffer_src_, kRegisterMemSize, "cpu:0", true, true);
+    });
+
+    EXPECT_TRUE(adxl_mock::wait_register_mem_entered());
+    EXPECT_EQ(getLocalBufferCount(transport.get()), buffer_count_before)
+        << "metadata exposed the remote buffer while RegisterMem was blocked";
+
+    adxl_mock::release_register_mem_block();
+    registrar.join();
+    EXPECT_EQ(register_rc.load(), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), buffer_count_before + 1);
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterWithWildcardLocation) {
@@ -3434,6 +3490,7 @@ struct JoinThread {
 
 struct ReleaseAdxlBlocks {
     ~ReleaseAdxlBlocks() {
+        adxl_mock::release_register_mem_block();
         adxl_mock::release_transfer_sync_block();
         adxl_mock::release_get_status_block();
     }
