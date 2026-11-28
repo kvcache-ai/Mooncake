@@ -29,6 +29,7 @@
 #include "types.h"
 
 namespace mooncake {
+class ThreadPool;
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -348,6 +349,9 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Bucket backend offload parallelism; one retains serial execution.
+    uint32_t offload_write_workers = 1;  // Valid range: [1, 16].
+
     // DFS control-plane mode. Enabled for filesystem-mode distributed storage
     // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
@@ -394,6 +398,19 @@ class StorageBackendInterface {
         const std::vector<std::string>& evicted_keys)>;
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
+
+    // Synchronous: joins all started callbacks before returning or throwing.
+    // false stops new claims. Callbacks may run concurrently and must not
+    // retain batch state. The caller serializes execution and shutdown.
+    virtual void ExecuteOffloadBatches(
+        size_t count, const std::function<bool(size_t)>& process) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!process(i)) break;
+        }
+    }
+
+    // Called after the owner stops dispatching, before staging is unregistered.
+    virtual void StopOffloadWorkers() {}
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -926,6 +943,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     ~BucketStorageBackend();
 
+    void ExecuteOffloadBatches(
+        size_t count, const std::function<bool(size_t)>& process) override;
+    void StopOffloadWorkers() override;
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -1261,8 +1282,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param disk_hint Restrict selection to this disk (>= 0). Used by
      *        watermark eviction, which drives one disk at a time.
      * @return PendingEviction with all keys and bucket metadata removed;
-     *         NO_AVAILABLE_DISK if no disk can hold the incoming bucket;
-     *         FILE_WRITE_FAIL if the quota is still exceeded afterwards.
+     *         NO_AVAILABLE_DISK if no disk has capacity for the incoming
+     *         bucket, including space reserved by writes or pending eviction.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
         int64_t required_size, const std::vector<std::string>& write_keys = {},
@@ -1406,6 +1427,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void ReleaseDiskOwnerLocks();
 
+    std::unique_ptr<ThreadPool> offload_write_pool_;
     std::atomic<bool> test_datasync_failure_{false};
     std::atomic<size_t> last_aligned_copy_bytes_{0};
     std::atomic<bool> test_direct_io_unavailable_{false};

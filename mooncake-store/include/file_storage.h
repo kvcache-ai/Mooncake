@@ -19,6 +19,7 @@
 namespace mooncake {
 
 struct SsdMetric;
+class ThreadPool;
 
 class FileStorage {
    public:
@@ -500,11 +501,16 @@ class FileStorage {
     // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
     // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
     // on the next OffloadObjects call, when the backend re-emits those keys in
-    // a bucket. Only touched from the offload worker path (single-threaded);
+    // a bucket. Only touched by the coordinator under offload_cycle_mutex_;
     // lost on restart together with the backend's in-memory ungrouped pool,
     // in which case the master's TTL reaper reclaims the orphaned tasks.
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
+
+    // The coordinator joins every worker before releasing the cycle lock.
+    std::mutex offload_cycle_mutex_;
+    void NotifyFailedOffloads(const std::vector<OffloadTaskItem>& tasks);
+    void CancelDeferredOffloads();  // Caller holds offload_cycle_mutex_.
 
     // Singleflight for cold reads. The first reader of an exact batch becomes
     // the leader and does the SSD I/O; readers that request the same key/size
@@ -521,9 +527,9 @@ class FileStorage {
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
-    std::atomic<bool> heartbeat_running_;
+    std::atomic<bool> heartbeat_running_{false};
     std::thread heartbeat_thread_;
-    std::atomic<bool> client_buffer_gc_running_;
+    std::atomic<bool> client_buffer_gc_running_{false};
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};

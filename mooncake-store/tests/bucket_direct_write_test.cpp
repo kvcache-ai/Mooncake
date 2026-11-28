@@ -258,6 +258,75 @@ TEST(BucketDirectWriteConfigTest, AcceptsAlignedAndRejectsItWithPacked) {
     std::filesystem::remove_all(path);
 }
 
+TEST_P(BucketDirectWriteTest, ConcurrentWritesRollbackAndRestartReadback) {
+    file_config_.offload_write_workers = 4;
+    bucket_config_.max_total_size = 512 * 1024 * 1024;
+    Values committed;
+    std::vector<std::string> rejected;
+    {
+        BucketStorageBackend backend(file_config_, bucket_config_);
+        ASSERT_TRUE(backend.Init());
+        for (int round = 0; round < 3; ++round) {
+            // Grow and reuse each worker's packing buffer, then fail datasync.
+            std::vector<Values> values;
+            for (int i = 0; i < 4; ++i)
+                values.push_back(
+                    MakeValues(round * 4 + i, round == 0 ? 32 : 4));
+            std::barrier ready(4);
+            backend.SetDatasyncFailureForTest(round == 2);
+            backend.ExecuteOffloadBatches(4, [&](size_t i) {
+                ready.arrive_and_wait();
+                auto batch = MakeBatch(values[i]);
+                auto result = backend.BatchOffload(
+                    batch, [&](const auto& keys, auto& metadata) {
+                        VerifyLayout(keys, metadata, values[i]);
+                        return round == 1 && i == 1 ? ErrorCode::RPC_FAIL
+                                                    : ErrorCode::OK;
+                    });
+                if (round == 2 || (round == 1 && i == 1)) {
+                    EXPECT_FALSE(result);
+                    if (!result)
+                        EXPECT_EQ(result.error(),
+                                  round == 2 ? ErrorCode::FILE_WRITE_FAIL
+                                             : ErrorCode::RPC_FAIL);
+                } else {
+                    EXPECT_TRUE(result);
+                }
+                return true;
+            });
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (round == 2 || (round == 1 && i == 1)) {
+                    for (const auto& [key, _] : values[i]) {
+                        auto exists = backend.IsExist(key);
+                        ASSERT_TRUE(exists);
+                        EXPECT_FALSE(*exists);
+                        rejected.push_back(key);
+                    }
+                } else {
+                    committed.insert(values[i].begin(), values[i].end());
+                }
+            }
+            Verify(backend, committed);
+            size_t data_files = 0, meta_files = 0;
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(path_)) {
+                data_files += entry.path().extension() == ".bucket";
+                meta_files += entry.path().extension() == ".meta";
+            }
+            EXPECT_EQ(data_files, round == 0 ? 4 : 7);
+            EXPECT_EQ(meta_files, data_files);
+        }
+    }
+    BucketStorageBackend recovered(file_config_, bucket_config_);
+    ASSERT_TRUE(recovered.Init());
+    Verify(recovered, committed);
+    for (const auto& key : rejected) {
+        auto exists = recovered.IsExist(key);
+        ASSERT_TRUE(exists);
+        EXPECT_FALSE(*exists);
+    }
+}
+
 TEST_P(BucketDirectWriteTest, LayoutRollbackAndRestartReadback) {
     Values all_values;
     std::unordered_map<std::string, StorageObjectMetadata> committed;
