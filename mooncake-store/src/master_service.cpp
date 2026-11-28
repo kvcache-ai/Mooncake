@@ -1010,11 +1010,6 @@ MasterService::~MasterService() {
     dynamic_replication_.Stop();
 
     client_offboarding_worker_.Stop();
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-        MasterMetricManager::instance().remove_segment_metrics(segment);
-    }
 
     // Segments still mounted here never went through CommitUnmountSegment;
     // release their capacity contribution so the process-lifetime
@@ -1075,11 +1070,26 @@ void MasterService::StopBatchOpLogWriter() {
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
-    TieredStorageUsageSnapshot snapshot{
-        .memory = segment_manager_.GetMemoryUsageSnapshot(),
-        .nof = nof_segment_manager_.GetUsageSnapshot(),
-        .dfs = {},
-    };
+    TieredStorageUsageSnapshot snapshot;
+    {
+        // Keep master_state_mutex_ ordered before segment_mutex_ and hold it
+        // across the snapshot so a concurrent restore cannot swap the standby
+        // accounting between the mount snapshot and the merge below.
+        std::shared_lock<std::shared_mutex> state_lock(master_state_mutex_);
+        snapshot.memory = segment_manager_.GetMemoryUsageSnapshot();
+        // Standby-restored memory is not mounted yet, so it has no allocator
+        // in the segment manager. Account for it from the restore bookkeeping
+        // until ReMountSegment folds it into the mounted allocators.
+        for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+            if (bytes == 0) {
+                continue;
+            }
+            const auto used = static_cast<size_t>(bytes);
+            snapshot.memory.used_bytes += used;
+            snapshot.memory.segments[segment].used_bytes += used;
+        }
+    }
+    snapshot.nof = nof_segment_manager_.GetUsageSnapshot();
     if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
         snapshot.dfs = {
             .enabled = true,
@@ -1490,17 +1500,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return fail_remount(ErrorCode::INTERNAL_ERROR);
         }
         for (auto& restore : restores) {
-            if (restore.imported_size != 0) {
-                MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                accounted->second -= restore.imported_size;
-                if (accounted->second == 0) {
-                    standby_accounted_memory_bytes_.erase(accounted);
-                }
-            }
+            // Once a segment is remounted, its mounted allocator becomes the
+            // sole source of truth for that segment's used bytes. Erase the
+            // entire standby entry (rather than subtracting imported_size) so
+            // objects deleted or evicted before remount do not leave orphaned
+            // standby bytes that would be double-counted alongside the mounted
+            // allocator in GetStorageUsageSnapshot().
+            standby_accounted_memory_bytes_.erase(restore.segment.name);
             for (size_t i = 0; i < restore.replicas.size(); ++i) {
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
@@ -4153,9 +4159,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
     // snapshots, and staged owner sessions in `restore` are discarded on scope
-    // exit without touching exported metrics. The memory gauges are only
-    // swapped in once the restore can no longer fail, so rollback never has to
-    // undo a published metric delta.
+    // exit. The standby accounting map is only replaced once the restore can
+    // no longer fail, so rollback never has to republish a gauge delta.
     const auto rollback_restored_state = [&]() {
         for (const auto& [tenant, ref] : installed) {
             MetadataAccessorRW accessor(this, tenant, ref);
@@ -4294,19 +4299,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
                   << total;
-    }
-
-    // Publish the accounting swap only after nothing can fail anymore: the
-    // fail-closed paths above must stay a no-op for the exported gauges, and
-    // the client/snapshot mutexes held here mean no concurrent reader can see
-    // the gauge drift between the map swap and this commit.
-    for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-    }
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count

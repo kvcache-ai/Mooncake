@@ -232,6 +232,15 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
+    // Allocation gauges are an observability projection, so refresh them from
+    // the in-process master before reading them in assertions.
+    void ProjectStorageMetrics() {
+        auto service = master_.service();
+        ASSERT_NE(service, nullptr);
+        MasterMetricManager::instance().project_storage_usage(
+            service->GetStorageUsageSnapshot());
+    }
+
     // Wait for task to complete by polling task status
     bool WaitForTaskCompletion(
         const UUID& task_id,
@@ -718,6 +727,7 @@ TEST_F(TaskExecutorIntegrationTest, DrainCompletesWhileGroupedKeyStaysHot) {
                 ASSERT_EQ(endpoint(*source_query), kClient1Endpoint);
                 ASSERT_TRUE(client2_->Get(key, *source_query, destination, 0));
                 EXPECT_EQ(output, value);
+                ProjectStorageMetrics();
                 EXPECT_GE(MasterMetricManager::instance()
                               .get_segment_allocated_mem_size(kClient1Endpoint),
                           static_cast<int64_t>(value.size()));
@@ -744,6 +754,7 @@ TEST_F(TaskExecutorIntegrationTest, DrainCompletesWhileGroupedKeyStaysHot) {
     }
     ASSERT_TRUE(switched);
     ASSERT_TRUE(drained);
+    ProjectStorageMetrics();
     EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
                   kClient1Endpoint),
               0);

@@ -4535,6 +4535,11 @@ TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
     ASSERT_TRUE(after);
     ASSERT_EQ(after->replicas.size(), 1u);
     EXPECT_EQ(after->replicas.front().id, source_id);
+    MasterMetricManager::instance().project_storage_usage(
+        service->GetStorageUsageSnapshot());
+    EXPECT_GT(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "move_source"),
+              0);
     EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
                   "move_target"),
               0);

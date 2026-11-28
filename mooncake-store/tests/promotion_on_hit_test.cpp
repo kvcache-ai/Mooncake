@@ -2655,10 +2655,10 @@ TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(metrics.get_promotion_rejected_watermark() - rejected_before, 1);
 
-    // Restore the observable gauges before normal teardown. The business
-    // assertion above intentionally reset them, but allocator and service
-    // destructors still emit their matching decrements.
-    metrics.inc_allocated_mem_size(segment_name, kAllocationSize);
+    // Restore the capacity gauge before normal teardown. The business
+    // assertion above intentionally reset it, but the service destructor still
+    // releases the mounted segment's capacity. Allocated bytes need no manual
+    // compensation because allocation no longer writes that gauge.
     metrics.inc_total_mem_capacity(segment_name, kSegmentSize);
     allocated.reset();
     service->RemoveAll();
