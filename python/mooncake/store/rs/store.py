@@ -816,7 +816,12 @@ class MooncakeDistributedStore:
         Args:
             key: Base key name.
             target: A ReadTarget specifying AsStored/Shard/Full mode.
-            tensor: Optional pre-allocated torch.Tensor to fill.
+            tensor: Optional contiguous CPU torch.Tensor to fill. Its dtype,
+                shape and byte size must exactly match the read result (the
+                local shard shape in Shard mode). A matching view into a larger
+                allocation is allowed. Invalid destinations raise ValueError
+                before any destination bytes are written. Returns the same
+                tensor object on success.
             tenant: Optional tenant name.
         """
         result = self._invoke(
@@ -1002,7 +1007,13 @@ class MooncakeDistributedStore:
         tensors: list | None = None,
         tenant: str | None = None,
     ):
-        """Batch get tensors with parallelism-aware routing."""
+        """Batch get tensors with parallelism-aware routing.
+
+        Each supplied destination follows get_tensor_with_parallelism's CPU,
+        contiguity, dtype, shape and byte-size requirements. Items are processed
+        in order: an invalid destination raises before writing that item, but
+        previously completed items are not rolled back.
+        """
         results = self._invoke(
             "batch_get_tensor_with_parallelism",
             keys,
