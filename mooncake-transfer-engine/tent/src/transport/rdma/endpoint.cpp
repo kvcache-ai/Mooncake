@@ -802,7 +802,8 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index,
-                               const std::function<void(RdmaSlice*)>& on_post) {
+                               const std::function<void(RdmaSlice*)>& on_post,
+                               size_t max_slices) {
     const static int kSgeEntries = 1;
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
@@ -828,10 +829,12 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     }
     const int signal_interval =
         std::min(params_->signal_interval, std::max(1, params_->max_qp_wr / 2));
+    const size_t candidate_count = std::min(slice_list.size(), max_slices);
     int wr_count = std::min(
         params_->max_qp_wr -
             wr_depth_list_[qp_index].value.load(std::memory_order_relaxed),
-        (int)slice_list.size());
+        static_cast<int>(std::min<size_t>(candidate_count,
+                                          std::numeric_limits<int>::max())));
     const int available_cqe = cq->maxCqe() - cq->getQuota();
     if (wr_count <= 0 || available_cqe <= 0) return 0;
     // Every outstanding WR can produce a CQE if the QP is moved to ERR,
