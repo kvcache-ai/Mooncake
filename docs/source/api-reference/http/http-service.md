@@ -589,6 +589,12 @@ cleanup is complete, the job reaches `CANCELED` for a user cancellation or
 `TIMED_OUT` for a deadline. After a timeout, unfinished source segments stay
 `DRAINING` so a new job can resume draining them.
 
+An object moves only to a target with room for it. When the job has no
+`target_segments`, the object counts as blocked until a target has room, and
+the master starts eviction to make room. With `target_segments`, the master
+does not evict, and each round without room counts as a failed try, as a
+failed move does. An object larger than every target counts as failed.
+
 #### `POST /api/v1/drain_jobs`
 Create an untimed drain job for the given segments. To set a deadline, use
 {ref}`the Python DrainJob API <python-timed-drain-job>` with `timeout_ms`, or use

@@ -2167,6 +2167,7 @@ class MasterService {
     struct ActiveDrainTask {
         DrainCandidate candidate;
         size_t bytes;
+        std::string target;
     };
 
     enum class DrainSourceState {
@@ -2223,6 +2224,23 @@ class MasterService {
         size_t bytes;
     };
 
+    enum class DrainMoveMiss {
+        // The object or its source replica is gone.
+        kGone,
+        // The object cannot move now, or no segment can take it.
+        kBusy,
+        // Every target lacks room for now, counting this job's moves.
+        kTargetsFull,
+        // As kTargetsFull, but a target could hold the object once some of
+        // its allocated bytes are freed.
+        kNoRoom,
+        // As kNoRoom, but only part of the pool may take the object: the
+        // requested targets, or the source's fabric.
+        kNoRoomInTargets,
+        // Every target is smaller than the object.
+        kTooLarge,
+    };
+
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
     static constexpr auto kDrainSourceVerificationInterval =
         std::chrono::seconds(5);
@@ -2249,12 +2267,16 @@ class MasterService {
     std::vector<bool> ScanDrainSources(
         DrainJob& job, const std::vector<size_t>& source_indices);
     bool MaybeCompleteDrainJob(DrainJob& job);
-    tl::expected<DrainMove, ErrorCode> PlanDrainMove(
-        DrainCandidate& candidate, const CreateDrainJobRequest& request);
-    std::optional<std::string> SelectDrainTargetForKey(
+    tl::expected<DrainMove, DrainMoveMiss> PlanDrainMove(
+        DrainCandidate& candidate, const CreateDrainJobRequest& request,
+        const std::unordered_map<std::string, size_t>& pending_bytes);
+    // Picks the least used target with room for the object, counting the
+    // bytes this job's unfinished moves send to each target.
+    tl::expected<std::string, DrainMoveMiss> SelectDrainTargetForKey(
         const std::vector<std::string>& existing_segments,
-        const std::string& source_segment,
-        const CreateDrainJobRequest& request);
+        const std::string& source_segment, const CreateDrainJobRequest& request,
+        size_t length,
+        const std::unordered_map<std::string, size_t>& pending_bytes);
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};

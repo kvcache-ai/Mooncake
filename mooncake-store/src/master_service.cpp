@@ -11021,20 +11021,26 @@ void MasterService::FinishDrainJobCancellation(DrainJob& job) {
     job.message = timed_out ? "Drain job timed out" : "Drain job canceled";
 }
 
-std::optional<std::string> MasterService::SelectDrainTargetForKey(
+auto MasterService::SelectDrainTargetForKey(
     const std::vector<std::string>& existing_segments,
-    const std::string& source_segment, const CreateDrainJobRequest& request) {
+    const std::string& source_segment, const CreateDrainJobRequest& request,
+    size_t length, const std::unordered_map<std::string, size_t>& pending_bytes)
+    -> tl::expected<std::string, DrainMoveMiss> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::string> candidate_segments = request.target_segments;
     if (candidate_segments.empty()) {
         auto err = segment_access.GetAllSegments(candidate_segments);
         if (err != ErrorCode::OK) {
-            return std::nullopt;
+            return tl::make_unexpected(DrainMoveMiss::kBusy);
         }
     }
 
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
+    bool lacks_room = false;
+    bool waits_for_planned = false;
+    bool too_large = false;
+    bool other_fabric = false;
     for (const auto& candidate : candidate_segments) {
         if (std::find(request.segments.begin(), request.segments.end(),
                       candidate) != request.segments.end()) {
@@ -11044,8 +11050,11 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
                       candidate) != existing_segments.end()) {
             continue;
         }
-        if (!segment_access.IsSegmentAllocatable(candidate) ||
-            !segment_access.CanCopyWithinFabric(source_segment, candidate)) {
+        if (!segment_access.IsSegmentAllocatable(candidate)) {
+            continue;
+        }
+        if (!segment_access.CanCopyWithinFabric(source_segment, candidate)) {
+            other_fabric = true;
             continue;
         }
         size_t used = 0, capacity = 0;
@@ -11054,6 +11063,24 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
             capacity == 0) {
             continue;
         }
+        if (length > capacity) {
+            too_large = true;
+            continue;
+        }
+        if (used >= capacity || capacity - used < length) {
+            lacks_room = true;
+            continue;
+        }
+        // Planned bytes never make it kNoRoom: once a move starts, they are
+        // in used as well, and counting them twice must not evict.
+        if (auto it = pending_bytes.find(candidate);
+            it != pending_bytes.end()) {
+            if (it->second > capacity - used - length) {
+                waits_for_planned = true;
+                continue;
+            }
+            used += it->second;
+        }
         const double util =
             static_cast<double>(used) / static_cast<double>(capacity);
         if (util < best_util) {
@@ -11061,7 +11088,22 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
             best_target = candidate;
         }
     }
-    return best_target;
+    if (best_target) {
+        return *best_target;
+    }
+    if (waits_for_planned) {
+        return tl::make_unexpected(DrainMoveMiss::kTargetsFull);
+    }
+    if (lacks_room) {
+        return tl::make_unexpected(request.target_segments.empty() &&
+                                           !other_fabric
+                                       ? DrainMoveMiss::kNoRoom
+                                       : DrainMoveMiss::kNoRoomInTargets);
+    }
+    if (too_large) {
+        return tl::make_unexpected(DrainMoveMiss::kTooLarge);
+    }
+    return tl::make_unexpected(DrainMoveMiss::kBusy);
 }
 
 void MasterService::RefreshDrainJobTasks(DrainJob& job) {
@@ -11148,20 +11190,22 @@ void MasterService::DelayDrainCandidate(DrainPlan& plan,
     plan.delayed.push_back(std::move(candidate));
 }
 
-tl::expected<MasterService::DrainMove, ErrorCode> MasterService::PlanDrainMove(
-    DrainCandidate& candidate, const CreateDrainJobRequest& request) {
+auto MasterService::PlanDrainMove(
+    DrainCandidate& candidate, const CreateDrainJobRequest& request,
+    const std::unordered_map<std::string, size_t>& pending_bytes)
+    -> tl::expected<DrainMove, DrainMoveMiss> {
     const auto& source = request.segments[candidate.source_index];
     std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
     MetadataAccessorRO accessor(this, candidate.tenant_id,
                                 candidate.object.key);
     if (!accessor.IsPublished()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(DrainMoveMiss::kGone);
     }
 
     const auto& metadata = accessor.Get();
     const auto segments = metadata.GetReplicaSegmentNames();
     if (std::find(segments.begin(), segments.end(), source) == segments.end()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(DrainMoveMiss::kGone);
     }
     if (candidate.object.generation != accessor.Generation()) {
         candidate.object.generation = accessor.Generation();
@@ -11175,7 +11219,7 @@ tl::expected<MasterService::DrainMove, ErrorCode> MasterService::PlanDrainMove(
         !metadata.AllReplicas(&Replica::fn_is_completed) ||
         state.is_processing || state.replication_task ||
         state.offloading_task) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return tl::make_unexpected(DrainMoveMiss::kBusy);
     }
 
     const bool source_is_serving =
@@ -11187,12 +11231,13 @@ tl::expected<MasterService::DrainMove, ErrorCode> MasterService::PlanDrainMove(
             return std::find(names.begin(), names.end(), source) != names.end();
         });
     if (!source_is_serving) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return tl::make_unexpected(DrainMoveMiss::kBusy);
     }
 
-    auto target = SelectDrainTargetForKey(segments, source, request);
+    auto target = SelectDrainTargetForKey(
+        segments, source, request, metadata.TotalLength(), pending_bytes);
     if (!target) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return tl::make_unexpected(target.error());
     }
     return DrainMove{std::move(*target), metadata.TotalLength()};
 }
@@ -11205,6 +11250,11 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     auto& plan = *job.plan;
     const auto now = std::chrono::steady_clock::now();
     size_t slots = job.request.max_concurrency - job.active_tasks.size();
+    std::unordered_map<std::string, size_t> pending_target_bytes;
+    for (const auto& [_, task] : job.active_tasks) {
+        pending_target_bytes[task.target] += task.bytes;
+    }
+    bool waits_for_room = false;
     while (slots != 0 && !DrainJobStopRequested(job)) {
         if (plan.ready.empty() &&
             (plan.delayed.empty() || plan.delayed.front().retry_at > now)) {
@@ -11217,12 +11267,37 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         candidate.blocked = false;
 
         auto& source = plan.sources[candidate.source_index];
-        auto move = PlanDrainMove(candidate, job.request);
+        auto move = PlanDrainMove(candidate, job.request, pending_target_bytes);
         if (!move) {
-            if (move.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            const auto miss = move.error();
+            if (miss == DrainMoveMiss::kGone) {
                 --source.outstanding;
-            } else {
+                continue;
+            }
+            // Eviction works on the whole pool and would mostly free other
+            // segments, so when only part of the pool may take the object, a
+            // full target counts as a failed try, as a failed move does.
+            // Waiting never fits an object larger than every target.
+            const bool fails = miss == DrainMoveMiss::kTooLarge ||
+                               miss == DrainMoveMiss::kNoRoomInTargets;
+            if (miss == DrainMoveMiss::kTooLarge) {
+                candidate.failed_attempts = kMaxDrainUnitRetries - 1;
+            }
+            if (!fails && miss != DrainMoveMiss::kBusy) {
+                // The rest of the queue would not fit either. Keep this
+                // candidate's place and try again next round.
+                waits_for_room |= miss == DrainMoveMiss::kNoRoom;
+                candidate.blocked = true;
+                ++plan.blocked_units;
+                plan.ready.push_front(std::move(candidate));
+                break;
+            }
+            if (!fails) {
                 DelayDrainCandidate(plan, std::move(candidate), true);
+            } else if (RecordDrainFailure(job, candidate)) {
+                DelayDrainCandidate(plan, std::move(candidate), false);
+            } else {
+                --source.outstanding;
             }
             continue;
         }
@@ -11237,8 +11312,10 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             CreateMoveTaskInternal(candidate.object.key, candidate.tenant_id,
                                    source_segment, move->target, true);
         if (task_id) {
+            pending_target_bytes[move->target] += move->bytes;
             job.active_tasks.emplace(
-                *task_id, ActiveDrainTask{std::move(candidate), move->bytes});
+                *task_id, ActiveDrainTask{std::move(candidate), move->bytes,
+                                          std::move(move->target)});
             continue;
         }
 
@@ -11259,9 +11336,14 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         }
     }
 
+    if (waits_for_room) {
+        need_mem_eviction_ = true;
+    }
     job.status = JobStatus::RUNNING;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job running";
+    job.message = waits_for_room
+                      ? "Drain job running; waiting for room on targets"
+                      : "Drain job running";
 }
 
 std::vector<bool> MasterService::ScanDrainSources(
