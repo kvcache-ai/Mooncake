@@ -19,6 +19,7 @@ using mooncake::conductor::prefixindex::ContextKey;
 using mooncake::conductor::prefixindex::CreateHashStrategy;
 using mooncake::conductor::prefixindex::DigestToHex;
 using mooncake::conductor::prefixindex::HashBlock;
+using mooncake::conductor::prefixindex::HashDomain;
 using mooncake::conductor::prefixindex::HashProfile;
 using mooncake::conductor::prefixindex::ResolveHashProfile;
 using mooncake::conductor::prefixindex::ValidateHashProfile;
@@ -783,6 +784,62 @@ TEST(HashChain, RejectsInvalidInputsAtSetup) {
         nullptr);
 }
 
+TEST(SglangHashChain, SeedDoesNotChangeResolvedIdentityOrHashes) {
+    for (const auto* recipe : {"sglang", "sglang_bigram"}) {
+        SCOPED_TRACE(recipe);
+        HashProfile canonical;
+        ASSERT_TRUE(ResolveHashProfile({.strategy = recipe,
+                                        .algorithm = "sha256_raw",
+                                        .python_hash_seed = "0",
+                                        .index_projection = "first64_be"},
+                                       &canonical)
+                        .empty());
+        const ContextKey context{.tenant_id = "default",
+                                 .model_name = "model",
+                                 .lora_name = "",
+                                 .block_size = 4};
+        const std::vector<int32_t> tokens{1, 2, 3, 4, 5};
+        std::string error;
+        auto expected_strategy = CreateHashStrategy(canonical, &error);
+        ASSERT_NE(expected_strategy, nullptr) << error;
+        std::vector<HashBlock> expected;
+        ASSERT_TRUE(
+            expected_strategy->Compute(context, tokens, std::nullopt, &expected)
+                .empty());
+        for (const auto* seed : {"", "0", "1", "random", "unused"}) {
+            HashProfile resolved;
+            ASSERT_TRUE(ResolveHashProfile({.strategy = recipe,
+                                            .algorithm = "sha256_raw",
+                                            .python_hash_seed = seed,
+                                            .index_projection = "first64_be"},
+                                           &resolved)
+                            .empty());
+            EXPECT_EQ(resolved.python_hash_seed, "0");
+            EXPECT_EQ(resolved, canonical);
+            // Direct resolved-profile callers get the same semantic identity.
+            resolved.python_hash_seed = seed;
+            EXPECT_EQ(resolved, canonical);
+            EXPECT_EQ(canonical, resolved);
+            ASSERT_TRUE(ValidateHashProfile(resolved).empty());
+            auto strategy = CreateHashStrategy(resolved, &error);
+            ASSERT_NE(strategy, nullptr) << error;
+            std::vector<HashBlock> actual;
+            ASSERT_TRUE(
+                strategy->Compute(context, tokens, std::nullopt, &actual)
+                    .empty());
+            EXPECT_EQ(actual, expected);
+        }
+        auto different = canonical;
+        different.index_projection = "low64_be";
+        EXPECT_NE(different, canonical);
+        different = canonical;
+        different.strategy =
+            recipe == std::string("sglang") ? "sglang_bigram" : "sglang";
+        EXPECT_NE(different, canonical);
+    }
+    EXPECT_NE(ResolvedProfile("0"), ResolvedProfile("1"));
+}
+
 TEST(SglangHashChain, MatchesNativeSha256TokenChain) {
     HashProfile profile;
     const HashProfileConfig source{
@@ -864,6 +921,83 @@ TEST(SglangHashChain, MatchesBigramGolden) {
         strategy->Compute(context, tokens, std::nullopt, &blocks).empty());
     ASSERT_EQ(blocks.size(), 1u);
     EXPECT_EQ(blocks[0].projected.value, 15710792592378487421ULL);
+}
+
+TEST(SglangHashChain, MatchesPinnedNamespacesWithLazyAndEagerHashes) {
+    const auto fixtures = LoadJsonFixture("special_kv_vectors.json");
+    const auto tokens = TokensFrom(fixtures["tokens"]);
+    for (const auto& item : fixtures["hash_cases"]) {
+        SCOPED_TRACE(item.toStyledString());
+        HashProfile profile;
+        ASSERT_TRUE(ResolveHashProfile(
+                        {.strategy = item["bigram"].asBool() ? "sglang_bigram"
+                                                             : "sglang",
+                         .algorithm = "sha256_raw",
+                         .index_projection = "first64_be"},
+                        &profile)
+                        .empty());
+        const auto salt = SaltFrom(item["salt"]);
+        const auto extra = SaltFrom(item["extra_key"]);
+        const ContextKey context{"default", "model", extra ? "adapter" : "", 2};
+        const auto name = item["domain"].asString();
+        const auto domain =
+            name == "sglang_storage" ? HashDomain::kSglangStorage
+            : name == "sglang_event" ? HashDomain::kSglangEvent
+                                     : HashDomain::kSglangDynamo;
+        std::string error;
+        auto strategy = CreateHashStrategy(profile, &error, domain, extra);
+        ASSERT_NE(strategy, nullptr) << error;
+        std::vector<HashBlock> blocks;
+        ASSERT_TRUE(strategy->Compute(context, tokens, salt, &blocks).empty());
+        ASSERT_EQ(blocks.size(), item["hashes"].size());
+        ASSERT_FALSE(blocks.empty());
+        auto chain = strategy->CreateChain(context, tokens, salt, &error);
+        ASSERT_NE(chain, nullptr) << error;
+        EXPECT_EQ(chain->ComputedCount(), 0u);
+        const auto* first = chain->At(0, &error);
+        ASSERT_NE(first, nullptr) << error;
+        EXPECT_EQ(*first, blocks.front());
+        EXPECT_EQ(chain->ComputedCount(), 1u);
+        const auto* last = chain->At(blocks.size() - 1, &error);
+        ASSERT_NE(last, nullptr) << error;
+        EXPECT_EQ(*last, blocks.back());
+        EXPECT_EQ(chain->ComputedCount(), blocks.size());
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            EXPECT_EQ(
+                blocks[i].projected.value,
+                ParseU64(item["hashes"][static_cast<Json::ArrayIndex>(i)]));
+            const auto* block = chain->At(i, &error);
+            ASSERT_NE(block, nullptr) << error;
+            EXPECT_EQ(*block, blocks[i]);
+        }
+        EXPECT_EQ(chain->ComputedCount(), blocks.size());
+        EXPECT_EQ(chain->At(blocks.size(), &error), nullptr);
+        EXPECT_FALSE(error.empty());
+        EXPECT_EQ(chain->ComputedCount(), blocks.size());
+    }
+}
+
+TEST(HashStrategy, RejectsUnsupportedDomainsAndInvalidNamespaceKeys) {
+    std::string error;
+    for (const auto domain :
+         {HashDomain::kSglangStorage, HashDomain::kSglangEvent,
+          HashDomain::kSglangDynamo, static_cast<HashDomain>(-1)}) {
+        EXPECT_EQ(CreateHashStrategy(ValidProfile(), &error, domain), nullptr);
+        EXPECT_FALSE(error.empty());
+    }
+    HashProfile sglang;
+    ASSERT_TRUE(ResolveHashProfile({.strategy = "sglang",
+                                    .algorithm = "sha256_raw",
+                                    .index_projection = "first64_be"},
+                                   &sglang)
+                    .empty());
+    EXPECT_EQ(CreateHashStrategy(sglang, &error, HashDomain::kSglangStorage,
+                                 std::string("\xed\xa0\x80", 3)),
+              nullptr);
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(CreateHashStrategy(sglang, nullptr, HashDomain::kSglangStorage,
+                                 std::string("\xed\xa0\x80", 3)),
+              nullptr);
 }
 
 }  // namespace

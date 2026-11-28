@@ -60,12 +60,13 @@ class UdsConnector {
 class UdsAcceptor {
    public:
     using Handler = std::function<void(UdsConnection &)>;
+    static constexpr int kDefaultListenBacklog = 128;
 
     explicit UdsAcceptor(std::string socket_name);
     ~UdsAcceptor();
 
     void registerHandler(Handler handler);
-    tl::expected<void, std::string> start();
+    tl::expected<void, std::string> start(int backlog = kDefaultListenBacklog);
     void stop();
 
    private:
@@ -77,7 +78,7 @@ class UdsAcceptor {
     int listen_fd_ = -1;
     std::atomic<int> active_client_fd_{-1};
     std::atomic<bool> running_{false};
-    std::jthread thread_;
+    std::thread thread_;
 };
 
 }  // namespace mooncake

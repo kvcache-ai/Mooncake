@@ -19,7 +19,6 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -46,6 +45,12 @@
 #include "transport/transport.h"
 
 #include "cuda_alike.h"
+
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_UBSHMEM)
+#define MOONCAKE_TCP_ASCEND
+#include <acl/acl.h>
+#endif
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
@@ -75,7 +80,7 @@ std::atomic<size_t> staging_device_query_count{0};
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -360,6 +365,13 @@ TcpTransport::TcpTransport()
         "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
         getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
         kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
+    if (const char* queued_bytes_env =
+            getenv("MC_TCP_MAX_QUEUED_BYTES_PER_PEER")) {
+        lane_state_->max_queued_bytes_per_peer = parseBoundedTcpSetting(
+            "MC_TCP_MAX_QUEUED_BYTES_PER_PEER", queued_bytes_env,
+            /*default_value=*/0, /*minimum=*/0,
+            std::numeric_limits<size_t>::max());
+    }
     lane_state_->admission_timeout =
         std::chrono::milliseconds(parseBoundedTcpSetting(
             "MC_TCP_ADMISSION_TIMEOUT_MS",
@@ -480,7 +492,18 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    // Remove only the descs this transport published. Under multi-protocol
+    // the protocol field is authoritative; otherwise ours are the entries
+    // without a serialized IPC handle.
+    static const std::function<bool(const BufferDesc&)> own_desc =
+        [](const BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            return desc.protocol == "tcp";
+#else
+            return desc.shm_name.empty();
+#endif
+        };
+    return metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
 }
 
 int TcpTransport::registerLocalMemoryBatch(
@@ -552,6 +575,9 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        // Match every sibling transport: attach the batch so completion
+        // callbacks pin the BatchDesc and publish into finishIfComplete.
+        task.batch_id = batch_id;
         startTransfer(prepareTransfer(&task, request));
     }
 

@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "crc32c.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/snapshot/batch_oplog/codec.h"
@@ -44,14 +45,50 @@ class MemoryBackend final : public HaKvBackend {
     ErrorCode Range(std::string_view begin, std::string_view end, size_t limit,
                     std::vector<KvPair>& output) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        return RangeLocked(begin, end, limit, output);
+    }
+    ErrorCode RangeSerializable(std::string_view begin, std::string_view end,
+                                size_t limit,
+                                std::vector<KvPair>& output) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        serializable_range_times_.push_back(std::chrono::steady_clock::now());
         output.clear();
-        for (auto it = values_.lower_bound(std::string(begin));
-             it != values_.end() && it->first < end &&
-             (limit == 0 || output.size() < limit);
-             ++it) {
-            output.push_back({it->first, it->second});
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            return ErrorCode::OK;
         }
-        return ErrorCode::OK;
+        const auto error = RangeLocked(begin, end, limit, output);
+        if (error == ErrorCode::OK && !advance_after_batch_key_.empty()) {
+            bool found_trigger = false;
+            for (const auto& pair : output) {
+                if (pair.key == advance_after_batch_key_) {
+                    found_trigger = true;
+                    break;
+                }
+            }
+            if (found_trigger) {
+                values_[advance_batch_.key] = advance_batch_.value;
+                values_[advance_prefix_.key] = advance_prefix_.value;
+                stale_serializable_ranges_ = stale_ranges_after_advance_;
+                advance_after_batch_key_.clear();
+            }
+        }
+        return error;
+    }
+    void AdvancePrefixAfterRangeContaining(std::string trigger_batch_key,
+                                           KvPair batch, KvPair prefix,
+                                           size_t stale_ranges) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        advance_after_batch_key_ = std::move(trigger_batch_key);
+        advance_batch_ = std::move(batch);
+        advance_prefix_ = std::move(prefix);
+        stale_ranges_after_advance_ = stale_ranges;
+        serializable_range_times_.clear();
+    }
+    std::vector<std::chrono::steady_clock::time_point>
+    SerializableRangeTimes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return serializable_range_times_;
     }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
@@ -61,8 +98,26 @@ class MemoryBackend final : public HaKvBackend {
     }
 
    private:
+    ErrorCode RangeLocked(std::string_view begin, std::string_view end,
+                          size_t limit, std::vector<KvPair>& output) {
+        output.clear();
+        for (auto it = values_.lower_bound(std::string(begin));
+             it != values_.end() && it->first < end &&
+             (limit == 0 || output.size() < limit);
+             ++it) {
+            output.push_back({it->first, it->second});
+        }
+        return ErrorCode::OK;
+    }
     std::mutex mutex_;
     std::map<std::string, std::string> values_;
+    size_t stale_serializable_ranges_{0};
+    std::string advance_after_batch_key_;
+    KvPair advance_batch_;
+    KvPair advance_prefix_;
+    size_t stale_ranges_after_advance_{0};
+    std::vector<std::chrono::steady_clock::time_point>
+        serializable_range_times_;
 };
 
 template <typename Predicate>
@@ -87,12 +142,16 @@ class RebootstrapTest : public ::testing::Test {
         HotStandbyConfig config;
         config.enable_snapshot_bootstrap = true;
         config.enable_verification = false;
-        config.oplog_poll_interval_ms = 1;
+        config.oplog_poll_interval_ms = 10;
+        config.batch_oplog_retry_timeout_sec = 1;
+        config.oplog_standby_max_batches_per_poll = 2;
         service_ = std::make_unique<HotStandbyService>(config);
-        service_->SetCatchUpBatchKvBackendForTesting(backend_);
+        lag_backend_ =
+            std::make_shared<AdvancingSuffixLagBackend>("n09", backend_);
+        service_->SetCatchUpBatchKvBackendForTesting(lag_backend_);
         service_->SetBatchOpLogSnapshotProvider(
             std::make_unique<BatchOpLogSnapshotProvider>(
-                "n09", *backend_, *objects_, "snapshots"));
+                "n09", *lag_backend_, *objects_, "snapshots"));
         Publish(1, "old", false);
         OpLogEntry initial;
         initial.sequence_id = 1;
@@ -177,9 +236,9 @@ class RebootstrapTest : public ::testing::Test {
         batch.entries = {entry};
         backend_->Put(BuildBatchRecordKey("n09", 4),
                       EncodeOpLogBatchRecord(batch));
-        Prefix(4);
         backend_->Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("n09"),
                       "3");
+        Prefix(4);
         service_->EndBatchOpLogSnapshotCapture(*capture);
     }
     void ExpectOldState() {
@@ -199,6 +258,8 @@ class RebootstrapTest : public ::testing::Test {
             return service_->GetLatestAppliedSequenceId() == 4 &&
                    !service_->GetSyncStatus().is_recovering;
         }));
+        EXPECT_EQ(4,
+                  HAMetricManager::instance().get_oplog_applied_sequence_id());
         EXPECT_TRUE(service_->IsReadyForPromotion());
         auto handoff = service_->PromoteAndDetachBatchOpLogStore();
         ASSERT_TRUE(handoff);
@@ -223,7 +284,55 @@ class RebootstrapTest : public ::testing::Test {
     std::shared_ptr<MemoryBackend> backend_{std::make_shared<MemoryBackend>()};
     std::unique_ptr<LocalFileSnapshotObjectStore> objects_;
     std::unique_ptr<HotStandbyService> service_;
+    std::shared_ptr<AdvancingSuffixLagBackend> lag_backend_;
 };
+
+TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
+    // SetUp publishes a snapshot covering seq 1 with no OpLog suffix beyond it.
+    service_->Stop();
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_applied_sequence_id(0);
+    metrics.update_snapshot_runtime(
+        [](auto& runtime) { runtime.applied_batch = 0; });
+    HotStandbyConfig config;
+    config.enable_snapshot_bootstrap = true;
+    config.enable_verification = false;
+    config.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config);
+    service_->SetCatchUpBatchKvBackendForTesting(backend_);
+    service_->SetBatchOpLogSnapshotProvider(
+        std::make_unique<BatchOpLogSnapshotProvider>("n09", *backend_,
+                                                     *objects_, "snapshots"));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    const auto status = service_->GetSyncStatus();
+    EXPECT_EQ(1u, status.applied_seq_id);
+    EXPECT_EQ(0u, status.lag_entries);
+    EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(1u, metrics.get_snapshot_runtime().applied_batch);
+}
+
+TEST_F(RebootstrapTest, RebootstrapWithoutSuffixSetsAppliedMetric) {
+    // The snapshot covers batch 4, so the swap installs it with no suffix to
+    // replay and ApplyOpLogEntry never runs on the candidate.
+    auto& metrics = HAMetricManager::instance();
+    Publish(4, "new", false);
+    metrics.set_oplog_applied_sequence_id(0);
+    Compact();
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() == 4 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    EXPECT_EQ(0u, metrics.get_snapshot_runtime().suffix_batches);
+    EXPECT_EQ(4u, metrics.get_snapshot_runtime().applied_batch);
+    EXPECT_EQ(4, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(4u, service_->GetSyncStatus().applied_seq_id);
+    EXPECT_TRUE(service_->IsReadyForPromotion());
+    auto handoff = service_->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(handoff);
+    EXPECT_EQ(4u, handoff->applied_cursor.last_seq);
+    ASSERT_EQ(1u, handoff->segments.size());
+    EXPECT_EQ("new", handoff->segments[0].segment_name);
+}
 
 TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
     auto& metrics = HAMetricManager::instance();
@@ -246,6 +355,51 @@ TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
                   .errors);
     EXPECT_EQ(1u, metrics.get_snapshot_runtime().suffix_batches);
     EXPECT_EQ(3u, metrics.get_snapshot_runtime().compaction_floor);
+}
+
+TEST_F(RebootstrapTest, WaitsBetweenPagesWhileSerializableRangeLags) {
+    Publish(3, "new", false);
+    OpLogEntry entry;
+    entry.sequence_id = 5;
+    entry.op_type = OpType::REMOVE;
+    entry.tenant_id = "default";
+    entry.object_key = "remove-me";
+    OpLogBatchRecord batch;
+    batch.batch_id = batch.first_seq = batch.last_seq = 5;
+    batch.entries = {entry};
+    backend_->AdvancePrefixAfterRangeContaining(
+        BuildBatchRecordKey("n09", 4),
+        {.key = BuildBatchRecordKey("n09", 5),
+         .value = EncodeOpLogBatchRecord(batch)},
+        {.key = BuildDurablePrefixKey("n09"),
+         .value = EncodeDurablePrefix({.batch_id = 5, .last_seq = 5})},
+        3);
+    Compact();
+
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() == 5 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    const auto range_times = backend_->SerializableRangeTimes();
+    ASSERT_GE(range_times.size(), 5u);
+    EXPECT_GE(range_times[4] - range_times[1], std::chrono::milliseconds(20));
+}
+
+TEST_F(RebootstrapTest,
+       RevalidatesPostRestoreSuffixDespiteContinuousBatchProgress) {
+    Publish(3, "new", false);
+    lag_backend_->LagAfterRangeContaining(BuildBatchRecordKey("n09", 4), 5, 3);
+    Compact();
+
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() >= 6 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    EXPECT_TRUE(service_->IsReadyForPromotion());
+    StandbySnapshot snapshot;
+    ASSERT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    ASSERT_EQ(1u, snapshot.segments.size());
+    EXPECT_EQ("new", snapshot.segments[0].segment_name);
 }
 
 TEST_F(RebootstrapTest, NoEligibleSnapshotPreservesStateAndRetriesOnline) {
@@ -332,6 +486,23 @@ TEST_F(RebootstrapTest, FloorAdvancingBeforeSwapRejectsCandidate) {
     EXPECT_TRUE(service_->IsReadyForPromotion());
 }
 #endif
+
+TEST_F(RebootstrapTest, RestartResumesPreservedPromotionCursor) {
+    service_->Stop();
+    auto metadata = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(metadata->RestoreMetadata("default", "advanced", {}));
+    DurablePrefix cursor{.batch_id = 50, .last_seq = 50};
+    ASSERT_EQ(ErrorCode::OK, service_->PreservePromotionBaseline(
+                                 std::move(metadata), cursor,
+                                 /*producer_view_version=*/7, {}));
+    Prefix(50);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    EXPECT_EQ(50u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(50, HAMetricManager::instance().get_oplog_applied_sequence_id());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    EXPECT_EQ(50u, service_->GetSyncStatus().applied_seq_id);
+}
 
 }  // namespace
 }  // namespace mooncake::test

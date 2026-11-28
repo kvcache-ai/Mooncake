@@ -16,18 +16,236 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace mooncake {
 
 namespace {
 
+// RPC layouts before physical placement was added. Keep the upstream HCA
+// versions unchanged so older readers never interpret placement as HCA data.
+struct LegacyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
+struct HcaReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
+        per_key_preferred_hca_names;
+};
+
+// Current upstream RPC layout, before this branch's physical placement fields.
+struct ResidencyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
+        per_key_preferred_hca_names;
+    struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+};
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+};
+
+struct HcaSegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+    struct_pack::compatible<SegmentLocality, 1> locality;
+};
+
+TEST(PlacementRpcTest, LegacyLayoutsRemainCompatibleInBothDirections) {
+    LegacyReplicateConfig legacy;
+    legacy.host_id = "host1";
+    legacy.session_ids = std::vector<std::string>{"session1"};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->host_id, "host1");
+    EXPECT_EQ(decoded->SessionId(), "session1");
+    EXPECT_FALSE(decoded->requester_placement);
+    EXPECT_FALSE(decoded->fabric_domain);
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    const auto bytes = struct_pack::serialize(*decoded);
+    auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(restored->requester_placement);
+    EXPECT_EQ(*restored->requester_placement, *decoded->requester_placement);
+    EXPECT_EQ(*restored->requester_self_id, "rack1.host1#g3");
+    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(bytes);
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->host_id, "host1");
+    ASSERT_TRUE(old_reader->session_ids);
+    EXPECT_EQ(old_reader->session_ids->front(), "session1");
+
+    LegacySegment old_segment;
+    old_segment.name = "rack1.host1#g3/numa2";
+    old_segment.te_endpoint = "10.0.0.1:18060";
+    old_segment.protocol = "mnnvl";
+    auto segment =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old_segment));
+    ASSERT_TRUE(segment);
+    EXPECT_FALSE(segment->physical_placement);
+    segment->physical_placement = *decoded->requester_placement;
+    const auto segment_bytes = struct_pack::serialize(*segment);
+    auto new_segment = struct_pack::deserialize<Segment>(segment_bytes);
+    ASSERT_TRUE(new_segment);
+    EXPECT_EQ(*new_segment, *segment);
+    auto old_segment_reader =
+        struct_pack::deserialize<LegacySegment>(segment_bytes);
+    ASSERT_TRUE(old_segment_reader);
+    EXPECT_EQ(old_segment_reader->te_endpoint, "10.0.0.1:18060");
+}
+
+TEST(PlacementRpcTest, HcaAndPlacementExtensionsRemainIndependent) {
+    HcaReplicateConfig upstream;
+    upstream.session_ids = std::vector<std::string>{"session1"};
+    upstream.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    upstream.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_1"}};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(upstream));
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->preferred_hca_names);
+    EXPECT_EQ(*decoded->preferred_hca_names, *upstream.preferred_hca_names);
+    ASSERT_TRUE(decoded->per_key_preferred_hca_names);
+    EXPECT_EQ(*decoded->per_key_preferred_hca_names,
+              *upstream.per_key_preferred_hca_names);
+    EXPECT_FALSE(decoded->requester_placement);
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    auto reader = struct_pack::deserialize<HcaReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(reader);
+    ASSERT_TRUE(reader->preferred_hca_names);
+    ASSERT_TRUE(reader->per_key_preferred_hca_names);
+    EXPECT_EQ(*reader->preferred_hca_names, *upstream.preferred_hca_names);
+    EXPECT_EQ(*reader->per_key_preferred_hca_names,
+              *upstream.per_key_preferred_hca_names);
+
+    HcaSegment upstream_segment;
+    upstream_segment.locality = SegmentLocality{2, {"mlx5_0"}};
+    auto segment = struct_pack::deserialize<Segment>(
+        struct_pack::serialize(upstream_segment));
+    ASSERT_TRUE(segment);
+    ASSERT_TRUE(segment->locality);
+    EXPECT_FALSE(segment->physical_placement);
+    segment->physical_placement = *decoded->requester_placement;
+    const auto bytes = struct_pack::serialize(*segment);
+    auto restored = struct_pack::deserialize<Segment>(bytes);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(*restored, *segment);
+    auto old_reader = struct_pack::deserialize<HcaSegment>(bytes);
+    ASSERT_TRUE(old_reader);
+    ASSERT_TRUE(old_reader->locality);
+    EXPECT_EQ(*old_reader->locality, *upstream_segment.locality);
+}
+
+TEST(PlacementRpcTest, ResidencyAndPlacementExtensionsRemainIndependent) {
+    ResidencyReplicateConfig upstream;
+    upstream.session_ids = std::vector<std::string>{"session1"};
+    upstream.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    upstream.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_1"}};
+    upstream.residency_affinity_ids = std::vector<std::string>{"affinity1"};
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<ResidencyReplicateConfig>());
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(upstream));
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->residency_affinity_ids);
+    EXPECT_EQ(*decoded->residency_affinity_ids,
+              *upstream.residency_affinity_ids);
+    EXPECT_FALSE(decoded->requester_self_id);
+    EXPECT_FALSE(decoded->fabric_domain);
+    EXPECT_FALSE(decoded->requester_placement);
+
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    const auto bytes = struct_pack::serialize(*decoded);
+    auto reader = struct_pack::deserialize<ResidencyReplicateConfig>(bytes);
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(reader->session_ids, upstream.session_ids);
+    EXPECT_EQ(reader->preferred_hca_names, upstream.preferred_hca_names);
+    EXPECT_EQ(reader->per_key_preferred_hca_names,
+              upstream.per_key_preferred_hca_names);
+    EXPECT_EQ(reader->residency_affinity_ids, upstream.residency_affinity_ids);
+
+    auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->residency_affinity_ids,
+              upstream.residency_affinity_ids);
+    EXPECT_EQ(restored->requester_self_id, decoded->requester_self_id);
+    EXPECT_EQ(restored->fabric_domain, decoded->fabric_domain);
+    EXPECT_EQ(restored->requester_placement, decoded->requester_placement);
+}
+
 class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
    public:
     BlockingOffsetBufferAllocator(std::string segment_name, size_t base,
-                                  size_t size, std::string transport_endpoint)
+                                  size_t size, std::string transport_endpoint,
+                                  std::string transport_protocol)
         : OffsetBufferAllocator(std::move(segment_name), base, size,
-                                std::move(transport_endpoint)) {}
+                                std::move(transport_endpoint),
+                                std::move(transport_protocol)) {}
 
     void deallocate(AllocatedBuffer* handle) override {
         entered_.release();
@@ -43,9 +261,11 @@ class BlockingAllocateOffsetBufferAllocator : public OffsetBufferAllocator {
    public:
     BlockingAllocateOffsetBufferAllocator(std::string segment_name, size_t base,
                                           size_t size,
-                                          std::string transport_endpoint)
+                                          std::string transport_endpoint,
+                                          std::string transport_protocol)
         : OffsetBufferAllocator(std::move(segment_name), base, size,
-                                std::move(transport_endpoint)) {}
+                                std::move(transport_endpoint),
+                                std::move(transport_protocol)) {}
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         entered_.release();
@@ -62,9 +282,18 @@ class BlockingAllocateOffsetBufferAllocator : public OffsetBufferAllocator {
 // Test fixture for Segment tests
 class SegmentTest : public ::testing::Test {
    protected:
-    std::shared_ptr<ClientLivenessRecord> client_liveness_ =
-        std::make_shared<ClientLivenessRecord>(
-            ClientLivenessRecord::Clock::now());
+    std::shared_ptr<ClientLivenessRecord> SessionFor(const UUID& client_id) {
+        auto& session = sessions_[client_id];
+        if (!session) {
+            session = std::make_shared<ClientLivenessRecord>(
+                client_id, ClientLivenessRecord::Clock::now());
+        }
+        return session;
+    }
+
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        sessions_;
 
     void SetUp() override {
         // Initialize glog for logging
@@ -192,6 +421,56 @@ class SegmentTest : public ::testing::Test {
     }
 };
 
+TEST_F(SegmentTest, ServingNameThresholdCountsNamesRatherThanFreeSpace) {
+    AllocatorManager manager;
+    EXPECT_TRUE(manager.hasEnoughServingNames(0));
+    EXPECT_FALSE(manager.hasEnoughServingNames(1));
+
+    constexpr size_t kSize = 64 * 1024;
+    const auto add = [&](const std::string& name, size_t base,
+                         ClientSessionSharedPtr session) {
+        return manager.addAllocator(name,
+                                    std::make_shared<OffsetBufferAllocator>(
+                                        name, base, kSize, name, "tcp"),
+                                    std::move(session));
+    };
+    const auto first_session = SessionFor(generate_uuid());
+    const auto second_session = SessionFor(generate_uuid());
+    auto first = add("shared", DEFAULT_CXL_BASE, first_session);
+    add("shared", DEFAULT_CXL_BASE + kSize, second_session);
+    auto full = first->Allocate(kSize);
+    ASSERT_TRUE(full);
+    ASSERT_FALSE(first->Allocate(1));
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    EXPECT_FALSE(manager.hasEnoughServingNames(2));
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto suspect = [&](const auto& session) {
+        ASSERT_EQ(session->Evaluate(now, std::chrono::seconds::zero(),
+                                    std::chrono::hours(1)),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+    };
+    suspect(first_session);
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    suspect(second_session);
+    EXPECT_FALSE(manager.hasEnoughServingNames(1));
+    ASSERT_EQ(first_session->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    // A full registration still serves when its same-name peer is suspected.
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+
+    auto snapshot = manager.Snapshot();
+    add("other", DEFAULT_CXL_BASE + 2 * kSize, nullptr);
+    EXPECT_TRUE(manager.hasEnoughServingNames(2));
+    EXPECT_FALSE(manager.hasEnoughServingNames(3));
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(2));
+    suspect(first_session);
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(0));
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    EXPECT_FALSE(manager.hasEnoughServingNames(2));
+}
+
 // Mount Segment Operations Tests:
 TEST_F(SegmentTest, MountSegmentSuccess) {
     SegmentManager segment_manager;
@@ -206,11 +485,122 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 
     // Get segment access and attempt to mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
 
     // Verify segment is properly mounted
     ValidateMountedSegment(segment_manager, segment, client_id);
+}
+
+TEST_F(SegmentTest, MountAndRemountRequireOwnerSession) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "session_owned_segment";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    const UUID owner = generate_uuid();
+    auto session = SessionFor(owner);
+    auto access = manager.getSegmentAccess();
+
+    EXPECT_EQ(access.MountSegment(segment, nullptr), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(access.ReMountSegment({segment}, nullptr),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(access.MountSegment(segment, session), ErrorCode::OK);
+    ValidateMountedSegment(manager, segment, owner);
+    EXPECT_EQ(access.ReMountSegment({segment}, SessionFor(generate_uuid())),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(access.ReMountSegment({segment}, session), ErrorCode::OK);
+    ValidateMountedSegment(manager, segment, owner);
+}
+
+TEST_F(SegmentTest, MnnvlMountRequiresPhysicalIdentity) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    const auto client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "mnnvl_segment";
+    segment.base = 0x300000000ULL;
+    segment.size = 16 * 1024 * 1024;
+    segment.te_endpoint = "10.0.0.1:18060";
+    segment.protocol = "mnnvl";
+    auto access = manager.getSegmentAccess();
+
+    // The client injects its operator identity on every MNNVL mount. The
+    // master contract must reject mounts that arrive without a valid one,
+    // whatever the client version.
+    EXPECT_EQ(access.MountSegment(segment, SessionFor(client_id)),
+              ErrorCode::INVALID_PARAMS);
+    segment.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", -1, 0};
+    EXPECT_EQ(access.MountSegment(segment, SessionFor(client_id)),
+              ErrorCode::INVALID_PARAMS);
+    segment.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    EXPECT_EQ(access.MountSegment(segment, SessionFor(client_id)),
+              ErrorCode::OK);
+    ValidateMountedSegment(manager, segment, client_id);
+}
+
+TEST_F(SegmentTest, ReadableFabricIdentitySurvivesDrainAndUnmount) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    const auto client_id = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "source";
+    source.base = 0x300000000ULL;
+    source.size = 16 * 1024 * 1024;
+    source.te_endpoint = "10.0.0.1:18060";
+    source.protocol = "mnnvl";
+    source.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    auto target = source;
+    target.id = generate_uuid();
+    target.name = "target";
+    target.base += source.size;
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(source, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(target, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(source.name, SegmentStatus::DRAINING),
+            ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+        EXPECT_FALSE(access.IsSegmentAllocatable(source.name));
+    }
+    auto check_snapshot = [&](SegmentManager& segments) {
+        auto access = segments.getAllocatorAccess();
+        auto snapshot = access.SnapshotAllocatorManager(source.name);
+        EXPECT_EQ(snapshot.getAllocators(source.name), nullptr);
+        EXPECT_EQ(snapshot.getNames(), (std::vector<std::string>{target.name}));
+        EXPECT_TRUE(snapshot.CanCopyWithinFabric(source.name, target.name));
+        auto ordinary = access.SnapshotAllocatorManager();
+        EXPECT_EQ(ordinary.GetSegmentMetadata(source.name), nullptr);
+    };
+    check_snapshot(manager);
+
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.PrepareGracefulUnmountSegment(source.id),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    check_snapshot(manager);
+    {
+        auto access = manager.getSegmentAccess();
+        size_t capacity = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(source.id, capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.CommitUnmountSegment(source.id, client_id, capacity),
+                  ErrorCode::OK);
+        EXPECT_FALSE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    auto access = manager.getAllocatorAccess();
+    auto removed = access.SnapshotAllocatorManager(source.name);
+    EXPECT_EQ(removed.GetSegmentMetadata(source.name), nullptr);
+    EXPECT_FALSE(removed.CanCopyWithinFabric(source.name, target.name));
 }
 
 TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
@@ -228,9 +618,8 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     std::shared_ptr<BufferAllocatorBase> allocator;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
         allocator = segment_access.GetAllocator(segment.id);
     }
     ASSERT_NE(allocator, nullptr);
@@ -309,12 +698,12 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
     UUID client_id = generate_uuid();
 
     auto blocking = std::make_shared<BlockingOffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
         auto original = segment_access.GetAllocator(segment.id);
         ASSERT_NE(original, nullptr);
         ASSERT_TRUE(segment_access.ReplaceAllocators(
@@ -371,9 +760,8 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     std::shared_ptr<BufferAllocatorBase> old_allocator;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
         old_allocator = segment_access.GetAllocator(segment.id);
     }
     ASSERT_NE(old_allocator, nullptr);
@@ -381,7 +769,8 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     ASSERT_NE(old_buffer, nullptr);
 
     auto replacement = std::make_shared<OffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     auto restored_buffer = replacement->allocate(kRestoredAllocationSize);
     ASSERT_NE(restored_buffer, nullptr);
     {
@@ -414,13 +803,95 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
 }
 
+TEST_F(SegmentTest, ReplaceAllocatorsUpdatesMultipleSegmentsAtomically) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    const UUID client_id = generate_uuid();
+
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "replace_batch_first";
+    first.size = kSegmentSize;
+    first.base = 0x180000000;
+    first.locality = SegmentLocality{.numa_node = 1, .hca_names = {"mlx5_0"}};
+
+    Segment second;
+    second.id = generate_uuid();
+    second.name = "replace_batch_second";
+    second.size = kSegmentSize;
+    second.base = 0x190000000;
+
+    std::shared_ptr<BufferAllocatorBase> old_first;
+    std::shared_ptr<BufferAllocatorBase> old_second;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(first, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(second, SessionFor(client_id)),
+                  ErrorCode::OK);
+        old_first = segment_access.GetAllocator(first.id);
+        old_second = segment_access.GetAllocator(second.id);
+    }
+    AllocatorManager old_snapshot;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        old_snapshot = access.SnapshotAllocatorManager();
+    }
+    const auto old_first_reg = old_snapshot.getAllocators(first.name)->front();
+    const auto old_second_reg =
+        old_snapshot.getAllocators(second.name)->front();
+
+    auto next_first = std::make_shared<OffsetBufferAllocator>(
+        first.name, first.base, first.size, first.te_endpoint, first.protocol);
+    auto next_second = std::make_shared<OffsetBufferAllocator>(
+        second.name, second.base, second.size, second.te_endpoint,
+        second.protocol);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        // Duplicate target must be rejected with zero side effects on earlier
+        // entries in the batch.
+        EXPECT_FALSE(segment_access.ReplaceAllocators(
+            {{first.id, old_first, next_first},
+             {second.id, old_second, next_second},
+             {first.id, old_first, next_first}}));
+        EXPECT_EQ(segment_access.GetAllocator(first.id), old_first);
+        EXPECT_EQ(segment_access.GetAllocator(second.id), old_second);
+    }
+    EXPECT_EQ(next_first->GetLocalityHandle(), nullptr);
+    EXPECT_TRUE(old_first_reg->IsAllocatable());
+    EXPECT_TRUE(old_second_reg->IsAllocatable());
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{first.id, old_first, next_first},
+             {second.id, old_second, next_second}}));
+        EXPECT_EQ(segment_access.GetAllocator(first.id), next_first);
+        EXPECT_EQ(segment_access.GetAllocator(second.id), next_second);
+    }
+    EXPECT_NE(next_first->GetLocalityHandle(), nullptr);
+    EXPECT_FALSE(old_first_reg->IsAllocatable());
+    EXPECT_FALSE(old_second_reg->IsAllocatable());
+
+    AllocatorManager next_snapshot;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        next_snapshot = access.SnapshotAllocatorManager();
+    }
+    EXPECT_EQ(next_snapshot.getAllocators(first.name)->front()->GetAllocator(),
+              next_first);
+    EXPECT_EQ(next_snapshot.getAllocators(second.name)->front()->GetAllocator(),
+              next_second);
+}
+
 TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET,
                                    /*enable_cxl=*/true);
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
     constexpr size_t kAllocationSize = 4 * 1024 * 1024;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool");
+        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool", "cxl");
     InstallSharedCxlAllocatorForTesting(segment_manager, allocator, {});
 
     auto buffer = allocator->allocate(kAllocationSize);
@@ -539,14 +1010,14 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
 
     // Get segment access and mount first time
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
 
     // Verify first mount
     ValidateMountedSegment(segment_manager, segment, client_id);
 
     // Test duplicate mount - mount the same segment again
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::SEGMENT_ALREADY_EXISTS);
 
     // Verify state remains the same after duplicate mount
@@ -561,9 +1032,8 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
 
     // RealClient may split one allocation into several segments, all named
     // after the same client hostname.
-    ASSERT_EQ(
-        segment_access.MountSegment(segment2, client_id, client_liveness_),
-        ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment2, SessionFor(client_id)),
+              ErrorCode::OK);
 
     ValidateMountedSegments(segment_manager, {segment, segment2},
                             {client_id, client_id});
@@ -587,7 +1057,7 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
 
     // Verify segment is mounted correctly
@@ -631,7 +1101,7 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
 
     // Get segment access and mount
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
 
     // Verify initial mounted state
@@ -675,7 +1145,7 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
 
     SegmentStatus status = SegmentStatus::UNDEFINED;
@@ -713,6 +1183,48 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
 }
 
+TEST_F(SegmentTest, MountRejectsClosedEarlierRegistrationOfSameName) {
+    SegmentManager segment_manager;
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "shared_segment";
+    first.base = 0x100000000;
+    first.size = 16 * 1024 * 1024;
+
+    Segment second = first;
+    second.id = generate_uuid();
+    second.base = 0x200000000;
+    Segment replacement = first;
+    replacement.id = generate_uuid();
+    replacement.base = 0x300000000;
+
+    const auto client_id = generate_uuid();
+    auto session = SessionFor(client_id);
+    auto segments = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segments.MountSegment(first, session), ErrorCode::OK);
+    ASSERT_EQ(segments.MountSegment(second, session), ErrorCode::OK);
+    for (auto status : {SegmentStatus::DRAINING, SegmentStatus::DRAINED}) {
+        segments.SetDrainSourceStatus(first.name, status);
+        // The indexed registration is open, while the earlier one is closed.
+        ASSERT_EQ(
+            segments.SetSegmentStatusByName(first.name, SegmentStatus::OK),
+            ErrorCode::OK);
+        EXPECT_EQ(segments.MountSegment(replacement, session),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    size_t capacity = 0;
+    ASSERT_EQ(segments.PrepareUnmountSegment(first.id, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(segments.MountSegment(replacement, session),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ASSERT_EQ(segments.CommitUnmountSegment(first.id, client_id, capacity),
+              ErrorCode::OK);
+    ASSERT_EQ(segments.PrepareGracefulUnmountSegment(second.id), ErrorCode::OK);
+    EXPECT_EQ(segments.MountSegment(replacement, session), ErrorCode::OK);
+    EXPECT_TRUE(segments.IsSegmentAllocatable(replacement.name));
+}
+
 TEST_F(SegmentTest,
        GracefulUnmountStopsDetachedAllocationButKeepsExistingBuffers) {
     SegmentManager segment_manager;
@@ -726,9 +1238,8 @@ TEST_F(SegmentTest,
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
     }
 
     AllocatorManager snapshot;
@@ -742,6 +1253,7 @@ TEST_F(SegmentTest,
     auto existing_buffer = registrations->front()->Allocate(1024);
     ASSERT_NE(existing_buffer, nullptr);
     EXPECT_TRUE(existing_buffer->isAvailable());
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
@@ -750,6 +1262,7 @@ TEST_F(SegmentTest,
     }
 
     RandomAllocationStrategy strategy;
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
     auto allocation = strategy.AllocateFrom(snapshot, 1024, segment.name);
     ASSERT_FALSE(allocation.has_value());
     EXPECT_EQ(allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
@@ -767,6 +1280,211 @@ TEST_F(SegmentTest,
                   ErrorCode::OK);
     }
     EXPECT_FALSE(existing_buffer->isAvailable());
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+}
+
+TEST_F(SegmentTest, BufferLifetimeRetainsClientSessionWithoutRegistration) {
+    std::unique_ptr<AllocatedBuffer> buffer;
+    std::weak_ptr<ClientLivenessRecord> owner;
+    {
+        auto record = std::make_shared<ClientLivenessRecord>(
+            generate_uuid(), ClientLivenessRecord::Clock::now());
+        owner = record;
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            "retained_session", DEFAULT_CXL_BASE, 64 * 1024 * 1024,
+            "retained_session_endpoint", "tcp");
+        AllocatorManager manager;
+        auto registration =
+            manager.addAllocator("retained_session", allocator, record);
+        buffer = registration->Allocate(1024);
+        ASSERT_TRUE(buffer);
+        EXPECT_EQ(buffer->getClientSession(), record);
+    }
+    EXPECT_FALSE(owner.expired());
+    EXPECT_TRUE(buffer->getClientSession()->IsServing());
+    EXPECT_FALSE(buffer->isAllocatorValid());
+    buffer.reset();
+    EXPECT_TRUE(owner.expired());
+}
+
+TEST_F(SegmentTest, MountedLifetimeTracksSessionServingAndIdempotentRebind) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "mounted_session_lifetime";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "mounted_session_endpoint";
+    const UUID owner = generate_uuid();
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)),
+                  ErrorCode::OK);
+    }
+    AllocatorManager snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        snapshot = access.SnapshotAllocatorManager();
+    }
+    auto registration = snapshot.getAllocators(segment.name)->front();
+    auto buffer = registration->Allocate(1024);
+    ASSERT_TRUE(buffer);
+    EXPECT_EQ(buffer->getClientSession(), SessionFor(owner));
+    {
+        auto access = manager.getSegmentAccess();
+        // Rebinding the same session must not invalidate existing buffers.
+        access.BindClientSession(SessionFor(owner));
+    }
+    EXPECT_TRUE(buffer->isAvailable());
+    const auto now = ClientLivenessRecord::Clock::now();
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
+    ASSERT_EQ(SessionFor(owner)->Evaluate(now, std::chrono::seconds::zero(),
+                                          std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_TRUE(buffer->isAllocatorValid());
+    EXPECT_FALSE(buffer->isAvailable());
+    EXPECT_FALSE(registration->Allocate(1024));
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+    ASSERT_EQ(SessionFor(owner)->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_TRUE(buffer->isAvailable());
+    EXPECT_TRUE(registration->Allocate(1024));
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
+
+    // OFFLINE also stops serving before physical resource invalidation.
+    ASSERT_EQ(SessionFor(owner)->Evaluate(now, std::chrono::seconds::zero(),
+                                          std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(SessionFor(owner)->Evaluate(now, std::chrono::seconds::zero(),
+                                          std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_TRUE(buffer->isAllocatorValid());
+    EXPECT_FALSE(buffer->isAvailable());
+    EXPECT_FALSE(registration->IsAllocatable());
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+}
+
+TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "session_incarnation_lifetime";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "session_incarnation_endpoint";
+    const UUID owner = generate_uuid();
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)),
+                  ErrorCode::OK);
+    }
+    const auto snapshot_registration = [&] {
+        auto access = manager.getAllocatorAccess();
+        auto snapshot = access.SnapshotAllocatorManager();
+        const auto* registrations = snapshot.getAllocators(segment.name);
+        return registrations && !registrations->empty() ? registrations->front()
+                                                        : nullptr;
+    };
+    auto old_registration = snapshot_registration();
+    ASSERT_NE(old_registration, nullptr);
+    auto old_buffer = old_registration->Allocate(1024);
+    ASSERT_TRUE(old_buffer);
+    auto replacement = std::make_shared<ClientLivenessRecord>(
+        owner, ClientLivenessRecord::Clock::now());
+    {
+        auto access = manager.getSegmentAccess();
+        access.BindClientSession(replacement);
+    }
+    EXPECT_EQ(old_buffer->getClientSession(), SessionFor(owner));
+    EXPECT_FALSE(old_buffer->isAllocatorValid());
+    EXPECT_FALSE(old_registration->Allocate(1024));
+    auto replacement_registration = snapshot_registration();
+    ASSERT_NE(replacement_registration, nullptr);
+    auto new_buffer = replacement_registration->Allocate(1024);
+    ASSERT_TRUE(new_buffer);
+    EXPECT_EQ(new_buffer->getClientSession(), replacement);
+    EXPECT_TRUE(new_buffer->isAvailable());
+
+    auto third = std::make_shared<ClientLivenessRecord>(
+        owner, ClientLivenessRecord::Clock::now());
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName(segment.name,
+                                                SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+        EXPECT_TRUE(new_buffer->isAvailable());
+        access.BindClientSession(third);
+        EXPECT_FALSE(access.IsSegmentAllocatable(segment.name));
+    }
+    EXPECT_EQ(snapshot_registration(), nullptr);
+    EXPECT_FALSE(replacement_registration->Allocate(1024));
+    EXPECT_FALSE(new_buffer->isAvailable());
+    EXPECT_EQ(new_buffer->getClientSession(), replacement);
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
+            ErrorCode::OK);
+    }
+    auto third_registration = snapshot_registration();
+    ASSERT_NE(third_registration, nullptr);
+    auto third_buffer = third_registration->Allocate(1024);
+    ASSERT_TRUE(third_buffer);
+    EXPECT_EQ(third_buffer->getClientSession(), third);
+    EXPECT_FALSE(old_registration->Allocate(1024));
+    EXPECT_FALSE(replacement_registration->Allocate(1024));
+    EXPECT_FALSE(old_buffer->isAvailable());
+    EXPECT_FALSE(new_buffer->isAvailable());
+}
+
+TEST_F(SegmentTest, DetachedAllocationRejectsReplacedSessionLifetime) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "allocation_session_replacement";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "allocation_session_endpoint";
+    const UUID owner = generate_uuid();
+    auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)),
+                  ErrorCode::OK);
+        ASSERT_TRUE(access.ReplaceAllocators(
+            {{segment.id, access.GetAllocator(segment.id), blocking}}));
+    }
+    AllocatorManager snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        snapshot = access.SnapshotAllocatorManager();
+    }
+    auto registration = snapshot.getAllocators(segment.name)->front();
+    auto allocation = std::async(std::launch::async,
+                                 [&] { return registration->Allocate(1024); });
+    const bool entered =
+        blocking->entered_.try_acquire_for(std::chrono::seconds(5));
+    if (entered) {
+        auto access = manager.getSegmentAccess();
+        access.BindClientSession(std::make_shared<ClientLivenessRecord>(
+            owner, ClientLivenessRecord::Clock::now()));
+    }
+    blocking->resume_.release();
+    ASSERT_TRUE(entered);
+    EXPECT_EQ(allocation.get(), nullptr);
+    EXPECT_FALSE(registration->IsAllocatable());
+    AllocatorManager next_snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        next_snapshot = access.SnapshotAllocatorManager();
+    }
+    auto next_registration = next_snapshot.getAllocators(segment.name)->front();
+    EXPECT_NE(next_registration, registration);
+    EXPECT_TRUE(next_registration->IsAllocatable());
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+    EXPECT_TRUE(next_snapshot.hasEnoughServingNames(1));
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
@@ -790,12 +1508,10 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment0, client_id, client_liveness_),
-            ErrorCode::OK);
-        ASSERT_EQ(
-            segment_access.MountSegment(segment1, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment0, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, SessionFor(client_id)),
+                  ErrorCode::OK);
     }
 
     {
@@ -855,13 +1571,13 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     const UUID client_id = generate_uuid();
 
     auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     AllocatorManager snapshot;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
         auto original = segment_access.GetAllocator(segment.id);
         ASSERT_TRUE(segment_access.ReplaceAllocators(
             {{segment.id, original, blocking}}));
@@ -884,9 +1600,9 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     }
     ASSERT_TRUE(allocation_entered);
     auto transition = std::async(std::launch::async, [&] {
-        return client_liveness_->Evaluate(ClientLivenessRecord::Clock::now(),
-                                          std::chrono::seconds::zero(),
-                                          std::chrono::hours(1));
+        return SessionFor(client_id)->Evaluate(
+            ClientLivenessRecord::Clock::now(), std::chrono::seconds::zero(),
+            std::chrono::hours(1));
     });
     const bool transitioned_during_allocation =
         transition.wait_for(std::chrono::seconds(1)) ==
@@ -918,12 +1634,10 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment0, client_id, client_liveness_),
-            ErrorCode::OK);
-        ASSERT_EQ(
-            segment_access.MountSegment(segment1, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment0, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment1, SessionFor(client_id)),
+                  ErrorCode::OK);
     }
 
     {
@@ -980,58 +1694,6 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
     }
 }
 
-TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
-    SegmentManager source(BufferAllocatorType::OFFSET);
-    Segment first;
-    first.id = generate_uuid();
-    first.name = "snapshot-shared-hostname";
-    first.base = DEFAULT_CXL_BASE;
-    first.size = 64 * 1024 * 1024;
-    first.te_endpoint = "snapshot-first-endpoint";
-    Segment second = first;
-    second.id = generate_uuid();
-    second.base += first.size;
-    second.te_endpoint = "snapshot-second-endpoint";
-    const UUID first_owner = generate_uuid();
-    const UUID second_owner = generate_uuid();
-
-    {
-        auto segment_access = source.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(first, first_owner, client_liveness_),
-            ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(
-                      second, second_owner,
-                      std::make_shared<ClientLivenessRecord>(
-                          ClientLivenessRecord::Clock::now())),
-                  ErrorCode::OK);
-    }
-    auto serialized =
-        SegmentSerializer(&source).Serialize(LocalSsdPersistedState{});
-    ASSERT_TRUE(serialized.has_value());
-
-    SegmentManager restored(BufferAllocatorType::OFFSET);
-    auto restored_state = SegmentSerializer(&restored).Deserialize(*serialized);
-    ASSERT_TRUE(restored_state.has_value());
-    {
-        auto allocator_access = restored.getAllocatorAccess();
-        const auto* registrations =
-            allocator_access.getAllocatorManager().getAllocators(first.name);
-        ASSERT_NE(registrations, nullptr);
-        EXPECT_EQ(registrations->size(), 2u);
-    }
-
-    std::vector<std::pair<Segment, UUID>> segments;
-    ASSERT_EQ(restored.getSegmentAccess().GetAllSegments(segments),
-              ErrorCode::OK);
-    std::unordered_map<UUID, UUID, boost::hash<UUID>> owners;
-    for (const auto& [segment, owner] : segments) {
-        owners.emplace(segment.id, owner);
-    }
-    EXPECT_EQ(owners.at(first.id), first_owner);
-    EXPECT_EQ(owners.at(second.id), second_owner);
-}
-
 TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     SegmentManager segment_manager;
 
@@ -1052,12 +1714,10 @@ TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(segment_a, client_id, client_liveness_),
-            ErrorCode::OK);
-        ASSERT_EQ(
-            segment_access.MountSegment(segment_b, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment_a, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment_b, SessionFor(client_id)),
+                  ErrorCode::OK);
     }
 
     const std::string key = "stable_rotation_key";
@@ -1085,7 +1745,7 @@ TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
     UUID client_id = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment, client_id, client_liveness_),
+    ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
               ErrorCode::OK);
     ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
                                                     SegmentStatus::DRAINED),
@@ -1124,9 +1784,8 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(
-        segment_access.MountSegment(segment_a, client_id, client_liveness_),
-        ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment_a, SessionFor(client_id)),
+              ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -1140,8 +1799,8 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
 
     // Remount both segments A and B
     std::vector<Segment> segments_to_remount = {segment_a, segment_b};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id,
-                                            client_liveness_),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount,
+                                            SessionFor(client_id)),
               ErrorCode::OK);
 
     // Verify both segments are mounted correctly
@@ -1171,9 +1830,8 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Get segment access and mount segment A
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(
-        segment_access.MountSegment(segment_a, client_id, client_liveness_),
-        ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment_a, SessionFor(client_id)),
+              ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -1186,8 +1844,8 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
 
     // Attempt to remount segment A while it's in UNMOUNTING state
     std::vector<Segment> segments_to_remount = {segment_a};
-    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount, client_id,
-                                            client_liveness_),
+    ASSERT_EQ(segment_access.ReMountSegment(segments_to_remount,
+                                            SessionFor(client_id)),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     // Complete the unmount process
@@ -1230,9 +1888,8 @@ TEST_F(SegmentTest, QuerySegments) {
         UUID client_id = generate_uuid();
 
         // Mount segment
-        ASSERT_EQ(
-            segment_access.MountSegment(segment, client_id, client_liveness_),
-            ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(segment, SessionFor(client_id)),
+                  ErrorCode::OK);
 
         // Store for verification
         segments.push_back(segment);

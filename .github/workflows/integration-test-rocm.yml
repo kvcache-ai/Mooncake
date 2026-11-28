@@ -36,6 +36,8 @@ jobs:
             --entrypoint /bin/rm \
             "${REGISTRY_ADDR_VLLM}" \
             -rf \
+            /workspace/scripts/e2e/python/.pytest_cache \
+            /workspace/scripts/e2e/python/__pycache__ \
             /workspace/scripts/tone_tests/python/.pytest_cache \
             /workspace/scripts/tone_tests/python/__pycache__
 
@@ -138,12 +140,12 @@ jobs:
           cleanup_best_effort() {
             local exit_code=$?
             trap - EXIT
-            if [ -f scripts/tone_tests/run/.shrc ]; then
+            if [ -f scripts/rocm_tests/run/.shrc ]; then
               set +e
               # shellcheck disable=SC1091
-              source scripts/tone_tests/run/.shrc
+              source scripts/rocm_tests/run/.shrc
               # shellcheck disable=SC1091
-              source scripts/tone_tests/scripts/common.sh
+              source scripts/rocm_tests/scripts/common.sh
               cleanup_test_env double || true
             fi
             exit "$exit_code"
@@ -152,9 +154,9 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
           if ${{ inputs.run_sglang }}; then
-            bash scripts/tone_tests/scripts/run_test.sh run-all
+            bash scripts/rocm_tests/scripts/run_test.sh run-all
           else
-            bash scripts/tone_tests/scripts/run_test.sh run-all VLLM
+            bash scripts/rocm_tests/scripts/run_test.sh run-all VLLM
           fi
 
       - name: Upload ROCm external PD logs
@@ -162,6 +164,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rocm-external-pd-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: scripts/tone_tests/run/logs
+          path: scripts/rocm_tests/run/logs
           if-no-files-found: warn
           retention-days: 14

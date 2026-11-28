@@ -18,22 +18,34 @@
 
 namespace mooncake::conductor::prefixindex {
 
+class HybridIndex;
+struct GroupMutation;
+struct SourceLayout;
+
 struct RegistrationResult {
     bool inserted = false;
     std::string error;
 };
 
 struct BlockPresence {
-    std::set<EngineOwner> gpu_owners;
-    std::set<SharedObjectOwner> cpu_owners;
-    std::set<SharedObjectOwner> disk_owners;
+    std::set<EngineOwner> device_owners;
+    std::set<EngineOwner> cpu_local_owners;
+    // vLLM CPU-tier store announcements per owner. vLLM's offloading
+    // connector re-announces a hash once per chunk that contains it and fans a
+    // chunk eviction out to all of the chunk's hashes, so an owner leaves
+    // cpu_local_owners only when its last announcement is removed.
+    std::map<EngineOwner, uint32_t> cpu_local_refs;
+    std::set<SharedObjectOwner> cpu_share_owners;
+    std::set<TierOwner> disk_owners;
 
     bool Empty() const {
-        return gpu_owners.empty() && cpu_owners.empty() && disk_owners.empty();
+        return device_owners.empty() && cpu_local_owners.empty() &&
+               cpu_share_owners.empty() && disk_owners.empty();
     }
 };
 
-// Maximum number of prefixes tracked for each context.
+// Default maximum number of prefixes tracked for each context; the service
+// configuration (max_blocks_per_context) may override it.
 constexpr size_t kDefaultMaxBlocks = 200000;
 // Target occupancy ratio for a batched capacity eviction.
 constexpr double kEvictTargetRatio = 0.9;
@@ -48,6 +60,8 @@ struct ContextState {
     mutable std::shared_mutex mutex;
     const HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
+    std::map<std::string, std::map<int64_t, common::PublisherKind>>
+        instance_publishers;
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
 
     // Store order: newest prefix at the front, oldest at the back. Query does
@@ -58,11 +72,14 @@ struct ContextState {
     const size_t max_blocks;
     // Cumulative number of entries removed by capacity eviction.
     int64_t evicted_by_capacity = 0;
+    // Allocated only for contexts requiring grouped KV matching.
+    std::shared_ptr<HybridIndex> hybrid;
 };
 
 struct RankCacheHitResult {
-    int64_t gpu = 0;
-    int64_t cpu = 0;
+    int64_t device = 0;
+    int64_t cpu_local = 0;
+    int64_t cpu_share = 0;
     int64_t disk = 0;
 
     bool operator==(const RankCacheHitResult&) const = default;
@@ -72,9 +89,12 @@ struct CacheHitResult {
     int64_t longest_match_tokens = 0;
     std::map<int64_t, int64_t> dp;
     std::map<int64_t, RankCacheHitResult> rank_matches;
-    int64_t gpu = 0;
-    int64_t cpu = 0;
+    int64_t device = 0;
+    int64_t cpu_local = 0;
+    int64_t cpu_share = 0;
     int64_t disk = 0;
+
+    bool operator==(const CacheHitResult&) const = default;
 };
 
 struct ContextView {
@@ -101,18 +121,33 @@ class PrefixCacheTable {
         const EngineRegistration& registration);
 
     RegistrationResult Register(const EngineRegistration& registration);
-    std::string ValidateProfileBinding(const ContextKey& context,
-                                       const HashProfile& profile) const;
+    std::string BindLayout(const ContextKey& context,
+                           const HashProfile& profile,
+                           std::shared_ptr<const CacheLayout> layout);
+    std::string ActivateDeployment(const ContextKey& context,
+                                   const HashProfile& profile,
+                                   const SourceLayout& binding,
+                                   const std::string& instance, int64_t rank);
+    bool GetDeployment(const ContextKey& context, SourceLayout* binding) const;
+    std::string ValidateProfileBinding(
+        const ContextKey& context, const HashProfile& profile,
+        std::shared_ptr<const CacheLayout> layout = nullptr) const;
     std::string Unregister(const ContextKey& context,
                            const std::string& instance_id, int64_t dp_rank);
 
-    std::string StoreGpu(const GpuMutation& mutation);
-    std::string RemoveGpu(const GpuMutation& mutation);
-    std::string ClearGpu(const GpuClear& clear);
+    std::string StoreEngine(const EngineMutation& mutation);
+    std::string RemoveEngine(const EngineMutation& mutation);
+    std::string ClearEngine(const EngineClear& clear);
 
     std::string StoreShared(const SharedMutation& mutation);
     std::string RemoveShared(const SharedMutation& mutation);
     std::string ClearShared(const SharedClear& clear);
+
+    std::string StoreGrouped(const GroupMutation& mutation);
+    std::string RemoveGrouped(const GroupMutation& mutation);
+    std::string ClearGroupedSource(
+        const ContextKey& context, const std::string& source,
+        const std::optional<std::string>& backend = std::nullopt);
 
     std::map<std::string, CacheHitResult> Query(
         const ContextKey& context, std::span<const int32_t> token_ids,
@@ -129,7 +164,8 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    const size_t block_limit_ = kDefaultMaxBlocks;
+    // Set at construction and copied into each context when it is registered.
+    size_t block_limit_ = kDefaultMaxBlocks;
 };
 
 }  // namespace mooncake::conductor::prefixindex

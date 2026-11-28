@@ -32,6 +32,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(USE_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 using mooncake::DmabufExport;
 using mooncake::RdmaContext;
 
@@ -150,5 +154,83 @@ TEST(ExportDmabuf, StackAddressYieldsHostReg) {
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
 }
+
+#if defined(USE_CUDA)
+// Needs a CUDA device and DMA-BUF support; skipped otherwise. Registering a
+// sub-range of a larger cudaMalloc allocation must export only that range:
+// exporting the whole allocation makes every import map all of it through
+// BAR1, and N concurrent imports of an N-way split (preTouchMemory) run out
+// of BAR1 (ibv_reg_dmabuf_mr ENOMEM), e.g. on MIG instances.
+TEST(ExportDmabuf, GpuSubRangeExportsOnlyTheRequestedRange) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "no CUDA device";
+    constexpr size_t kAlloc = 64ULL << 20;  // one 64 MiB allocation
+    constexpr size_t kOffset = 16ULL << 20;
+    constexpr size_t kLength = 16ULL << 20;  // register [16 MiB, 32 MiB)
+    void *base = nullptr;
+    ASSERT_EQ(cudaMalloc(&base, kAlloc), cudaSuccess);
+    DmabufExport exp;
+    int ret = RdmaContext::exportDmabuf(static_cast<char *>(base) + kOffset,
+                                        kLength, exp);
+    if (ret != 0 || exp.method != DmabufExport::Method::kDmabufReg) {
+        RdmaContext::closeDmabufExport(exp);
+        cudaFree(base);
+        GTEST_SKIP() << "DMA-BUF path not taken (no DMA-BUF support, or "
+                        "WITH_NVIDIA_PEERMEM selects ibv_reg_mr)";
+    }
+    off_t exported = lseek(exp.fd, 0, SEEK_END);
+    ASSERT_GT(exported, 0);
+    EXPECT_GE(static_cast<size_t>(exported), exp.offset + kLength);
+    EXPECT_LT(static_cast<size_t>(exported), kAlloc)
+        << "exported the whole allocation instead of the requested range";
+    EXPECT_LT(exp.offset, static_cast<uint64_t>(sysconf(_SC_PAGESIZE)));
+    RdmaContext::closeDmabufExport(exp);
+    cudaFree(base);
+}
+
+// Needs a CUDA device and DMA-BUF support; skipped otherwise. Registering a
+// whole cudaMalloc allocation whose size is not a page multiple must still
+// export it: cuMemGetAddressRange() reports the unrounded size, and
+// cuMemGetHandleForAddressRange() rejects a size that is not page-aligned.
+TEST(ExportDmabuf, GpuWholeAllocationWithUnalignedSize) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "no CUDA device";
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+
+    // A page-aligned allocation first, so that a missing DMA-BUF path skips
+    // the test instead of hiding the unaligned case below.
+    constexpr size_t kAligned = 4ULL << 20;
+    void *aligned = nullptr;
+    ASSERT_EQ(cudaMalloc(&aligned, kAligned), cudaSuccess);
+    DmabufExport control;
+    int ret = RdmaContext::exportDmabuf(aligned, kAligned, control);
+    const bool dmabuf =
+        ret == 0 && control.method == DmabufExport::Method::kDmabufReg;
+    RdmaContext::closeDmabufExport(control);
+    cudaFree(aligned);
+    if (!dmabuf)
+        GTEST_SKIP() << "DMA-BUF path not taken (no DMA-BUF support, or "
+                        "WITH_NVIDIA_PEERMEM selects ibv_reg_mr)";
+
+    const size_t kAlloc = (4ULL << 20) + 12345;
+    ASSERT_NE(kAlloc % page, 0u);
+    void *base = nullptr;
+    ASSERT_EQ(cudaMalloc(&base, kAlloc), cudaSuccess);
+    DmabufExport exp;
+    ret = RdmaContext::exportDmabuf(base, kAlloc, exp);
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(exp.method, DmabufExport::Method::kDmabufReg);
+    EXPECT_EQ(exp.offset, 0u);
+    if (exp.fd >= 0) {
+        off_t exported = lseek(exp.fd, 0, SEEK_END);
+        EXPECT_GE(exported, static_cast<off_t>(kAlloc));
+        EXPECT_EQ(static_cast<size_t>(exported) % page, 0u);
+    }
+    RdmaContext::closeDmabufExport(exp);
+    cudaFree(base);
+}
+#endif
 
 }  // namespace

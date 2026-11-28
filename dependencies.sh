@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.25.9
+GOVER=1.26.10
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -217,12 +217,10 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
-    # Package names for openEuler
+    # Select the MessagePack package for each distribution.
     if [ "$OS" = "openeuler" ]; then
-        BOOST_PACKAGE="boost-devel"
         MSGPACK_PACKAGE=""
     else
-        BOOST_PACKAGE="boost1.78-devel"
         MSGPACK_PACKAGE="msgpack-devel"
     fi
 
@@ -252,7 +250,6 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libunwind-dev \
                      libnuma-dev \
                      libpython3-dev \
-                     libboost-all-dev \
                      libssl-dev \
                      libgrpc-dev \
                      libgrpc++-dev \
@@ -275,12 +272,10 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libc-bin"
 
     # ScaleFabric SHCA (shca-tools) ships its own libibverbs headers/libs; installing
-    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
-    # which also depend on distro ibverbs and fail on SHCA systems.
+    # libibverbs-dev conflicts with it.
     if has_shca_tools; then
         SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
-        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/libboost-dev/g")
-        echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
+        echo -e "${GREEN}shca-tools package detected. Skipping libibverbs-dev (provided by shca-tools); build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
     fi
 
     # Since Ubuntu 26.04, libmsgpack-dev is a transitional package for the C-only
@@ -306,7 +301,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     $BOOST_PACKAGE \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -347,7 +341,6 @@ elif [ "$OS" = "kylin" ]; then
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost-devel \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \

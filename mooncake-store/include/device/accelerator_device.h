@@ -15,9 +15,12 @@ enum class AcceleratorVendor {
     kMaca,
     kHygon,
     kCorex,
+    kSupa,
     kHip,
     kAscend,
     kSunrise,
+    kIntel,
+    kMlu,
 };
 
 enum class MemoryKind {

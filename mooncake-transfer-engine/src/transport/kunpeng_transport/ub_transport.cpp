@@ -23,7 +23,16 @@
 
 namespace mooncake {
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
-    : endpoint_type_(endpoint_type) {}
+    : endpoint_type_(endpoint_type) {
+    const char* mode = getenv("MC_UB_TRANS_MODE");
+    rm_mode_ = (mode != nullptr &&
+                (strcmp(mode, "rm") == 0 || strcmp(mode, "RM") == 0 ||
+                 strcmp(mode, "1") == 0));
+    if (rm_mode_) {
+        LOG(INFO) << "UbTransport: using RM (Reliable Message) mode "
+                     "(UBoE compatible)";
+    }
+}
 
 UbTransport::~UbTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -31,7 +40,10 @@ UbTransport::~UbTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    // Contexts hold URMA resources and need the module alive; release them
+    // before pairing the urma_init() done in init().
     context_list_.clear();
+    uninit(this);
 }
 
 int UbTransport::install(std::string& local_server_name,
@@ -218,7 +230,7 @@ Status UbTransport::submitTransferTask(
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
-        globalConfig().max_wr * globalConfig().num_qp_per_ep;
+        globalConfig().max_wr * globalConfig().num_jetty_per_ep;
     uint64_t nr_slices;
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -502,6 +514,7 @@ int UbTransport::init(UbTransport* transport) {
             LOG(ERROR) << "UrmaContext init failed";
             return -1;
         }
+        transport->urma_initialized_ = true;
     } else if (transport->endpoint_type_ == OBMM_ENDPOINT) {
         LOG(ERROR) << "ObmmContext not support now.";
         return -1;
@@ -514,6 +527,10 @@ int UbTransport::init(UbTransport* transport) {
 
 void UbTransport::uninit(UbTransport* transport) {
     if (transport->endpoint_type_ == URMA_ENDPOINT) {
+        // Idempotent: install() failure paths and the destructor both land
+        // here, while urma_init() happens exactly once per transport.
+        if (!transport->urma_initialized_) return;
+        transport->urma_initialized_ = false;
         if (!UrmaContext::uninit()) {
             LOG(ERROR) << "UrmaContext uninit failed";
         }

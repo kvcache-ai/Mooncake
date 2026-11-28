@@ -5,7 +5,9 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
@@ -17,6 +19,7 @@
 namespace mooncake {
 
 struct TieredStorageUsageSnapshot;
+struct WeightMetadataSnapshot;
 
 class MasterMetricManager {
    public:
@@ -128,6 +131,13 @@ class MasterMetricManager {
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
 
+    // DFS Allocator Metrics (projected from the DFS allocator snapshot). These
+    // reflect the shard/bucket DFS allocator, distinct from the 3fs/nfs file
+    // storage gauges above.
+    int64_t get_dfs_allocated_bytes();
+    int64_t get_dfs_total_capacity();
+    int64_t get_dfs_file_count();
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
@@ -136,6 +146,14 @@ class MasterMetricManager {
     void observe_value_size(int64_t size);
     int64_t get_key_count();
     int64_t get_soft_pin_key_count();
+
+    // Key Group Metrics
+    // spec: "group:prefix|suffix|contains:pattern,...", must be set before
+    // any object is created.
+    void configure_key_groups(const std::string& spec);
+    uint8_t classify_key_group(std::string_view key) const;
+    void inc_key_group(uint8_t group, int64_t value_bytes);
+    void dec_key_group(uint8_t group, int64_t value_bytes);
 
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);
@@ -146,21 +164,16 @@ class MasterMetricManager {
     void client_liveness_recovered();
     void client_liveness_became_offline();
     void on_client_liveness_record_removed(ClientLivenessState state);
-    void reset_client_liveness_metrics(int64_t active_records = 0);
     void inc_client_offboarding_queue_depth(int64_t jobs = 1);
     void dec_client_offboarding_queue_depth(int64_t jobs = 1);
     void inc_client_offboarding_retry();
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
-    // Snapshot Metrics
-    void set_snapshot_duration_ms(int64_t size);
-    void inc_snapshot_success();
-    void inc_snapshot_fail();
-
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
+    void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
     void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
@@ -199,6 +212,16 @@ class MasterMetricManager {
     void inc_nof_segments_unmounted_by_heartbeat_total(int64_t val = 1);
     void observe_nof_heartbeat_probe_latency_ms(int64_t latency_ms);
 
+    void project_weight_metadata(const WeightMetadataSnapshot& snapshot,
+                                 uint64_t now_ms);
+    void inc_weight_reconciliation_failures(int64_t val = 1);
+    int64_t get_weight_revision_count(const std::string& availability);
+    int64_t get_weight_residency_count(const std::string& residency);
+    int64_t get_weight_active_leases();
+    int64_t get_weight_pending_operations();
+    int64_t get_weight_oldest_operation_age_ms();
+    int64_t get_weight_reconciliation_failures();
+
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
     void inc_batch_exist_key_failures(int64_t failed_items);
@@ -214,6 +237,7 @@ class MasterMetricManager {
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
     void inc_batch_put_start_requests(int64_t items);
     void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_object_already_exists(int64_t items);
     void inc_batch_put_start_partial_success(int64_t failed_items);
     void inc_batch_put_end_requests(int64_t items);
     void inc_batch_put_end_failures(int64_t failed_items);
@@ -225,6 +249,7 @@ class MasterMetricManager {
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
+    int64_t get_put_start_object_already_exists();
     int64_t get_put_start_alloc_failures();
     int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
@@ -275,6 +300,7 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_object_already_exists();
     int64_t get_batch_put_start_partial_successes();
     int64_t get_batch_put_start_items();
     int64_t get_batch_put_start_failed_items();
@@ -343,6 +369,8 @@ class MasterMetricManager {
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
+    void inc_standby_restore_rejected_objects(const std::string& reason,
+                                              int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
     // Promotion retry candidate metrics
@@ -597,10 +625,29 @@ class MasterMetricManager {
     ylt::metric::gauge_t file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
+    // DFS Allocator Metrics
+    ylt::metric::gauge_t dfs_allocated_size_;
+    ylt::metric::gauge_t dfs_total_capacity_;
+    ylt::metric::gauge_t dfs_file_count_;
+
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
     ylt::metric::histogram_t value_size_distribution_;
+
+    // Key Group Metrics
+    static constexpr size_t kMaxKeyGroups = 32;
+    struct KeyGroupRule {
+        enum class Match { kPrefix, kSuffix, kContains };
+        Match match;
+        std::string pattern;
+        uint8_t group;
+    };
+    std::vector<KeyGroupRule> key_group_rules_;
+    // The last entry is "other".
+    std::vector<std::string> key_group_names_;
+    ylt::metric::dynamic_gauge_1t key_count_by_group_;
+    ylt::metric::dynamic_gauge_1t value_bytes_by_group_;
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
@@ -618,6 +665,7 @@ class MasterMetricManager {
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
@@ -679,6 +727,7 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_object_already_exists_;
     ylt::metric::counter_t batch_put_start_partial_successes_;
     ylt::metric::counter_t batch_put_start_items_;
     ylt::metric::counter_t batch_put_start_failed_items_;
@@ -759,6 +808,7 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+    ylt::metric::dynamic_counter_1t standby_restore_rejected_objects_total_;
 
     // SSD Offload Task Metrics
     ylt::metric::dynamic_counter_1t offload_enqueued_total_;
@@ -767,10 +817,6 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
-    // Snapshot Metrics
-    ylt::metric::histogram_t snapshot_duration_ms_;
-    ylt::metric::counter_t snapshot_success_;
-    ylt::metric::counter_t snapshot_fail_;
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
     ylt::metric::counter_t copy_start_failures_;
@@ -798,6 +844,13 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    ylt::metric::dynamic_gauge_1t weight_revisions_by_availability_;
+    ylt::metric::dynamic_gauge_1t weight_revisions_by_residency_;
+    ylt::metric::gauge_t weight_active_leases_;
+    ylt::metric::gauge_t weight_pending_operations_;
+    ylt::metric::gauge_t weight_oldest_operation_age_ms_;
+    ylt::metric::counter_t weight_reconciliation_failures_;
 
     // Build Info Metric
     // Prometheus "info" pattern: the value carries no meaning and is always 1,

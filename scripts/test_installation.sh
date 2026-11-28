@@ -38,21 +38,36 @@ python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncak
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
+cp -r python/tests/services test_env/service_tests
 cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
 cp -r python/tests/ssd test_env/ssd_tests
+mkdir -p test_env/store_tests
+cp python/tests/store/test_structured_ranges_properties.py test_env/store_tests/
 cd test_env
-pip install torch numpy
+# Allow GPU-less consumer legs (e.g. ubuntu-24.04, which skips PG CUDA JIT) to
+# pass --index-url https://download.pytorch.org/whl/cpu without affecting numpy.
+# shellcheck disable=SC2086
+pip install torch ${TORCH_PIP_EXTRA_ARGS:-}
+pip install numpy
 python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_transfer_engine_gil.py
+
+echo "Running HTTP metadata server test..."
+python -m unittest service_tests/test_http_metadata_server.py
 
 echo "Running mooncake config test..."
 python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
-python -m pytest reshard_tests ssd_tests -q
+python -m pytest reshard_tests ssd_tests store_tests -q \
+  unit_tests/test_rpc_interface.py unit_tests/test_shared_segment.py \
+  unit_tests/test_transfer_engine_topology.py
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
@@ -69,6 +84,10 @@ echo "Verifying transfer_engine_bench entry point..."
 which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
 echo "Success: transfer_engine_bench entry point found"
 
+echo "Verifying mooncake_http_metadata_server entry point..."
+which mooncake_http_metadata_server || { echo "ERROR: mooncake_http_metadata_server entry point not found!"; exit 1; }
+mooncake_http_metadata_server --help >/dev/null
+echo "Success: mooncake_http_metadata_server entry point found"
 echo "Verifying transfer_engine_topology_dump entry point..."
 transfer_engine_topology_dump --help >/dev/null
 python -m mooncake.transfer_engine_topology_dump --help >/dev/null

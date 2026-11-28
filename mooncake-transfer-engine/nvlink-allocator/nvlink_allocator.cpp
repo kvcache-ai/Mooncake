@@ -147,7 +147,9 @@ void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
         std::cerr << "cuMemRetainAllocationHandle failed: " << result << "\n";
         return;
     }
-    result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
+    // Not all runtimes accept a NULL base output; always pass a real pointer.
+    CUdeviceptr base = 0;
+    result = cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemAddressFree((CUdeviceptr)ptr, size);

@@ -2,6 +2,8 @@
 .vscode
 build
 build_ofed4
+build-xpu-ci/
+xpu-ci-output/
 old
 local_test
 go.sum

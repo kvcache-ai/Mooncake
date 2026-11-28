@@ -33,6 +33,10 @@ const static std::string GPU_PREFIX = "maca:";
 #define cuMemUnmap mcMemUnmap
 #define cuPointerGetAttribute mcPointerGetAttribute
 
+#define cudaDeviceProp mcDeviceProp_t
+#define cudaGetDeviceProperties mcGetDeviceProperties
+#define cudaErrorDeviceUninitialized mcErrorDeviceUninitialized
+
 #define CUDA_SUCCESS mcSuccess
 #define CUDA_ERROR_NOT_PERMITTED mcErrorNotPermitted
 #define CUDA_ERROR_NOT_SUPPORTED mcErrorNotSupported
@@ -77,7 +81,13 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 #define cudaDeviceGetAttribute mcDeviceGetAttribute
 #define cudaDeviceGetPCIBusId mcDeviceGetPCIBusId
 #define cudaDeviceSynchronize mcDeviceSynchronize
+#define cudaDeviceGetStreamPriorityRange mcDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority mcStreamCreateWithPriority
+#define cudaStreamCaptureStatus mcStreamCaptureStatus
+#define cudaStreamCaptureStatusNone mcStreamCaptureStatusNone
+#define cudaStreamIsCapturing mcStreamIsCapturing
 #define cudaDevAttrMultiProcessorCount mcDeviceAttributeMultiProcessorCount
+#define cudaDevAttrClockRate mcDeviceAttributeClockRate
 #define cudaErrorNotReady mcErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled mcErrorPeerAccessAlreadyEnabled
 #define cudaError_t mcError_t

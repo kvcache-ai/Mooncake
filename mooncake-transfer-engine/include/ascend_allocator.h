@@ -1,12 +1,41 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "acl/acl_rt.h"
 #endif
 
 namespace mooncake {
+// Config provider for the two process switches the allocator reads. The
+// transfer engine registers callbacks at load time that read globalConfig()
+// live, so a store that flips the switches after init is picked up
+// immediately. A consumer that does not link the transfer engine (for example
+// a TENT-only Python module) leaves the provider unset and either calls
+// ascend_allocator_set_runtime_flags() or relies on the environment defaults.
+// Priority: provider > runtime flags > environment default.
+using AscendConfigBoolFn = bool (*)();
+
+void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
+                                          AscendConfigBoolFn use_fabric_mem);
+
+// Independent of the two switches above. Priority matches them: this provider,
+// then the runtime flag, defaulting to false.
+void ascend_allocator_set_single_segment_provider(AscendConfigBoolFn fn);
+
+// Set the fallback switches used when no config provider is registered.
+// Calling this again replaces all three values.
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem,
+                                        bool single_segment = false);
+
+// 0 keeps one store allocation. Single-segment mode returns 0. Otherwise the
+// standalone split is total/device_count, or 0 when fewer than two devices
+// are visible to ContextManager.
+size_t ascend_agent_mode_store_chunk_cap(size_t total_size);
+
 void* ascend_allocate_memory(size_t total_size, const std::string& protocol);
 
 // Matches store allocate_buffer_mmap_memory(size, alignment, defer_populate).
@@ -25,8 +54,19 @@ void* ascend_allocate_memory_best_effort(size_t target_size,
 
 void ascend_free_memory(const std::string& protocol, void* ptr);
 
+// Handle a peer process on this machine can import to map the same physical
+// pages (ASCEND_USE_SHMEM). True only when `addr` is the base of a shared
+// memfd allocation; false for private mappings, aclrtMallocHost buffers, VMM
+// allocations, and for any address that is not an allocation base.
+bool ascend_get_shared_host_handle(void* addr, std::string* handle);
+
 // Check if [addr, addr+length) overlaps with any store memory range.
 bool ascend_is_store_memory(void* addr, size_t length);
+
+// Check whether addr starts inside a direct ACL VMM allocation (allocated via
+// ascend_allocate_vmm_memory_direct). Returns false for adxl::MallocMem
+// allocations and non-VMM host buffers.
+bool ascend_is_direct_vmm_memory(void* addr, size_t length);
 
 // Direct ACL VMM allocation, always bypasses adxl MallocMem.
 // For use by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
@@ -38,4 +78,5 @@ void* ascend_allocate_vmm_memory_direct(size_t size);
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 aclrtDrvMemHandle ascend_get_physical_handle_from_va(void* va);
 #endif
+
 }  // namespace mooncake

@@ -2,8 +2,11 @@
 // Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
 // from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
+#include <atomic>
 #include <memory>
 #include <thread>
+#include <utility>
+
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 
@@ -74,7 +77,7 @@ T applyReduceOp(const T& a, const T& b, ReduceOp op) {
         case ReduceOp::Max:
             return std::max(a, b);
         default:
-            PG_ASSERT(false, "Unsupported reduce op: ", (int)op);
+            detail::throwPGAssertFailure("Unsupported reduce op: ", (int)op);
     }
 }
 
@@ -152,7 +155,12 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
 
     if (cuda_device_index_ >= 0) {
         for (auto& enqueue_stream : enqueue_streams_) {
-            enqueue_stream = GpuStream::createNonBlocking(cuda_device_index_);
+            auto stream_result =
+                GpuStream::createNonBlocking(cuda_device_index_);
+            PG_ASSERT(stream_result.has_value(),
+                      "create CUDA worker enqueue stream failed: ",
+                      stream_result.error().message);
+            enqueue_stream.emplace(std::move(stream_result).value());
         }
     }
 
@@ -230,6 +238,8 @@ std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
             copyFromRecvBuffer(
                 (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
                 state->currentPos, realSize);
+            std::atomic_ref<uint32_t>(meta->halfReads[bufferOffset])
+                .fetch_add(1, std::memory_order_release);
 
             state->currentPos += realSize;
 
@@ -256,7 +266,10 @@ void MooncakeWorker::putTaskCuda(
                              cudaStream_t)>& copyFromRecvBuffer) {
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
 
-    const GpuDeviceGuard guard(cuda_device_index_);
+    auto guard_result = GpuDeviceGuard::create(cuda_device_index_);
+    PG_ASSERT(guard_result.has_value(), "select CUDA worker device failed: ",
+              guard_result.error().message);
+    auto device_guard = std::move(guard_result).value();
     const auto issue_stream =
         GpuStream::borrow(issueStream, cuda_device_index_);
     const size_t cudaTaskSlot = cudaOpCount % kNumCudaTasks_;
@@ -264,16 +277,24 @@ void MooncakeWorker::putTaskCuda(
     const auto& enq_stream = enqueue_streams_[cudaTaskSlot].value();
     ++cudaOpCount;
 
-    cudaStreamCaptureStatus issue_capture = cudaStreamCaptureStatusNone;
-    cudaStreamCaptureStatus enq_capture = cudaStreamCaptureStatusNone;
-    PG_ASSERT_CUDA(cudaStreamIsCapturing(issue_stream.get(), &issue_capture));
-    PG_ASSERT_CUDA(cudaStreamIsCapturing(enq_stream.get(), &enq_capture));
-    const bool is_capturing = issue_capture != cudaStreamCaptureStatusNone ||
-                              enq_capture != cudaStreamCaptureStatusNone;
-
-    GpuEvent event_start(issue_stream.deviceIndex());
-    event_start.record(issue_stream);
-    enq_stream.waitEvent(event_start);
+    const auto issue_capture = issue_stream.captureStatus();
+    PG_ASSERT(issue_capture.has_value(),
+              "query CUDA worker issue stream capture status failed: ",
+              issue_capture.error().message);
+    const auto enq_capture = enq_stream.captureStatus();
+    PG_ASSERT(enq_capture.has_value(),
+              "query CUDA worker enqueue stream capture status failed: ",
+              enq_capture.error().message);
+    const bool is_capturing =
+        issue_capture.value() != cudaStreamCaptureStatusNone ||
+        enq_capture.value() != cudaStreamCaptureStatusNone;
+    auto event_start_result = GpuEvent::create(issue_stream.deviceIndex());
+    PG_ASSERT(event_start_result.has_value(),
+              "create CUDA worker entry event failed: ",
+              event_start_result.error().message);
+    auto event_start = std::move(event_start_result).value();
+    PG_ASSERT_OK(event_start.record(issue_stream));
+    PG_ASSERT_OK(enq_stream.waitEvent(event_start));
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -302,6 +323,8 @@ void MooncakeWorker::putTaskCuda(
         copyFromRecvBuffer(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream.get());
+        launchReadDoneKernel(meta->halfReadsDevice + bufferOffset,
+                             enq_stream.get());
 
         ++meta->taskCount;
     }
@@ -311,14 +334,20 @@ void MooncakeWorker::putTaskCuda(
     // serialized by the stream. In eager mode, finish each chunk's host-worker
     // submission step before installing the completion wait on issue_stream
     // below. Captured enqueue kernels have not run yet, so capture skips this
-    // gate.
+    // gate. The submission step includes waiting for the targets to read the
+    // half (AWAITING_READERS), so when a chunk reuses a half whose last run a
+    // target has not read yet, the caller waits here for that read too.
     if (!is_capturing) {
         waitUntilTasksSubmitted(submitted_tasks);
     }
 
-    GpuEvent event_end(enq_stream.deviceIndex());
-    event_end.record(enq_stream);
-    issue_stream.waitEvent(event_end);
+    auto event_end_result = GpuEvent::create(enq_stream.deviceIndex());
+    PG_ASSERT(event_end_result.has_value(),
+              "create CUDA worker return event failed: ",
+              event_end_result.error().message);
+    auto event_end = std::move(event_end_result).value();
+    PG_ASSERT_OK(event_end.record(enq_stream));
+    PG_ASSERT_OK(issue_stream.waitEvent(event_end));
 }
 
 }  // namespace mooncake

@@ -12,7 +12,7 @@ namespace mooncake {
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
       host_(host),
-      server_(std::make_unique<coro_http::coro_http_server>(4, port)),
+      server_(std::make_unique<coro_http::coro_http_server>(4, port, host_)),
       running_(false) {
     init_server();
 }
@@ -22,10 +22,14 @@ HttpMetadataServer::~HttpMetadataServer() { stop(); }
 void HttpMetadataServer::init_server() {
     using namespace coro_http;
 
+    // Clients send the key percent-encoded (curl_easy_escape), so every
+    // handler decodes it. Stored keys then match the plain names that
+    // MasterService::cleanupHttpMetadata removes.
+
     // GET /metadata?key=<key>
     server_->set_http_handler<GET>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
-            auto key = req.get_query_value("key");
+            auto key = req.get_decode_query_value("key");
             if (key.empty()) {
                 resp.set_status_and_content(status_type::bad_request,
                                             "Missing key parameter");
@@ -47,7 +51,7 @@ void HttpMetadataServer::init_server() {
     // PUT /metadata?key=<key>
     server_->set_http_handler<PUT>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
-            auto key = req.get_query_value("key");
+            auto key = req.get_decode_query_value("key");
             if (key.empty()) {
                 resp.set_status_and_content(status_type::bad_request,
                                             "Missing key parameter");
@@ -81,7 +85,7 @@ void HttpMetadataServer::init_server() {
     // DELETE /metadata?key=<key>
     server_->set_http_handler<coro_http::http_method::DEL>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
-            auto key = req.get_query_value("key");
+            auto key = req.get_decode_query_value("key");
             if (key.empty()) {
                 resp.set_status_and_content(status_type::bad_request,
                                             "Missing key parameter");
@@ -122,6 +126,7 @@ bool HttpMetadataServer::start() {
                    << port_;
         return false;
     }
+    port_ = server_->port();
     running_ = true;
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;

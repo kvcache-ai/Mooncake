@@ -24,6 +24,9 @@ struct VllmStoredEvent {
     std::optional<int64_t> group_idx;
     std::optional<std::string> kv_cache_spec_kind;
     std::optional<int64_t> kv_cache_spec_sliding_window;
+    // Optional complete deployment declaration from AscendStoreConnector.
+    // Extension field: all upstream fields and the event tag remain unchanged.
+    std::optional<std::string> kv_cache_layout;
 };
 
 struct VllmRemovedEvent {
@@ -37,9 +40,9 @@ struct VllmClearedEvent {};
 using VllmEvent =
     std::variant<VllmStoredEvent, VllmRemovedEvent, VllmClearedEvent>;
 
-// SGLang's native KV-event protocol is msgspec array-like/tagged data.  Keep
-// its signed wire hashes as uint64 bit patterns internally so all index paths
-// use one unsigned representation.
+// SGLang's native KV-event protocol wraps tagged msgpack map events in an
+// array-like envelope.  Keep its signed wire hashes as uint64 bit patterns
+// internally so all index paths use one unsigned representation.
 struct SglangStoredEvent {
     std::vector<uint64_t> block_hashes;
     std::optional<uint64_t> parent_block_hash;
@@ -48,6 +51,7 @@ struct SglangStoredEvent {
     std::optional<int64_t> lora_id;
     std::optional<std::string> medium;
     std::optional<std::string> cache_salt;
+    std::optional<std::string> lora_name;
 };
 
 struct SglangRemovedEvent {

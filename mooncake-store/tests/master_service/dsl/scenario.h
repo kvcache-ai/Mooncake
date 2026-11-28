@@ -1955,10 +1955,14 @@ ObjectsSpec<> Objects(std::initializer_list<std::string> keys);
 
 struct ReadableObjectCountSpec {
     ObjectsSpecData objects;
-    size_t expected;
+    size_t min_expected;
+    size_t max_expected;
 };
 
 ReadableObjectCountSpec ReadableCount(ObjectsSpec<> objects, size_t expected);
+ReadableObjectCountSpec ReadableCountBetween(ObjectsSpec<> objects,
+                                             size_t min_expected,
+                                             size_t max_expected);
 
 struct KeyExistsSpec {
     std::string key;
@@ -1989,6 +1993,35 @@ struct BatchExistenceSpec {
 };
 
 BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys);
+
+// Lease-free twin of BatchExistence: BatchProbeKey reports the same hits
+// without granting or extending read leases. LastHitOnly keeps those
+// per-key results and leases the last candidate of candidate_size
+// consecutive keys whose results are all true.
+struct BatchProbeSpec {
+    std::vector<std::string> keys;
+    std::string tenant{TenantId::Default().value()};
+    GrantLeasePolicy policy{};
+    std::vector<bool> expected;
+
+    BatchProbeSpec& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    BatchProbeSpec& LastHitOnly(uint64_t candidate_size) {
+        policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+        policy.candidate_size = candidate_size;
+        return *this;
+    }
+
+    BatchProbeSpec& Returns(std::initializer_list<bool> values) {
+        expected.assign(values.begin(), values.end());
+        return *this;
+    }
+};
+
+BatchProbeSpec BatchProbe(std::initializer_list<std::string> keys);
 
 struct BatchReplicaListsSpec {
     std::vector<std::string> keys;
@@ -2121,8 +2154,6 @@ struct MemoryNodeStatusSpec {
 
 MemoryNodeStatusSpec MemoryNodeStatus(std::string node);
 
-std::string GroupOnDifferentShard(std::string_view key);
-
 class MasterScenario {
    public:
     explicit MasterScenario(std::string name);
@@ -2206,6 +2237,7 @@ class MasterScenario {
     MasterScenario& Then(ReadableObjectCountSpec objects);
     MasterScenario& Then(KeyExistsSpec key_exists);
     MasterScenario& Then(BatchExistenceSpec batch_existence);
+    MasterScenario& Then(BatchProbeSpec batch_probe);
     MasterScenario& Then(BatchReplicaListsSpec batch_replica_lists);
     MasterScenario& Then(NamedTaskSpec task);
     MasterScenario& Then(UnknownTaskSpec task);

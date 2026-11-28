@@ -10,6 +10,7 @@ from pg_test_utils import (
     MooncakePGMUSABackendTestCase,
     MooncakePGWorkerContext,
 )
+from transfer_fault_injection import TransferFault, preload_transfer_fault
 
 
 def _collective_payload(
@@ -51,6 +52,161 @@ def _collective_payload(
         )
         dist.broadcast(tensor, src=0)
         return {"value": int(tensor.cpu().item())}
+
+    if case_name == "noncontiguous_collectives":
+
+        def make_matrix(values: torch.Tensor, transposed: bool) -> torch.Tensor:
+            storage = torch.empty((2, 2), dtype=torch.int32, device=device)
+            tensor = storage.t() if transposed else storage
+            tensor.copy_(values)
+            return tensor
+
+        transposed = rank % 2 == 0
+        errors = []
+        broadcast = make_matrix(
+            torch.full((2, 2), -1, dtype=torch.int32, device=device), transposed
+        )
+        if rank == 0:
+            broadcast.copy_(torch.tensor([[1, 2], [3, 4]], device=device))
+        dist.broadcast(broadcast, src=0)
+        if broadcast.cpu().tolist() != [[1, 2], [3, 4]]:
+            errors.append("broadcast returned incorrect logical values")
+
+        allreduce = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        dist.all_reduce(allreduce, op=dist.ReduceOp.SUM)
+        rank_sum = world_size * (world_size - 1) // 2
+        expected = (
+            torch.arange(4, dtype=torch.int32, device=device)
+            .view(2, 2)
+            .mul(world_size)
+            .add(rank_sum)
+        )
+        if allreduce.cpu().tolist() != expected.cpu().tolist():
+            errors.append("all_reduce returned incorrect logical values")
+
+        allgather_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        allgather_outputs = [
+            make_matrix(
+                torch.zeros((2, 2), dtype=torch.int32, device=device),
+                peer % 2 != 0,
+            )
+            for peer in range(world_size)
+        ]
+        dist.all_gather(allgather_outputs, allgather_input)
+        if [item.cpu().tolist() for item in allgather_outputs] != [
+            (torch.arange(4, dtype=torch.int32).view(2, 2) + peer).tolist()
+            for peer in range(world_size)
+        ]:
+            errors.append("all_gather returned incorrect logical values")
+
+        gather_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        if rank == 0:
+            gather_outputs = [
+                make_matrix(
+                    torch.zeros((2, 2), dtype=torch.int32, device=device),
+                    peer % 2 != 0,
+                )
+                for peer in range(world_size)
+            ]
+            dist.gather(gather_input, gather_outputs, dst=0)
+            if [item.cpu().tolist() for item in gather_outputs] != [
+                (torch.arange(4).view(2, 2) + peer).tolist()
+                for peer in range(world_size)
+            ]:
+                errors.append("gather returned incorrect logical values")
+        else:
+            dist.gather(gather_input, dst=0)
+
+        reduce_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        dist.reduce(reduce_input, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            expected_reduce = (
+                torch.arange(4, dtype=torch.int32)
+                .view(2, 2)
+                .mul(world_size)
+                .add(rank_sum)
+            )
+            if reduce_input.cpu().tolist() != expected_reduce.tolist():
+                errors.append("reduce returned incorrect logical values")
+
+        scatter_output = make_matrix(
+            torch.zeros((2, 2), dtype=torch.int32, device=device), transposed
+        )
+        if rank == 0:
+            scatter_inputs = []
+            for peer in range(world_size):
+                scatter_inputs.append(
+                    make_matrix(
+                        torch.arange(4, dtype=torch.int32, device=device)
+                        .view(2, 2)
+                        .add(peer * 10),
+                        peer % 2 == 0,
+                    )
+                )
+            dist.scatter(scatter_output, scatter_inputs, src=0)
+        else:
+            dist.scatter(scatter_output, src=0)
+        expected_scatter = (torch.arange(4).view(2, 2) + rank * 10).tolist()
+        if scatter_output.cpu().tolist() != expected_scatter:
+            errors.append("scatter returned incorrect logical values")
+
+        allgather_base_input_storage = torch.empty(
+            (2, 2), dtype=torch.int32, device=device
+        )
+        allgather_base_input = allgather_base_input_storage[:, 0]
+        allgather_base_input.copy_(
+            torch.tensor([rank * 10, rank * 10 + 1], dtype=torch.int32, device=device)
+        )
+        allgather_base_output_storage = torch.empty(
+            (world_size * 2, 2), dtype=torch.int32, device=device
+        )
+        allgather_base_output = allgather_base_output_storage[:, 0]
+        dist.all_gather_into_tensor(allgather_base_output, allgather_base_input)
+        expected_allgather_base = [
+            value for peer in range(world_size) for value in (peer * 10, peer * 10 + 1)
+        ]
+        if allgather_base_output.cpu().tolist() != expected_allgather_base:
+            errors.append("all_gather_into_tensor returned incorrect values")
+
+        reduce_scatter_base_input_storage = torch.empty(
+            (world_size * 2, 2), dtype=torch.int32, device=device
+        )
+        reduce_scatter_base_input = reduce_scatter_base_input_storage[:, 0]
+        reduce_scatter_base_input.copy_(
+            torch.arange(world_size * 2, dtype=torch.int32, device=device) * 10 + rank
+        )
+        reduce_scatter_base_output_storage = torch.empty(
+            (2, 2), dtype=torch.int32, device=device
+        )
+        reduce_scatter_base_output = reduce_scatter_base_output_storage[:, 0]
+        dist.reduce_scatter_tensor(
+            reduce_scatter_base_output,
+            reduce_scatter_base_input,
+            op=dist.ReduceOp.SUM,
+        )
+        rank_sum = world_size * (world_size - 1) // 2
+        expected_reduce_scatter_base = [
+            rank * 20 * world_size + rank_sum,
+            (rank * 20 + 10) * world_size + rank_sum,
+        ]
+        if reduce_scatter_base_output.cpu().tolist() != expected_reduce_scatter_base:
+            errors.append("reduce_scatter_tensor returned incorrect values")
+
+        if errors:
+            raise AssertionError("; ".join(errors))
+        return {"value": "ok"}
 
     if case_name == "all_gather_into_tensor":
         local = torch.tensor([rank], dtype=torch.int32, device=device)
@@ -121,6 +277,82 @@ def _collective_payload(
     raise ValueError(f"unsupported collective case_name: {case_name}")
 
 
+def _allreduce_boundaries_worker(ctx: MooncakePGWorkerContext) -> None:
+    ctx.init_group()
+    cases = 0
+    for dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+    ):
+        for count in (0, 1, 3, 17, 2049, 65539):
+            # Offset by one element to exercise unaligned packs and guard both
+            # ends, including empty owner shards and nonuniform channel tails.
+            storage = torch.full((count + 2,), -7, dtype=dtype, device=ctx.device)
+            tensor = storage[1:-1]
+            base = (torch.arange(count, device=ctx.device) % 3 + 1).to(dtype)
+            for op in (
+                dist.ReduceOp.SUM,
+                dist.ReduceOp.PRODUCT,
+                dist.ReduceOp.MIN,
+                dist.ReduceOp.MAX,
+            ):
+                if op == dist.ReduceOp.PRODUCT:
+                    tensor.fill_(2)
+                    expected = torch.full_like(base, 2**ctx.world_size)
+                else:
+                    tensor.copy_(base + ctx.rank)
+                    if op == dist.ReduceOp.SUM:
+                        expected = (
+                            base * ctx.world_size
+                            + ctx.world_size * (ctx.world_size - 1) // 2
+                        )
+                    elif op == dist.ReduceOp.MIN:
+                        expected = base
+                    else:
+                        expected = base + ctx.world_size - 1
+                dist.all_reduce(tensor, op=op)
+                assert torch.equal(tensor, expected), (dtype, count, op, ctx.rank)
+                assert storage[0].item() == storage[-1].item() == -7
+                cases += 1
+
+    # Cross a complete 32-channel tile at 2/8 ranks with the default workspace.
+    large = torch.empty((1 << 22) + 3, device=ctx.device)
+    for _ in range(3):
+        large.fill_(ctx.rank + 1)
+        dist.all_reduce(large)
+        assert bool(torch.all(large == ctx.world_size * (ctx.world_size + 1) // 2))
+    ctx.record_result({"cases": cases})
+
+
+def _allreduce_graph_replay_worker(ctx: MooncakePGWorkerContext) -> None:
+    ctx.init_group()
+    tensor = torch.full((131073,), ctx.rank + 1, device=ctx.device)
+    dist.all_reduce(tensor)
+    torch.cuda.synchronize(ctx.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tensor.fill_(ctx.rank + 1)
+        dist.all_reduce(tensor)
+    expected = ctx.world_size * (ctx.world_size + 1) // 2
+    for iteration in range(12):
+        # Interleave different launch/channel sizes with replay on the same
+        # communicator so protocol progress cannot be captured as constants.
+        graph.replay()
+        other = torch.full(
+            (1 if iteration % 2 else 8193,), ctx.rank + 1, device=ctx.device
+        )
+        dist.all_reduce(other)
+        torch.cuda.synchronize(ctx.device)
+        assert bool(torch.all(tensor == expected))
+        assert bool(torch.all(other == expected))
+    graph.reset()
+    torch.cuda.synchronize(ctx.device)
+    ctx.record_result({"replays": 12})
+
+
 def _collective_worker(
     ctx: MooncakePGWorkerContext,
     case_name: str,
@@ -165,6 +397,38 @@ def _async_ops_on_independent_streams_worker(
             "values": [int(tensor_a.cpu().item()), int(tensor_b.cpu().item())],
         }
     )
+
+
+def _slow_finisher_of_a_half_worker(
+    ctx: MooncakePGWorkerContext, fault_library: str, rank_one_passed: mp.Event
+) -> None:
+    """Rank 1 finishes a collective after rank 0 flags the half's next run."""
+    device = ctx.init_group()
+    fault = TransferFault(fault_library, local_rank=ctx.rank)
+    # Larger than a flag, so that only flag writes are delayed.
+    tensor = torch.full((64,), ctx.rank + 1, dtype=torch.int32, device=device)
+
+    if ctx.rank == 1:
+        fault.delay_flag_completion(0.5)
+    dist.all_reduce(tensor)
+    ctx.synchronize()
+    fault.delay_flag_completion(0)
+
+    # A capture takes the other half without running, so the barrier runs on
+    # the all_reduce's half.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dist.all_reduce(tensor)
+    ctx.synchronize()
+    dist.barrier()
+    ctx.synchronize()
+    # Rank 0 stays until rank 1 passes: rank 0 leaving the group would also end
+    # rank 1's wait for a lost flag.
+    if ctx.rank == 1:
+        rank_one_passed.set()
+    elif not rank_one_passed.wait(timeout=30.0):
+        raise TimeoutError("rank 1 did not pass the barrier")
+    ctx.record_result({"value": int(tensor[0].cpu().item())})
 
 
 class _CollectiveTestMixin:
@@ -212,6 +476,14 @@ class _CollectiveTestMixin:
         self.assert_all_ok(rows)
         for row in rows:
             self.assertEqual(row["value"], 111)
+
+    def test_noncontiguous_collectives(self) -> None:
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "noncontiguous_collectives"
+        )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["value"], "ok")
 
     def test_all_gather_into_tensor(self) -> None:
         rows = self.spawn_backend_and_collect(
@@ -275,6 +547,31 @@ class TestMooncakePGCollectivesCUDA(
     _CollectiveTestMixin, MooncakePGCUDABackendTestCase
 ):
     world_size = 2
+
+    def test_slow_finisher_keeps_flag_of_the_next_run_of_a_half(self) -> None:
+        rank_one_passed = mp.get_context("spawn").Event()
+        with preload_transfer_fault() as fault_library:
+            rows = self.spawn_backend_and_collect(
+                _slow_finisher_of_a_half_worker,
+                str(fault_library),
+                rank_one_passed,
+                timeout_s=90.0,
+            )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["value"], 3)
+
+    def test_allreduce_unaligned_tails_and_slot_reuse(self) -> None:
+        rows = self.spawn_backend_and_collect(_allreduce_boundaries_worker)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["cases"], 120)
+
+    def test_allreduce_graph_replay_with_changing_sizes(self) -> None:
+        rows = self.spawn_backend_and_collect(_allreduce_graph_replay_worker)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["replays"], 12)
 
     def test_async_ops_on_independent_streams(self) -> None:
         spawn_ctx = mp.get_context("spawn")

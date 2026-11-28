@@ -12,6 +12,9 @@
 
 namespace mooncake::conductor::prefixindex {
 
+// Producer hash namespaces are independent of the cache recovery policy.
+enum class HashDomain { kRaw, kSglangStorage, kSglangEvent, kSglangDynamo };
+
 struct HashBlock {
     std::array<uint8_t, 32> digest{};
     ProjectedPrefix projected;
@@ -59,9 +62,11 @@ class HashStrategy {
 };
 
 // Resolves a supported source profile and derives its root digest. Returns an
-// empty string on success.
+// empty string on success. When provided, error_field identifies an invalid
+// configuration field and is cleared on success or non-field errors.
 std::string ResolveHashProfile(const common::HashProfileConfig& config,
-                               HashProfile* out);
+                               HashProfile* out,
+                               std::string* error_field = nullptr);
 
 // Returns an empty string when the resolved profile is supported, well formed,
 // and its root digest matches a fresh derivation from python_hash_seed.
@@ -69,8 +74,12 @@ std::string ValidateHashProfile(const HashProfile& profile);
 
 // Returns nullptr and sets error when the resolved profile shape is invalid or
 // unsupported. This consumes the derived root without hashing the seed again.
-std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
-                                                 std::string* error);
+// The default preserves native hashes. SGLang storage/event namespaces select
+// their producer's root/projection rules; they do not depend on cache layout.
+std::unique_ptr<HashStrategy> CreateHashStrategy(
+    const HashProfile& profile, std::string* error,
+    HashDomain domain = HashDomain::kRaw,
+    std::optional<std::string> extra_key = std::nullopt);
 
 std::string DigestToHex(const std::array<uint8_t, 32>& digest);
 

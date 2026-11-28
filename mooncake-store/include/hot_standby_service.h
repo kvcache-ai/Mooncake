@@ -12,13 +12,14 @@
 #include <thread>
 #include <vector>
 
+#include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
-#include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -47,13 +48,14 @@ struct HotStandbyConfig {
     // snapshot baseline before switching to steady-state replication.
     bool enable_snapshot_bootstrap{false};
 
-    // OpLog following phase (optional): when disabled, Start() stops after the
-    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
-    // state.
+    // When disabled, the standby starts empty without metadata replication.
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
+    uint32_t oplog_standby_max_batches_per_poll{
+        kDefaultOpLogStandbyMaxBatchesPerPoll};
     uint32_t batch_oplog_retry_timeout_sec{180};
+    uint32_t ha_redis_expected_replicas_per_shard{0};
 };
 
 /**
@@ -98,11 +100,14 @@ class HotStandbyService {
      * OpLog backend-based sync)
      * @param oplog_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
-     * @return ErrorCode::OK on success
+     * @param cancelled Optional shutdown predicate checked during bootstrap
+     * @return ErrorCode::OK on success, ETCD_CTX_CANCELLED if startup is
+     * stopped
      */
     ErrorCode Start(const std::string& primary_address,
                     const std::string& oplog_endpoints,
-                    const std::string& cluster_id);
+                    const std::string& cluster_id,
+                    std::function<bool()> cancelled = {});
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -131,6 +136,17 @@ class HotStandbyService {
      * @return ErrorCode::OK on success, other codes on failure
      */
     ErrorCode Promote();
+
+    // Remember the applied durable prefix across Stop()/Start(). Used when
+    // promotion fails before the metadata store is detached.
+    void MarkAppliedCursorForRestart();
+
+    // Reinstall a detached promotion handoff. The following Start() resumes
+    // from this cursor instead of reloading an older snapshot.
+    ErrorCode PreservePromotionBaseline(
+        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        DurablePrefix applied_cursor, ViewVersionId producer_view_version,
+        std::vector<StandbySegmentInfo> segments);
 
     /**
      * @brief Promote this standby to Primary and export a snapshot atomically.
@@ -195,9 +211,6 @@ class HotStandbyService {
         SnapshotLifecycleCallback callback);
     void SetBatchOpLogSnapshotStopCallback(SnapshotLifecycleCallback callback);
 
-    // Inject a snapshot provider (from external snapshot implementation).
-    void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
-
     // Inject the new batch-OpLog bootstrap path. It owns no running state;
     // Start() gives it temporary stores and installs them only on success.
     void SetBatchOpLogSnapshotProvider(
@@ -214,6 +227,10 @@ class HotStandbyService {
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
+
+    // Selects the durable OpLog backend opened by Start(). Defaults to etcd so
+    // existing callers keep the previous connection path.
+    void SetOpLogBackendType(ha::HABackendType type);
 
     /**
      * @brief Get current state from state machine
@@ -233,9 +250,13 @@ class HotStandbyService {
         kBoundedNoProgress,
     };
 
-    ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode PrepareBootstrapBaselineLocked(
+        uint64_t& baseline_seq_id, const std::function<bool()>& cancelled);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
-    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(
+        uint64_t& baseline_seq_id, const std::function<bool()>& cancelled);
+    bool WaitForRestoreCancellation(std::chrono::milliseconds delay,
+                                    const std::function<bool()>& cancelled);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
@@ -270,8 +291,6 @@ class HotStandbyService {
     HotStandbyConfig config_;
 
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
-    std::unique_ptr<SnapshotProvider> snapshot_provider_{
-        std::make_unique<NoopSnapshotProvider>()};
     std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components
@@ -280,12 +299,15 @@ class HotStandbyService {
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
     ViewVersionId batch_snapshot_producer_view_version_{0};
+    std::vector<StandbySegmentInfo> preserved_segments_;
+    bool preserve_promotion_baseline_{false};
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
     std::string cluster_id_;
+    ha::HABackendType oplog_backend_type_{ha::HABackendType::ETCD};
 
     // Replication state
     std::atomic<uint64_t> applied_seq_id_{0};
@@ -315,6 +337,12 @@ class HotStandbyService {
     std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
+    // Stop publishes cancellation without waiting for mutex_, which Start holds
+    // throughout bootstrap. A generation avoids resetting a concurrent Stop.
+    std::atomic<uint64_t> stop_generation_{0};
+    std::atomic<uint32_t> stops_in_progress_{0};
+    std::mutex restore_cancel_mutex_;
+    std::condition_variable restore_cancel_cv_;
     mutable std::mutex mutex_;
     mutable std::mutex sync_status_callback_mutex_;
     mutable std::mutex snapshot_lifecycle_callback_mutex_;

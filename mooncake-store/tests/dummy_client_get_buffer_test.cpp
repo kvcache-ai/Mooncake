@@ -22,7 +22,7 @@
 #include "common/network.h"
 #include "default_config.h"
 #include "dummy_client.h"
-#include "environ.h"
+#include "../src/config/client_object_checksum_config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -388,7 +388,7 @@ TEST_F(DummyClientGetBufferTest, GetBuffer_AllocatorFallback) {
 }
 
 TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
@@ -418,7 +418,7 @@ TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {
 }
 
 TEST_F(DummyClientGetBufferTest, BatchQueryPreservesObjectChecksum) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";

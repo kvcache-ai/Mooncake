@@ -9,6 +9,11 @@
 #include "mooncake_communicator.h"
 #include "control_plane/link_manager.h"
 #include "control_plane/rpc_runtime.h"
+#include "device_comm/device_collective/device_collective_feature.h"
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+#include "device_comm/device_collective/device_collective_workspace.h"
+#include "device_comm/device_transfer/transfer_service.h"
+#endif
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -35,6 +40,21 @@ PGResult<void> callAndCheck(RpcClient& client, const std::string& addr,
     return {};
 }
 
+// Runs on the installation executor with no access to AgentHost state.
+PGResult<DeviceTransferEndpoint> installTransferEndpoints(
+    DeviceTransferService* service, const InstallTransferEndpoints& effect) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    PG_VALIDATE_STATE(service, "device endpoint service is missing");
+    return service->installEndpoints(effect.snapshot,
+                                     effect.reclaim_before_version);
+#else
+    (void)service;
+    (void)effect;
+    return makePGError(PGErrorCode::NotSupported,
+                       "device endpoints require CUDA");
+#endif
+}
+
 }  // namespace
 
 void AgentRpcServiceImpl::onPeerJoined(PeerJoinedPush push) {
@@ -50,12 +70,22 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     host_.postViewUpdate(std::move(ctx), std::move(push));
 }
 
+void AgentRpcServiceImpl::onTransferEndpointUpdate(
+    coro_rpc::context<TransferEndpointUpdateAck> ctx,
+    TransferEndpointUpdatePush push) {
+    host_.postTransferEndpointUpdate(std::move(ctx), std::move(push));
+}
+
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
+                     DeviceTransferService* device_transfer_service,
+                     DeviceCollectiveWorkspace* device_collective_workspace,
                      LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
+      device_transfer_service_(device_transfer_service),
+      device_collective_workspace_(device_collective_workspace),
       link_manager_(link_manager),
       host_ip_(host_ip),
       rank_(rank),
@@ -94,7 +124,8 @@ PGResult<void> AgentHost::start() {
     rpc_impl_ = std::make_unique<AgentRpcServiceImpl>(*this);
     rpc_server_->registerHandler<&AgentRpcService::onPeerJoined,
                                  &AgentRpcService::onRankStateUpdate,
-                                 &AgentRpcService::onViewUpdate>(
+                                 &AgentRpcService::onViewUpdate,
+                                 &AgentRpcService::onTransferEndpointUpdate>(
         rpc_impl_.get());
     bool server_started = rpc_server_->start();
     if (!server_started) {
@@ -106,6 +137,7 @@ PGResult<void> AgentHost::start() {
                                std::to_string(rank_));
     }
 
+    transfer_endpoint_installer_.start();
     executor_.setTickCallback([this]() { tick(); });
     executor_.start();
 
@@ -116,10 +148,9 @@ void AgentHost::shutdown() {
     if (shutdown_requested_.exchange(true, std::memory_order_acq_rel)) return;
 
     link_manager_.setEventCallback(nullptr);
-    if (rpc_server_) rpc_server_->shutdown();
-    // Finish operations that callers already submitted, including explicit
-    // unregisterGroup calls, before releasing process-level rank ownership.
     executor_.shutdown();
+    transfer_endpoint_installer_.shutdown();
+    if (rpc_server_) rpc_server_->shutdown();
     link_manager_.stop();
     unregisterAgent();
     if (rpc_client_) {
@@ -251,18 +282,22 @@ PGResult<void> AgentHost::waitUntilRankActive(
 PGResult<GroupId> AgentHost::registerGroup(
     GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
     std::vector<GlobalRank> rank_order,
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend,
     GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
     MooncakeCommunicator* communicator) {
     return executor_.postAndWait(
         [this, group_bootstrap_id = std::move(group_bootstrap_id),
-         max_group_size, rank_order = std::move(rank_order), resolve_policy,
-         auto_deactivate, communicator]() mutable -> PGResult<GroupId> {
+         max_group_size, rank_order = std::move(rank_order),
+         preferred_gpu_collective_backend, resolve_policy, auto_deactivate,
+         communicator]() mutable -> PGResult<GroupId> {
             RegisterGroupRequest req;
             req.rank = rank_;
             req.agent_session_id = agent_.getAgentSessionId();
             req.group_bootstrap_id = std::move(group_bootstrap_id);
             req.max_group_size = max_group_size;
             req.rank_order = std::move(rank_order);
+            req.preferred_gpu_collective_backend =
+                preferred_gpu_collective_backend;
             req.resolve_policy = resolve_policy;
             req.auto_deactivate = auto_deactivate;
 
@@ -271,6 +306,10 @@ PGResult<GroupId> AgentHost::registerGroup(
                        coordinator_addr_, std::move(req)));
 
             if (!resp.success) {
+                if (resp.allow_local_fallback && !*resp.allow_local_fallback) {
+                    return makePGError(PGErrorCode::NotSupported,
+                                       resp.reject_reason);
+                }
                 // A rejected group must not affect the process-scoped Agent.
                 // Return an empty id so this communicator can remain
                 // group-scoped and execute local-only collectives.
@@ -464,6 +503,60 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     });
 }
 
+void AgentHost::postTransferEndpointUpdate(
+    coro_rpc::context<TransferEndpointUpdateAck> ctx,
+    TransferEndpointUpdatePush push) {
+    executor_.post([this, ctx = std::move(ctx),
+                    push = std::move(push)]() mutable {
+        uint64_t request_id = next_transfer_endpoint_request_id_++;
+        auto apply_result =
+            agent_.handleTransferEndpointUpdate(request_id, push);
+        if (apply_result.has_value()) {
+            pending_transfer_endpoint_resps_.emplace(request_id,
+                                                     std::move(ctx));
+            runEffects(std::move(apply_result).value());
+        } else {
+            LOG(ERROR) << apply_result.error().message;
+            TransferEndpointUpdateAck ack{.rank = rank_,
+                                          .rank_epoch = agent_.getRankEpoch(),
+                                          .version = push.snapshot.version,
+                                          .applied = false,
+                                          .updated_endpoint = std::nullopt};
+            ctx.response_msg(std::move(ack));
+        }
+    });
+}
+
+void AgentHost::enqueueTransferEndpointInstallation(
+    const InstallTransferEndpoints& effect,
+    coro_rpc::context<TransferEndpointUpdateAck> ctx) {
+    TransferEndpointUpdateAck ack{
+        .rank = rank_,
+        .rank_epoch = effect.snapshot.rank_epochs[rank_],
+        .version = effect.snapshot.version,
+        .applied = false,
+        .updated_endpoint = std::nullopt};
+    auto submitted = transfer_endpoint_installer_.post(
+        [service = device_transfer_service_, effect, ctx, ack]() mutable {
+            auto result = installTransferEndpoints(service, effect);
+            if (result.has_value()) {
+                ack.applied = true;
+                auto endpoint = std::move(result).value();
+                if (endpoint != *effect.snapshot.endpoints[ack.rank])
+                    ack.updated_endpoint = std::move(endpoint);
+            } else {
+                LOG(ERROR) << "Device endpoint installation failed: "
+                           << result.error().message;
+            }
+            ctx.response_msg(std::move(ack));
+        });
+    if (!submitted.has_value()) {
+        LOG(ERROR) << "Cannot submit device endpoint installation: "
+                   << submitted.error().message;
+        ctx.response_msg(std::move(ack));
+    }
+}
+
 void AgentHost::startAgentRegistration(bool start_new_session) {
     if (shutdown_requested_.load(std::memory_order_acquire)) return;
 
@@ -492,6 +585,16 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
     req.warmup_recv_addr = link_manager_.getWarmupRecvAddr();
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (device_transfer_service_) {
+        req.transfer_service_endpoint =
+            device_transfer_service_->localEndpoint();
+    }
+    if (device_collective_workspace_) {
+        req.collective_workspace_endpoint =
+            device_collective_workspace_->localEndpoint();
+    }
+#endif
     req.agent_session_id = agent_session_id_;
     const uint64_t request_session_id = req.agent_session_id;
 
@@ -622,6 +725,24 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
+                [this](const InstallTransferEndpoints& e) {
+                    auto it =
+                        pending_transfer_endpoint_resps_.find(e.request_id);
+                    if (it != pending_transfer_endpoint_resps_.end()) {
+                        auto ctx = std::move(it->second);
+                        pending_transfer_endpoint_resps_.erase(it);
+                        enqueueTransferEndpointInstallation(e, std::move(ctx));
+                    }
+                },
+                [this](const InstallDeviceCollectiveWorkspaceEndpoint& e) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+                    PG_ASSERT_OK(
+                        device_collective_workspace_->installPeerEndpoint(
+                            e.rank, e.endpoint));
+#else
+                    (void)e;
+#endif
+                },
                 [this](const EnablePeerProbe& e) {
                     link_manager_.enablePeerProbe(e.rank, e.rank_epoch,
                                                   e.te_server_name,
@@ -682,11 +803,18 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         }
                     }
                 },
-                [this](const ApplyViewToCommunicator& e) {
+                [this](const ApplyGroupStateToCommunicator& e) {
                     withCommunicator(e.view.group_id, [&](auto communicator) {
-                        communicator->applyViewUpdate(e.view, e.rank_states,
+                        communicator->applyGroupState(e.view, e.rank_states,
                                                       e.rank_epochs,
                                                       e.activatable);
+                    });
+                },
+                [this](const ApplyRankStateToCommunicator& e) {
+                    withCommunicator(e.group_id, [&](auto communicator) {
+                        communicator->applyRankStateUpdate(
+                            e.rank, e.in_group_rank, e.state, e.rank_epoch,
+                            e.activatable);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

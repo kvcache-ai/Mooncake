@@ -18,7 +18,9 @@ start_metadata_server() {
     local attempt
 
     echo "Starting standalone HTTP metadata server..."
-    mooncake_http_metadata_server --port 8080 &
+    # Loopback only: every client in this script is colocated, and the server
+    # refuses an unauthenticated non-loopback bind.
+    mooncake_http_metadata_server --host 127.0.0.1 --port 8080 &
     METADATA_SERVER_PID=$!
 
     for attempt in {1..50}; do
@@ -119,6 +121,7 @@ esac
 
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
+env -u MC_USE_TENT -u MC_USE_TEV1 MC_FORCE_TCP=true python test_session_refresh_cpu.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &
 TARGET_PID=$!
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_initiator_test.py
