@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 
 #include "types.h"  // ErrorCode
@@ -95,6 +97,40 @@ class NVMeoFInitiator {
     virtual int64_t PollCompletion(NofSegmentHandle* handle,
                                    uint32_t max_completions) = 0;
 
+    // Shared hold on the controller behind a segment.
+    //
+    // Every thread that submits to or polls a segment must hold this while
+    // it does so. An initiator that resets controllers takes the same lock
+    // exclusively, so a reset never runs while another thread is using any
+    // queue pair or cached namespace of that controller. The lock is only
+    // tried, never waited on: when a reset is queued or in progress the
+    // returned lock does not own the mutex and the caller should skip the
+    // segment for this round. Initiators without recovery never refuse.
+    virtual std::shared_lock<std::shared_mutex> TryLockSegmentIo(
+        const NofSegmentHandle* handle) {
+        (void)handle;
+        return std::shared_lock<std::shared_mutex>(never_reset_io_mutex_,
+                                                   std::try_to_lock);
+    }
+
+    // Whether the queue pair of a segment has entered a failed state, e.g.
+    // because the target went away.
+    virtual bool IsSegmentFailed(const NofSegmentHandle* handle) {
+        (void)handle;
+        return false;
+    }
+
+    // Try to bring a failed segment back, without blocking on the target.
+    //
+    // @pre Called from the thread that polls this handle, while holding
+    //      TryLockSegmentIo().
+    // Returns true when the segment is healthy. Otherwise recovery has been
+    // started (or is still running) and a later call retries.
+    virtual bool TryRecoverSegment(NofSegmentHandle* handle) {
+        (void)handle;
+        return true;
+    }
+
     // Closes #3131: register a user buffer with the initiator's DMA
     // translation table. No-op (OK) for initiators without one.
     //
@@ -135,6 +171,10 @@ class NVMeoFInitiator {
     virtual ErrorCode UnregisterMemory(void* ptr) = 0;
 
     virtual NofCapabilities GetCapabilities() const = 0;
+
+   private:
+    // Backs the default TryLockSegmentIo(); never taken exclusively.
+    std::shared_mutex never_reset_io_mutex_;
 };
 
 // Registration page granularity fixed by the RegisterMemory contract above.
