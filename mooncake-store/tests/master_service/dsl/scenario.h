@@ -611,6 +611,25 @@ struct BatchRemoveAction {
 
 BatchRemoveAction BatchRemove(std::initializer_list<std::string> keys);
 
+// MasterService::BatchUpdateSoftPin on `keys` with an eviction priority,
+// extend-only.
+struct SoftPinWithPriorityAction {
+    std::vector<std::string> keys;
+    uint64_t ttl_ms{0};
+    uint32_t priority{0};
+    std::string tenant{TenantId::Default().value()};
+    std::optional<ErrorCode> expected_error{};
+
+    SoftPinWithPriorityAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+SoftPinWithPriorityAction SoftPinWithPriority(std::vector<std::string> keys,
+                                              uint64_t ttl_ms,
+                                              uint32_t priority);
+
 struct RemoveAction {
     std::string key;
     std::string tenant{TenantId::Default().value()};
@@ -2184,6 +2203,7 @@ class MasterScenario {
     MasterScenario& When(BatchUpsertStartAction action);
     MasterScenario& When(BatchUpsertEndAction action);
     MasterScenario& When(BatchRemoveAction action);
+    MasterScenario& When(SoftPinWithPriorityAction action);
     MasterScenario& When(RemoveAction action);
     MasterScenario& When(ClearReplicasAction action);
     MasterScenario& When(CopyStartAction action);

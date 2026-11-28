@@ -161,6 +161,17 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
     }
 
+    uint32_t GetEvictionPriority(MasterService& service, const std::string& key,
+                                 const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        auto hold = MasterServiceTestPeer::ReadObject(
+            service,
+            MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+        return hold ? hold->metadata().eviction_priority : 0;
+    }
+
     std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
         MasterService& service, const TenantId& tenant_id,
         const std::string& group_id) {

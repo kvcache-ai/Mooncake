@@ -43,6 +43,9 @@ namespace mooncake {
 struct ResolvedSoftPinRequest {
     SoftPinAction action{SoftPinAction::PRESERVE};
     std::chrono::milliseconds ttl{0};
+    // ENABLE only: keep a committed deadline later than now + ttl instead of
+    // replacing it, so the pin only ever extends.
+    bool keep_later_deadline{false};
 };
 
 struct ObjectMetadata {
@@ -165,6 +168,9 @@ struct ObjectMetadata {
     // otherwise be distinguished from the current write.
     HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
     const bool hard_pinned{false};  // immutable, set at creation
+    // Set by BatchUpdateSoftPin. Read only while the soft pin is active: when
+    // soft pins must give memory, the lowest priority goes first.
+    uint32_t eviction_priority{0};
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
 
@@ -492,10 +498,16 @@ struct ObjectMetadata {
                         --metric_delta;
                     }
                 } else {
+                    const auto deadline =
+                        ComputeSoftPinDeadline(now, request.ttl);
+                    if (request.keep_later_deadline && soft_pin_timeout &&
+                        *soft_pin_timeout >= deadline) {
+                        break;
+                    }
                     if (!soft_pin_timeout) {
                         ++metric_delta;
                     }
-                    soft_pin_timeout = ComputeSoftPinDeadline(now, request.ttl);
+                    soft_pin_timeout = deadline;
                     deadline_to_index = soft_pin_timeout;
                     // Upserting the latest registration supersedes any
                     // expired or previously active deadline.

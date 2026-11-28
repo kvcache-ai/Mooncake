@@ -1045,6 +1045,38 @@ TEST_F(MasterAdminServerWithServiceTest, StandaloneSoftPinHttp) {
         400);
 }
 
+TEST_F(MasterAdminServerWithServiceTest, SoftPinHttpOptions) {
+    // An existing key is pinned now; a key not written yet is held.
+    auto pin =
+        HttpPostJson("/api/v1/soft_pin",
+                     std::string("{\"keys\":[\"") + kDefaultKey +
+                         "\",\"held-pin-key\"],\"ttl_ms\":60000,\"priority\":5,"
+                         "\"extend_only\":true,\"pending\":true}");
+    ASSERT_EQ(pin.http_status, 200);
+    EXPECT_NE(pin.body.find(std::string("\"key\":\"") + kDefaultKey +
+                            "\",\"error_code\":0,\"pending\":false"),
+              std::string::npos)
+        << pin.body;
+    EXPECT_NE(pin.body.find("\"key\":\"held-pin-key\",\"error_code\":0,"
+                            "\"pending\":true"),
+              std::string::npos)
+        << pin.body;
+
+    // The options need a positive ttl_ms and are not taken by soft_unpin.
+    EXPECT_EQ(HttpPostJson("/api/v1/soft_pin",
+                           "{\"keys\":[\"a\"],\"ttl_ms\":0,\"pending\":true}")
+                  .http_status,
+              400);
+    EXPECT_EQ(
+        HttpPostJson("/api/v1/soft_unpin", "{\"keys\":[\"a\"],\"priority\":1}")
+            .http_status,
+        400);
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin",
+                           std::string("{\"keys\":[\"") + kDefaultKey + "\"]}")
+                  .http_status,
+              200);
+}
+
 TEST_F(MasterAdminServerWithServiceTest,
        SoftPinRejectsTrailingContentWithoutChangingState) {
     const auto pin =

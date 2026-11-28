@@ -375,6 +375,31 @@ TEST_P(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
                   .AreReadable());
 }
 
+// Among soft-pinned objects, which give memory only to make up the minimum,
+// the lower priority goes first although it is the younger lease.
+TEST_P(MasterServiceEvictScenarioTest, SoftPinPriorityOrdersFallbackEviction) {
+    constexpr size_t kPerTier = 10;
+    const auto base = ExpiredBase();
+    std::vector<std::string> high, low;
+    for (size_t index = 0; index < kPerTier; ++index) {
+        high.push_back(Key(index));
+        low.push_back(Key(kPerTier + index));
+    }
+
+    MasterScenario scenario("soft pin priority order", EvictConfig(true));
+    scenario.Given(MemoryNode("memory"))
+        .Given(IndexedObjects(0, 2 * kPerTier)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(base))
+        .When(SoftPinWithPriority(high, 60 * 60 * 1000, 5))
+        .When(SoftPinWithPriority(low, 60 * 60 * 1000, 1))
+        .When(EvictMemory(0.50))
+        .Then(ReadableCount(IndexedObjects(0, 2 * kPerTier), kPerTier))
+        .Then(IndexedObjects(kPerTier, 2 * kPerTier).DoNotExist())
+        .Then(IndexedObjects(0, kPerTier).AreReadable());
+}
+
 TEST_P(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
     constexpr size_t kObjectCount = 10;
     constexpr size_t kGroupSize = 3;

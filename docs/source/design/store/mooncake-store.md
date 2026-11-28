@@ -417,6 +417,42 @@ uses the existing runtime-only soft-pin behavior: it changes eviction priority,
 does not create session membership, and does not prevent explicit removal.
 Both the client and master must support `BatchUpdateSoftPin`.
 
+### Updating soft pins over HTTP
+
+The master's admin server takes the same update as JSON. `POST
+/api/v1/soft_pin` pins 1 to 4096 keys of one tenant for `ttl_ms`, and `POST
+/api/v1/soft_unpin` clears them:
+
+```bash
+curl -X POST http://<master>:9003/api/v1/soft_pin \
+  -d '{"tenant_id": "default", "keys": ["k1", "k2"], "ttl_ms": 120000}'
+```
+
+The response holds one `{"key", "error_code", "pending"}` entry per key, in
+request order.
+
+A controller that knows which objects will be read again, such as an inference
+router that keeps an agent session's KV cache while the session waits on a tool
+call, can add three optional fields to `soft_pin`. Each needs a positive
+`ttl_ms`.
+
+- `priority` (default 0): the object's eviction priority while the pin is
+  active. When soft-pinned objects must give memory
+  (`allow_evict_soft_pinned_objects`), the lowest priority goes first; a group
+  goes at the priority of its highest member.
+- `extend_only` (default `false`): never shorten an active pin. A later
+  deadline and a higher priority already on the object are kept.
+- `pending` (default `false`): hold the pin for a key that is missing or still
+  being written instead of returning an error, and apply it, extend-only, when
+  the key's write completes. A held pin runs out at its deadline. The master
+  holds up to 2^18 such pins and drops the oldest past that. Held pins are
+  runtime-only, like soft pins.
+
+`/metrics` counts pins sent with `pending`: `master_pin_applied_at_once_total`,
+`master_pin_left_pending_total`, `master_pin_pending_applied_on_write_total`,
+`master_pin_pending_expired_total`, `master_pin_pending_dropped_full_total`, and
+the gauge `master_pin_pending_keys`.
+
 ## Hard Pin
 
 The Master skips hard-pinned objects during capacity-driven memory eviction.

@@ -182,6 +182,19 @@ class WrappedMasterService {
         const std::vector<std::string>& keys, uint64_t ttl_ms,
         const std::string& tenant_id = "default");
 
+    // See MasterService::PinMetricsText.
+    std::string PinMetricsText() const {
+        return master_service_.PinMetricsText();
+    }
+
+    // BatchUpdateSoftPin with MasterService::SoftPinOptions; served over HTTP
+    // (/api/v1/soft_pin), not registered as an RPC.
+    std::vector<tl::expected<MasterService::SoftPinOutcome, ErrorCode>>
+    BatchUpdateSoftPinWithOptions(const std::vector<std::string>& keys,
+                                  uint64_t ttl_ms,
+                                  const MasterService::SoftPinOptions& options,
+                                  const std::string& tenant_id = "default");
+
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
