@@ -48,6 +48,13 @@ void* allocate_buffer_allocator_memory(
 void free_memory(const std::string& protocol, void* ptr,
                  DmaBufferAllocator* dma_allocator = nullptr);
 
+// Sized release for allocator-owned Store segments, after all users and memory
+// registrations have been removed. MC_STORE_FREE_THREADS=2..64 optionally
+// discards pages in parallel before free(); zero/unset preserves plain free().
+// Never pass a size larger than the original allocation.
+void free_memory(const std::string& protocol, void* ptr,
+                 DmaBufferAllocator* dma_allocator, size_t total_size);
+
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
         return size;

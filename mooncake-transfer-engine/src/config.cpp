@@ -789,6 +789,22 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* host_reg_threads =
+            std::getenv("MC_RDMA_HOST_REG_THREADS")) {
+        const auto value = TryParseInteger<size_t>(host_reg_threads);
+        if (value && *value <= 64) {
+            config.host_reg_threads = *value;
+        } else {
+            LOG(WARNING) << "Invalid MC_RDMA_HOST_REG_THREADS value: "
+                         << host_reg_threads << ", expected 0..64";
+        }
+    }
+
+    if (const char* affinity = std::getenv("MC_HOST_MEM_NUMA_AFFINITY")) {
+        parseBoolConfigEnv(affinity, "MC_HOST_MEM_NUMA_AFFINITY",
+                           config.host_mem_numa_affinity);
+    }
+
     const char* max_concurrent_reg_mr = std::getenv("MC_MAX_CONCURRENT_REG_MR");
     if (max_concurrent_reg_mr) {
         // Robust parse (not atol): a non-numeric typo must keep the default
@@ -1049,6 +1065,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
     LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
     LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
+    LOG(INFO) << "host_reg_threads = " << config.host_reg_threads;
+    LOG(INFO) << "host_mem_numa_affinity = " << config.host_mem_numa_affinity;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");

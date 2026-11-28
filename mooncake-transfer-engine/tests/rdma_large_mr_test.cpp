@@ -38,6 +38,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <atomic>
+#include <condition_variable>
+#include <dlfcn.h>
+#include <future>
+#include <mutex>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -46,10 +51,38 @@
 #include "cuda_alike.h"
 #endif
 #include "config.h"
+#include "rdma_test_peers.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+namespace {
+std::atomic<void *> held_dereg_address{nullptr};
+std::mutex held_dereg_mutex;
+std::condition_variable held_dereg_cv;
+bool held_dereg_entered = false;
+bool held_dereg_release = false;
+}  // namespace
+
+// Test-only interposition: hold one genuine MR inside the driver call, then
+// fail it without destroying it. All other deregistrations use real verbs.
+extern "C" int ibv_dereg_mr(ibv_mr *mr) {
+    void *held = held_dereg_address.load();
+    if (held && mr->addr == held) {
+        std::unique_lock<std::mutex> lock(held_dereg_mutex);
+        held_dereg_entered = true;
+        held_dereg_cv.notify_all();
+        held_dereg_cv.wait(lock, [] { return held_dereg_release; });
+        errno = EBUSY;
+        return EBUSY;
+    }
+    using Deregister = int (*)(ibv_mr *);
+    static const auto original =
+        reinterpret_cast<Deregister>(dlsym(RTLD_NEXT, "ibv_dereg_mr"));
+    if (!original) std::abort();
+    return original(mr);
+}
 
 namespace mooncake {
 
@@ -58,6 +91,16 @@ namespace mooncake {
 // env).
 static constexpr size_t kMaxMrSize = 64ull << 20;    // 64 MiB
 static constexpr size_t kBufferSize = 256ull << 20;  // 256 MiB -> 4 chunks
+
+static void releaseCompletedBatch(TransferEngine &engine,
+                                  Transport::BatchID batch) {
+    const Status result = engine.freeBatchID(batch);
+    // Current engine APIs may retire a completed batch asynchronously while
+    // completion callbacks unwind. Never retry this invalidated handle; each
+    // fixture keeps its allocation alive until engine shutdown drains cleanup.
+    EXPECT_TRUE(result.ok() || result.IsBatchCleanupDeferred())
+        << result.ToString();
+}
 
 class RDMALargeMrTest : public ::testing::Test {
    public:
@@ -69,7 +112,7 @@ class RDMALargeMrTest : public ::testing::Test {
         engine = std::make_unique<TransferEngine>(true);
         const char *env_meta = std::getenv("MC_METADATA_SERVER");
         std::string metadata_server = env_meta ? env_meta : "P2PHANDSHAKE";
-        ASSERT_EQ(engine->init(metadata_server, "test_node_large_mr"), 0);
+        ASSERT_EQ(engine->init(metadata_server, "127.0.0.1"), 0);
         ASSERT_EQ(globalConfig().max_mr_size, kMaxMrSize)
             << "Launch this test process with MC_MAX_MR_SIZE=" << kMaxMrSize;
         addr = numa_alloc_onnode(kBufferSize, 0);
@@ -82,6 +125,7 @@ class RDMALargeMrTest : public ::testing::Test {
 
     void TearDown() override {
         if (engine && addr) engine->unregisterLocalMemory(addr);
+        engine.reset();
         if (addr) numa_free(addr, kBufferSize);
     }
 };
@@ -119,7 +163,7 @@ TEST_F(RDMALargeMrTest, WritePastMaxMrSizeBoundary) {
         else if (status.s == TransferStatusEnum::FAILED)
             break;
     }
-    ASSERT_EQ(engine->freeBatchID(batch_id), Status::OK());
+    releaseCompletedBatch(*engine, batch_id);
 
     // The regression assertion: pre-fix this is FAILED (remote access error);
     // post-fix it COMPLETES and the bytes match.
@@ -171,7 +215,7 @@ TEST_F(RDMALargeMrTest, WriteStraddlesChunkBoundary) {
         else if (status.s == TransferStatusEnum::FAILED)
             break;
     }
-    ASSERT_EQ(engine->freeBatchID(batch_id), Status::OK());
+    releaseCompletedBatch(*engine, batch_id);
 
     ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED)
         << "RDMA WRITE straddling a chunk boundary failed -- a cross-chunk "
@@ -206,10 +250,207 @@ TEST_F(RDMALargeMrTest, WriteWithSourceStraddlingChunkBoundary) {
         ASSERT_EQ(engine->getTransferStatus(batch_id, 0, status), Status::OK());
         if (status.s != TransferStatusEnum::WAITING) break;
     }
-    ASSERT_EQ(engine->freeBatchID(batch_id), Status::OK());
+    releaseCompletedBatch(*engine, batch_id);
     ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
     ASSERT_EQ(0, memcmp((char *)addr + kSourceOffset,
                         (char *)addr + kTargetOffset, kDataLength));
+}
+
+class RDMAParallelHostMrTest : public ::testing::Test {
+   protected:
+    static constexpr size_t size = (1ull << 30) + 4096;
+    void *addr = nullptr;
+    std::unique_ptr<TransferEngine> engine;
+    size_t old_workers = 0;
+    uint64_t old_limit = 0;
+
+    void SetUp() override {
+        engine = std::make_unique<TransferEngine>(true);
+        ASSERT_EQ(engine->init("P2PHANDSHAKE", "127.0.0.1"), 0);
+        old_workers = globalConfig().host_reg_threads;
+        old_limit = globalConfig().max_mr_size;
+        globalConfig().host_reg_threads = 4;
+        // Exercise software splitting with an uneven final chunk, independent
+        // of the device limit and the small MC_MAX_MR_SIZE used by other tests.
+        globalConfig().max_mr_size = 2ull << 30;
+        addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(addr, MAP_FAILED);
+    }
+
+    void TearDown() override {
+        engine.reset();
+        if (addr && addr != MAP_FAILED) munmap(addr, size);
+        globalConfig().host_reg_threads = old_workers;
+        globalConfig().max_mr_size = old_limit;
+    }
+
+    void expectNoRegions() {
+        auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        ASSERT_NE(desc, nullptr);
+        EXPECT_TRUE(desc->buffers.empty());
+        auto *rdma =
+            dynamic_cast<RdmaTransport *>(engine->getTransport("rdma"));
+        ASSERT_NE(rdma, nullptr);
+        for (const auto &context : rdma->getContextList())
+            EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(*context), 0u);
+    }
+
+    void transfer(size_t source_offset, size_t target_offset, bool read) {
+        constexpr size_t bytes = 65539;
+        auto *source = static_cast<uint8_t *>(addr) + source_offset;
+        auto *target = static_cast<uint8_t *>(addr) + target_offset;
+        for (size_t i = 0; i < bytes; ++i)
+            (read ? target : source)[i] = static_cast<uint8_t>(i * 17 + 3);
+        memset(read ? source : target, 0, bytes);
+        auto batch = engine->allocateBatchID(1);
+        TransferRequest request;
+        request.opcode = read ? TransferRequest::READ : TransferRequest::WRITE;
+        request.source = source;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target);
+        request.length = bytes;
+        ASSERT_TRUE(engine->submitTransfer(batch, {request}).ok());
+        TransferStatus status;
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        do {
+            ASSERT_TRUE(engine->getTransferStatus(batch, 0, status).ok());
+        } while (status.s == TransferStatusEnum::WAITING &&
+                 std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        releaseCompletedBatch(*engine, batch);
+        EXPECT_EQ(memcmp(source, target, bytes), 0);
+    }
+
+    void checkTransfers(size_t expected_chunks, size_t length = size) {
+        auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        ASSERT_NE(desc, nullptr);
+        ASSERT_EQ(desc->buffers.size(), expected_chunks);
+        for (size_t i = 1; i < desc->buffers.size(); ++i) {
+            size_t seam =
+                desc->buffers[i].addr - reinterpret_cast<uint64_t>(addr);
+            transfer(0, seam - 32767, false);
+            transfer(0, seam - 32767, true);
+            transfer(seam - 32767, 1ull << 20, false);
+        }
+        transfer(0, length - 65539, false);
+    }
+};
+
+TEST_F(RDMAParallelHostMrTest, SixtyFourWorkersUseFourChunksForOneGiB) {
+    constexpr size_t length = 1ull << 30;
+    globalConfig().host_reg_threads = 64;
+    ASSERT_EQ(engine->registerLocalMemory(addr, length, "cpu:0"), 0);
+    ASSERT_NO_FATAL_FAILURE(checkTransfers(4u, length));
+    auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    for (const auto &buffer : desc->buffers)
+        EXPECT_EQ(buffer.length, length / 4);
+    ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
+    expectNoRegions();
+}
+
+TEST_F(RDMAParallelHostMrTest, MoreChunksThanWorkersRollbackAndRetry) {
+    // Eleven chunks on four workers: cover uneven worker partitions and the
+    // final partial chunk, including failures beyond the first worker wave.
+    globalConfig().max_mr_size = 96ull << 20;
+    auto *last_page = static_cast<char *>(addr) + size - 4096;
+    ASSERT_EQ(mprotect(last_page, 4096, PROT_NONE), 0);
+    EXPECT_NE(engine->registerLocalMemory(addr, size, "cpu:0"), 0);
+    expectNoRegions();
+    ASSERT_EQ(mprotect(last_page, 4096, PROT_READ | PROT_WRITE), 0);
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        ASSERT_EQ(engine->registerLocalMemory(addr, size, "cpu:0"), 0);
+        ASSERT_NO_FATAL_FAILURE(checkTransfers(11u));
+        if (cycle == 0) {
+            {
+                std::lock_guard<std::mutex> lock(held_dereg_mutex);
+                held_dereg_entered = false;
+                held_dereg_release = true;
+            }
+            auto desc =
+                engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            held_dereg_address =
+                reinterpret_cast<void *>(desc->buffers.back().addr);
+            const int rc = engine->unregisterLocalMemory(addr);
+            held_dereg_address = nullptr;
+            EXPECT_NE(rc, 0);
+        }
+        ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
+        expectNoRegions();
+    }
+}
+
+TEST_F(RDMAParallelHostMrTest,
+       DeregistrationUnlocksOtherRegionsAndRestoresOnFailure) {
+    auto *rdma = dynamic_cast<RdmaTransport *>(engine->getTransport("rdma"));
+    ASSERT_NE(rdma, nullptr);
+    ASSERT_FALSE(rdma->getContextList().empty());
+    auto &context = *rdma->getContextList().front();
+    void *other = static_cast<char *>(addr) + 4096;
+    ASSERT_EQ(context.registerMemoryRegion(addr, 4096, IBV_ACCESS_LOCAL_WRITE),
+              0);
+    ASSERT_EQ(context.registerMemoryRegion(other, 4096, IBV_ACCESS_LOCAL_WRITE),
+              0);
+    const uint32_t key = context.lkey(addr);
+    const uint32_t remote_key = context.rkey(addr);
+    const uint32_t other_key = context.lkey(other);
+    {
+        std::lock_guard<std::mutex> lock(held_dereg_mutex);
+        held_dereg_entered = false;
+        held_dereg_release = false;
+    }
+    held_dereg_address = addr;
+    auto blocked = std::async(std::launch::async, [&] {
+        return context.unregisterMemoryRegion(addr);
+    });
+    {
+        std::unique_lock<std::mutex> lock(held_dereg_mutex);
+        EXPECT_TRUE(held_dereg_cv.wait_for(lock, std::chrono::seconds(5),
+                                           [] { return held_dereg_entered; }));
+    }
+    auto independent = std::async(std::launch::async, [&] {
+        EXPECT_EQ(context.lkey(addr), 0u);
+        EXPECT_EQ(context.rkey(addr), 0u);
+        EXPECT_EQ(
+            context.registerMemoryRegion(addr, 4096, IBV_ACCESS_LOCAL_WRITE),
+            ERR_ADDRESS_OVERLAPPED);
+        EXPECT_NE(context.unregisterMemoryRegion(addr), 0);
+        const uint32_t observed = context.lkey(other);
+        const int rc = context.unregisterMemoryRegion(other);
+        return std::pair{observed, rc};
+    });
+    EXPECT_EQ(independent.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    {
+        std::lock_guard<std::mutex> lock(held_dereg_mutex);
+        held_dereg_release = true;
+    }
+    held_dereg_cv.notify_all();
+    EXPECT_NE(blocked.get(), 0);
+    held_dereg_address = nullptr;
+    auto [observed, rc] = independent.get();
+    EXPECT_EQ(observed, other_key);
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(context.lkey(addr), key);
+    EXPECT_EQ(context.rkey(addr), remote_key);
+    EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(context), 1u);
+    EXPECT_EQ(context.unregisterMemoryRegion(addr), 0);
+    EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(context), 0u);
+    ASSERT_EQ(context.registerMemoryRegion(addr, 4096, IBV_ACCESS_LOCAL_WRITE),
+              0);
+    EXPECT_EQ(context.unregisterMemoryRegion(addr), 0);
+}
+
+TEST_F(RDMAParallelHostMrTest, ReleasesDataDirectPlaceholderWithoutVerbs) {
+    auto *rdma = dynamic_cast<RdmaTransport *>(engine->getTransport("rdma"));
+    ASSERT_NE(rdma, nullptr);
+    ASSERT_FALSE(rdma->getContextList().empty());
+    auto &context = *rdma->getContextList().front();
+    RdmaContextTestPeer::seedMemoryRegion(context, addr, 4096, nullptr);
+    ASSERT_EQ(context.unregisterMemoryRegion(addr), 0);
+    EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(context), 0u);
 }
 
 #if defined(USE_CUDA) || defined(USE_HIP)
@@ -235,8 +476,7 @@ class RDMAGpuDmabufChunkTest : public ::testing::TestWithParam<size_t> {
         engine = std::make_unique<TransferEngine>(true);
         const char *env_meta = std::getenv("MC_METADATA_SERVER");
         std::string metadata_server = env_meta ? env_meta : "P2PHANDSHAKE";
-        ASSERT_EQ(engine->init(metadata_server, "test_node_gpu_dmabuf_chunk"),
-                  0);
+        ASSERT_EQ(engine->init(metadata_server, "127.0.0.1"), 0);
         ASSERT_EQ(globalConfig().max_mr_size, kMaxMrSize)
             << "Launch this test process with MC_MAX_MR_SIZE=" << kMaxMrSize;
 
@@ -250,6 +490,7 @@ class RDMAGpuDmabufChunkTest : public ::testing::TestWithParam<size_t> {
 
     void TearDown() override {
         if (engine && gpu_addr) engine->unregisterLocalMemory(gpu_addr);
+        engine.reset();
         if (gpu_allocation) cudaFree(gpu_allocation);
     }
 };
@@ -287,7 +528,7 @@ TEST_P(RDMAGpuDmabufChunkTest, LaterChunkUsesItsOwnDmabufOffset) {
         ASSERT_EQ(engine->getTransferStatus(batch_id, 0, status), Status::OK());
         if (status.s != TransferStatusEnum::WAITING) break;
     }
-    ASSERT_EQ(engine->freeBatchID(batch_id), Status::OK());
+    releaseCompletedBatch(*engine, batch_id);
     ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
 
     ASSERT_EQ(cudaMemcpy(result.data(), (char *)gpu_addr + kTargetOffset,
@@ -306,6 +547,29 @@ TEST_P(RDMAGpuDmabufChunkTest, RegistersInteriorGpuBuffers) {
             << "offset=" << offset;
         EXPECT_EQ(engine->unregisterLocalMemory(ptr), 0);
     }
+}
+
+TEST_P(RDMAGpuDmabufChunkTest, HostWorkersDoNotSplitDeviceMemory) {
+    ASSERT_EQ(engine->unregisterLocalMemory(gpu_addr), 0);
+    ASSERT_EQ(cudaFree(gpu_allocation), cudaSuccess);
+    gpu_allocation = nullptr;
+    gpu_addr = nullptr;
+    constexpr size_t bytes = 1ull << 30;
+    ASSERT_EQ(cudaMalloc(&gpu_allocation, bytes + GetParam()), cudaSuccess);
+    gpu_addr = static_cast<char *>(gpu_allocation) + GetParam();
+    auto &config = globalConfig();
+    const auto old_workers = config.host_reg_threads;
+    const auto old_limit = config.max_mr_size;
+    config.host_reg_threads = 16;
+    config.max_mr_size = 2ull << 30;
+    int rc = engine->registerLocalMemory(gpu_addr, bytes, GPU_PREFIX + "0");
+    config.host_reg_threads = old_workers;
+    config.max_mr_size = old_limit;
+    ASSERT_EQ(rc, 0);
+    auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers.front().length, bytes);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllocationOffsets, RDMAGpuDmabufChunkTest,

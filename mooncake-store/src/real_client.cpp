@@ -2351,7 +2351,7 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
 void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
     if (record.base && ReleasePinnedRegionForFree(record.pinned_region,
                                                   "allocated Store segment")) {
-        free_memory(record.protocol, record.base);
+        free_memory(record.protocol, record.base, nullptr, record.size);
     }
 }
 
@@ -2507,7 +2507,7 @@ int RealClient::allocateAndMountSegment(
             LOG(ERROR) << "MountSegmentAndGetId failed";
             if (ReleasePinnedRegionForFree(pinned_region,
                                            "allocated Store segment")) {
-                free_memory(protocol, ptr);
+                free_memory(protocol, ptr, nullptr, chunk_size);
             }
             break;
         }

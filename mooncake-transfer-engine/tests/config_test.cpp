@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "config.h"
+#include "host_memory_affinity.h"
 #include "transport/batch_registration.h"
 #include "transport/rdma_transport/rdma_context.h"
 
@@ -65,6 +66,91 @@ TEST_F(IbTimeoutEnvTest, RejectsInvalidValuesWithoutChangingConfig) {
         loadGlobalConfig(config);
         EXPECT_EQ(config.ib_timeout, 20);
     }
+}
+
+class HostRegThreadsEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override {
+        ::unsetenv("MC_RDMA_HOST_REG_THREADS");
+        ::unsetenv("MC_HOST_MEM_NUMA_AFFINITY");
+    }
+};
+
+TEST_F(HostRegThreadsEnvTest, DisabledByDefault) {
+    ::unsetenv("MC_RDMA_HOST_REG_THREADS");
+    ::unsetenv("MC_HOST_MEM_NUMA_AFFINITY");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.host_reg_threads, 0u);
+    EXPECT_FALSE(config.host_mem_numa_affinity);
+}
+
+TEST_F(HostRegThreadsEnvTest, AcceptsBoundariesAndWorkerCount) {
+    for (size_t count : {0u, 1u, 16u, 64u}) {
+        ASSERT_EQ(::setenv("MC_RDMA_HOST_REG_THREADS",
+                           std::to_string(count).c_str(), 1),
+                  0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.host_reg_threads, count);
+    }
+}
+
+TEST_F(HostRegThreadsEnvTest, InvalidInputPreservesConfiguration) {
+    for (const char* value : {"-1", "65", "16junk"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_RDMA_HOST_REG_THREADS", value, 1), 0);
+        GlobalConfig config;
+        config.host_reg_threads = 8;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.host_reg_threads, 8u);
+    }
+}
+
+TEST_F(HostRegThreadsEnvTest, NumaAffinityIsExplicitAndStrict) {
+    GlobalConfig config;
+    ASSERT_EQ(::setenv("MC_HOST_MEM_NUMA_AFFINITY", "1", 1), 0);
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.host_mem_numa_affinity);
+    ASSERT_EQ(::setenv("MC_HOST_MEM_NUMA_AFFINITY", "invalid", 1), 0);
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.host_mem_numa_affinity);
+}
+
+TEST(HostMemoryAffinityTest, DisabledPlanDoesNotChangeCaller) {
+    cpu_set_t before, after;
+    ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+    HostMemoryAffinityPlan disabled(false);
+    EXPECT_EQ(disabled.cpuForPartition(0, 32), -1);
+    {
+        ScopedHostMemoryAffinity guard(disabled.cpuForPartition(0, 32));
+    }
+    ASSERT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
+    EXPECT_TRUE(CPU_EQUAL(&before, &after));
+}
+
+TEST(HostMemoryAffinityTest, RespectsRestrictedCpuSetAndRestoresOnException) {
+    cpu_set_t before, during, after;
+    ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+    HostMemoryAffinityPlan plan(true);
+    int cpu = plan.cpuForPartition(0, 1);
+    if (cpu < 0) GTEST_SKIP() << "NUMA/cpuset queries unavailable";
+    EXPECT_TRUE(CPU_ISSET(cpu, &before));
+    try {
+        ScopedHostMemoryAffinity guard(cpu);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(during), &during), 0);
+        ASSERT_EQ(CPU_COUNT(&during), 1);
+        EXPECT_TRUE(CPU_ISSET(cpu, &during));
+        HostMemoryAffinityPlan restricted(true);
+        for (size_t i = 0; i < 64; ++i)
+            EXPECT_EQ(restricted.cpuForPartition(i, 64), cpu);
+        EXPECT_EQ(restricted.cpuForPartition(0, 0), -1);
+        EXPECT_EQ(restricted.cpuForPartition(64, 64), -1);
+        throw std::runtime_error("exercise affinity restoration");
+    } catch (const std::runtime_error&) {
+    }
+    ASSERT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
+    EXPECT_TRUE(CPU_EQUAL(&before, &after));
 }
 
 TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {

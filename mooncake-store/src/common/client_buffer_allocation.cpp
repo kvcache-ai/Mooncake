@@ -1,10 +1,16 @@
 #include "common/client_buffer_allocation.h"
 
+#include "client_buffer_allocation_internal.h"
 #include "config.h"
 #include "config/hugepage_config.h"
+#include "host_memory_affinity.h"
+#include "integer_parser.h"
 #include "ub_allocator.h"
 
 #include <cstdlib>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
 #include <glog/logging.h>
 
 #ifdef USE_CUDA
@@ -26,6 +32,55 @@
 
 namespace mooncake {
 namespace {
+
+// Only called for ordinary allocator-owned host memory whose RDMA and optional
+// pinned registrations have already been released. Keep partial edge pages
+// intact: they may also contain allocator bookkeeping or another allocation.
+void discard_owned_pages(void *ptr, size_t total_size) {
+    const char *setting = std::getenv("MC_STORE_FREE_THREADS");
+    if (!setting) return;
+    const auto threads = TryParseInteger<size_t>(setting);
+    if (!threads || *threads > 64) {
+        LOG(WARNING) << "Invalid MC_STORE_FREE_THREADS value: " << setting
+                     << ", expected 0..64";
+        return;
+    }
+    if (*threads < 2) return;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+    const size_t page = static_cast<size_t>(page_size);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+    const size_t skip = (page - base % page) % page;
+    if (total_size <= skip) return;
+    const size_t pages = (total_size - skip) / page;
+    const size_t count = std::min(*threads, pages);
+    if (count < 2) return;
+    const size_t per_worker = pages / count + (pages % count != 0);
+    const HostMemoryAffinityPlan affinity(
+        globalConfig().host_mem_numa_affinity);
+    auto discard = [&](size_t offset) {
+        size_t length = std::min(per_worker, pages - offset) * page;
+        ScopedHostMemoryAffinity bound(affinity.cpuForPartition(
+            offset / per_worker, count,
+            static_cast<char *>(ptr) + skip + offset * page + length / 2));
+        if (madvise(static_cast<char *>(ptr) + skip + offset * page, length,
+                    MADV_DONTNEED) != 0) {
+            PLOG(WARNING) << "Parallel Store page discard failed";
+        }
+    };
+    std::vector<std::jthread> workers;
+    workers.reserve(count - 1);
+    for (size_t offset = per_worker; offset < pages; offset += per_worker) {
+        try {
+            workers.emplace_back(discard, offset);
+        } catch (const std::system_error &error) {
+            LOG(WARNING) << "Store page discard worker unavailable: "
+                         << error.what();
+            discard(offset);
+        }
+    }
+    discard(0);
+}
 
 #ifdef USE_VRAM_SEGMENT
 tl::expected<void *, std::string> allocate_vram_memory(
@@ -143,6 +198,17 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 
 void free_memory(const std::string &protocol, void *ptr,
                  DmaBufferAllocator *dma_allocator) {
+    free_memory(protocol, ptr, dma_allocator, 0);
+}
+
+void free_memory(const std::string &protocol, void *ptr,
+                 DmaBufferAllocator *dma_allocator, size_t total_size) {
+    detail::free_memory(protocol, ptr, dma_allocator, total_size, 16ull << 30);
+}
+
+void detail::free_memory(const std::string &protocol, void *ptr,
+                         DmaBufferAllocator *dma_allocator, size_t total_size,
+                         size_t min_discard_size) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
@@ -179,6 +245,8 @@ void free_memory(const std::string &protocol, void *ptr,
 #endif
     return;
 #endif
+    if (ptr && total_size >= min_discard_size)
+        discard_owned_pages(ptr, total_size);
     free(ptr);
 }
 

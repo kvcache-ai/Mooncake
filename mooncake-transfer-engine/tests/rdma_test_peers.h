@@ -95,6 +95,11 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static size_t memoryRegionCount(RdmaContext &context) {
+        RWSpinlock::ReadGuard guard(context.memory_regions_lock_);
+        return context.memory_region_map_.size();
+    }
+
     static void setTransferWorkerCount(RdmaContext &context, int count) {
         context.transfer_worker_count_ = count;
     }

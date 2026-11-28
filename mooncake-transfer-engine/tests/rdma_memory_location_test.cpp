@@ -2,17 +2,19 @@
 #include <numa.h>
 #include <sys/mman.h>
 
+#include <atomic>
 #include <cerrno>
 #include <memory>
+#include <utility>
 
 #include "config.h"
 #include "memory_location.h"
 #include "rdma_test_peers.h"
 
 namespace {
-int registered_regions = 0;
+std::atomic<int> registered_regions{0};
 int location_queries = 0;
-int registration_calls = 0;
+std::atomic<int> registration_calls{0};
 int fail_registration = 0;
 ibv_pd test_pd{};
 }  // namespace
@@ -142,6 +144,26 @@ TEST_F(RdmaMemoryLocationTest, LaterRegistrationFailureStillRollsBack) {
     EXPECT_TRUE(
         metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
     EXPECT_EQ(registered_regions, 0);
+}
+
+TEST_F(RdmaMemoryLocationTest, BatchWorkersNeitherSplitNorPretouchHostBuffers) {
+    constexpr size_t length = 4ull << 30;
+    void *large = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT_NE(large, MAP_FAILED);
+    globalConfig().max_mr_size = length;
+    globalConfig().parallel_reg_mr = 1;
+    const auto workers = std::exchange(globalConfig().host_reg_threads, 64);
+    const auto peermem =
+        std::exchange(globalConfig().with_nvidia_peermem, true);
+    const int ret = transport_->registerLocalMemoryBatch(
+        {{large, length}, {buffer_, pagesize}}, "cpu:0");
+    globalConfig().with_nvidia_peermem = peermem;
+    globalConfig().host_reg_threads = workers;
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(registration_calls.load(), 2);
+    EXPECT_EQ(transport_->unregisterLocalMemoryBatch({large, buffer_}), 0);
+    EXPECT_EQ(munmap(large, length), 0);
 }
 
 }  // namespace

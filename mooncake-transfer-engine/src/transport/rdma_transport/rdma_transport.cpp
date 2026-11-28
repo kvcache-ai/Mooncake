@@ -40,6 +40,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "host_memory_affinity.h"
 #include "cuda_alike.h"
 #include "hip_device_guard.h"
 #include "memory_location.h"
@@ -73,6 +74,34 @@ bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
+
+template <typename Function>
+static void forEachChunk(size_t chunks, size_t concurrency,
+                         Function operation) {
+    std::atomic_size_t next{0};
+    auto run = [&] {
+        // Start work throughout the buffer, even when an MR size limit makes
+        // it contain more chunks than workers. Contiguous partitions keep
+        // all NUMA nodes active instead of faulting one node's chunks first.
+        for (size_t partition = next.fetch_add(1); partition < concurrency;
+             partition = next.fetch_add(1)) {
+            const size_t begin = chunks * partition / concurrency;
+            const size_t end = chunks * (partition + 1) / concurrency;
+            for (size_t i = begin; i < end; ++i) operation(i, partition);
+        }
+    };
+    std::vector<std::jthread> workers;
+    workers.reserve(concurrency - 1);
+    for (size_t i = 1; i < concurrency; ++i) {
+        try {
+            workers.emplace_back(run);
+        } catch (const std::system_error &error) {
+            LOG(WARNING) << "Fewer host MR workers: " << error.what();
+            break;
+        }
+    }
+    run();
+}
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -700,6 +729,14 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     const bool hugetlb_backed =
         dmabuf_exp.method == DmabufExport::Method::kHostReg &&
         buffer_page_size > base_page_size;
+    // Keep HugeTLB's narrow-first/widening and ownership handling on its
+    // existing path. This optimization targets ordinary host pages only.
+    const bool parallel_host = !force_sequential && dmabuf_exp.host_memory &&
+                               !hugetlb_backed && !narrowed &&
+                               !registration_nics.empty() &&
+                               globalConfig().host_reg_threads > 1 &&
+                               globalConfig().parallel_reg_mr != 0 &&
+                               length >= (size_t)1024 * 1024 * 1024;
     const bool needs_widening =
         hugetlb_backed && length > 0 &&
         ((reinterpret_cast<uintptr_t>(addr) % buffer_page_size) != 0 ||
@@ -729,25 +766,43 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         plan.mr_len = len;
         plan.widened = widened;
         plan.chunks.clear();
-        if (chunk_limit > 0) {
+        size_t plan_chunk_limit = chunk_limit;
+        if (parallel_host) {
+            constexpr size_t host_alignment = 2 * 1024 * 1024;
+            // Bound each driver call even for very large pools. A worker
+            // completes all NICs for one tile before moving to its next tile.
+            constexpr size_t host_chunk_limit = size_t{2} * 1024 * 1024 * 1024;
+            constexpr size_t min_host_chunk = 256 * 1024 * 1024;
+            const size_t workers = globalConfig().host_reg_threads;
+            const size_t per_worker = len / workers + (len % workers != 0);
+            const size_t block = (per_worker / host_alignment +
+                                  (per_worker % host_alignment != 0)) *
+                                 host_alignment;
+            plan_chunk_limit =
+                std::clamp(block, min_host_chunk, host_chunk_limit);
+            if (chunk_limit)
+                plan_chunk_limit = std::min(plan_chunk_limit, chunk_limit);
+        }
+        if (plan_chunk_limit > 0) {
             size_t offset = 0;
             do {
                 auto *chunk_addr = static_cast<char *>(base) + offset;
                 const size_t prefix = (uintptr_t)chunk_addr % alignment;
-                if (prefix >= chunk_limit) {
+                if (prefix >= plan_chunk_limit) {
                     LOG(ERROR)
                         << "Data Direct alignment prefix exceeds max_mr_size";
                     return ERR_INVALID_ARGUMENT;
                 }
-                size_t chunk_len = std::min(chunk_limit - prefix, len - offset);
+                size_t chunk_len =
+                    std::min(plan_chunk_limit - prefix, len - offset);
                 plan.chunks.emplace_back(chunk_addr, chunk_len);
                 offset += chunk_len;
             } while (offset < len);
             if (plan.chunks.size() > 1) {
                 LOG(WARNING) << "Auto-splitting buffer " << base << " (" << len
                              << " bytes) into " << plan.chunks.size()
-                             << " chunks of <= " << chunk_limit
-                             << " bytes each (device max_mr_size; "
+                             << " chunks of <= " << plan_chunk_limit
+                             << " bytes each (MR chunk size limit; "
                                 "Mooncake#2017)";
             }
         } else {
@@ -837,7 +892,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 chunk_addrs.push_back((uint64_t)chunk.first);
             {
                 std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-                chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+                chunk_map_[(uint64_t)addr] = {
+                    std::move(chunk_addrs),
+                    parallel_host ? globalConfig().host_reg_threads : 0};
             }
             // Supersede any metadata-only record an earlier failed unregister
             // left at this address. The surviving MRs still need the chunked
@@ -884,7 +941,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     // Best-effort rollback of the first `committed` FULLY-committed chunks
     // (metadata added to the local segment desc AND MRs registered), i.e.
-    // chunks [0, committed). `committed == 0` is a no-op. Metadata is removed
+    // chunks [0, committed). The parallel host path also releases the MRs
+    // registered ahead of their metadata. Metadata is removed
     // WITHOUT a per-chunk publish. Nothing added by a failed attempt was ever
     // published — the single publish happens after a successful attempt,
     // outside the registry lock — so there is nothing to republish here either.
@@ -900,6 +958,10 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                              << metadata_key << " (ret=" << rc << ")";
             unregisterChunkMRs(plan.chunks[ri].first);
         }
+        if (parallel_host) {
+            for (size_t ri = n; ri < plan.chunks.size(); ++ri)
+                unregisterChunkMRs(plan.chunks[ri].first);
+        }
     };
 
     // Pre-touch decision is loop-invariant: it depends only on context_list_,
@@ -913,6 +975,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
     // block, so skip it there.
     const bool do_pre_touch =
+        !force_sequential &&
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
@@ -920,6 +983,51 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     auto runChunks = [&](const RegisteredPlan &plan, int &err) {
         err = 0;
         auto &chunks = plan.chunks;
+        if (parallel_host) {
+            auto started = std::chrono::steady_clock::now();
+            std::vector<int> results(chunks.size(), 0);
+            const size_t count =
+                std::min(globalConfig().host_reg_threads, chunks.size());
+            const HostMemoryAffinityPlan affinity(
+                globalConfig().host_mem_numa_affinity);
+            forEachChunk(chunks.size(), count, [&](size_t ci, size_t worker) {
+                ScopedHostMemoryAffinity bound(affinity.cpuForPartition(
+                    worker, count,
+                    static_cast<char *>(chunks[ci].first) +
+                        chunks[ci].second / 2));
+                // Spread initial faults and MR creation across NICs as well as
+                // disjoint memory ranges, avoiding a first-NIC registration
+                // wave.
+                for (size_t i = 0; i < registration_nics.size(); ++i) {
+                    auto &context = context_list_
+                        [registration_nics[(worker + i) %
+                                           registration_nics.size()]];
+                    int rc = context->registerMemoryRegion(
+                        chunks[ci].first, chunks[ci].second, access_rights,
+                        dmabuf_exp);
+                    if (rc) {
+                        results[ci] = rc;
+                        break;
+                    }
+                }
+            });
+            for (int rc : results) {
+                if (rc) {
+                    rollbackPlan(plan, 0);
+                    err = rc;
+                    return;
+                }
+            }
+            if (globalConfig().trace) {
+                LOG(INFO)
+                    << "Parallel host registration: chunks=" << chunks.size()
+                    << " workers=" << count << " bytes=" << length
+                    << " duration_ms="
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+            }
+        }
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
             void *chunk_addr = chunks[ci].first;
             size_t chunk_len = chunks[ci].second;
@@ -932,7 +1040,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
                 chunk_dmabuf_exp.offset += chunk_offset;
 
-            if (do_pre_touch) {
+            if (do_pre_touch && !parallel_host) {
                 // Parallel pre-touch the memory to speed up registration.
                 int ret = preTouchMemory(chunk_addr, chunk_len,
                                          registration_nics.front());
@@ -963,7 +1071,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
             auto reg_start = std::chrono::steady_clock::now();
 
-            if (use_parallel_reg) {
+            if (!parallel_host && use_parallel_reg) {
                 std::vector<std::thread> reg_threads;
                 reg_threads.reserve(registration_nics.size());
                 std::vector<int> ret_codes(context_list_.size(), 0);
@@ -993,7 +1101,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                         return;
                     }
                 }
-            } else {
+            } else if (!parallel_host) {
                 for (size_t i : registration_nics) {
                     int ret = context_list_[i]->registerMemoryRegion(
                         chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
@@ -1016,7 +1124,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
                                                                       reg_start)
                     .count();
-            if (globalConfig().trace) {
+            if (!parallel_host && globalConfig().trace) {
                 LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
                           << chunks.size() << ", addr=" << chunk_addr
                           << ", length=" << chunk_len
@@ -1058,7 +1166,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                            << resolved_name << " holds an MR for " << chunk_addr
                            << "; fix the topology or set "
                               "MC_RDMA_NIC_SELECTION=all";
-                unregisterChunkMRs(chunk_addr);
+                if (!parallel_host) unregisterChunkMRs(chunk_addr);
                 rollbackPlan(plan, ci);
                 err = ERR_DEVICE_NOT_FOUND;
                 return;
@@ -1090,7 +1198,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (rc) {
                 // ci's MRs are registered but its metadata add failed; release
                 // ci's MRs, then roll back the committed chunks [0, ci).
-                unregisterChunkMRs(chunk_addr);
+                if (!parallel_host) unregisterChunkMRs(chunk_addr);
                 rollbackPlan(plan, ci);
                 err = rc;
                 return;
@@ -1212,7 +1320,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         for (auto &chunk : used.chunks)
             chunk_addrs.push_back((uint64_t)chunk.first);
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+        chunk_map_[(uint64_t)addr] = {
+            std::move(chunk_addrs),
+            parallel_host ? globalConfig().host_reg_threads : 0};
     }
 
     // The claims are kept for the live registration; only the alias still has
@@ -1307,13 +1417,15 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
     // receives the base addr).
     std::vector<uint64_t> chunk_addrs;
+    size_t host_workers = 0;
     {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
         auto it = chunk_map_.find((uint64_t)addr);
         if (it != chunk_map_.end()) {
             // Copy, but keep the entry until the whole unregister succeeds:
             // a retry re-enumerates the chunks through this map.
-            chunk_addrs = it->second;
+            chunk_addrs = it->second.addresses;
+            host_workers = it->second.host_workers;
         }
     }
     // A HugeTLB sub-view registration is widened to whole huge pages after its
@@ -1367,7 +1479,30 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                 use_parallel_unreg = context_list_.size() > 1;
         }
         int mr_err = 0;
-        if (use_parallel_unreg) {
+        if (use_parallel_unreg && host_workers > 1) {
+            // Different workers release disjoint host ranges. Stagger the
+            // first NIC to avoid all workers queueing on one context's MR
+            // lock or unpinning the same pages on every NIC simultaneously.
+            std::vector<int> results(chunk_addrs.size(), 0);
+            const HostMemoryAffinityPlan affinity(
+                globalConfig().host_mem_numa_affinity);
+            const size_t count = std::min(host_workers, chunk_addrs.size());
+            forEachChunk(
+                chunk_addrs.size(), count, [&](size_t ci, size_t worker) {
+                    ScopedHostMemoryAffinity bound(affinity.cpuForPartition(
+                        worker, count,
+                        reinterpret_cast<void *>(chunk_addrs[ci])));
+                    for (size_t i = 0; i < context_list_.size(); ++i) {
+                        auto &context =
+                            context_list_[(worker + i) % context_list_.size()];
+                        int rc = context->unregisterMemoryRegion(
+                            reinterpret_cast<void *>(chunk_addrs[ci]));
+                        if (rc && !results[ci]) results[ci] = rc;
+                    }
+                });
+            for (int rc : results)
+                if (rc && !mr_err) mr_err = rc;
+        } else if (use_parallel_unreg) {
             std::vector<std::thread> threads;
             threads.reserve(context_list_.size());
             std::vector<int> ret_codes(context_list_.size(), 0);
