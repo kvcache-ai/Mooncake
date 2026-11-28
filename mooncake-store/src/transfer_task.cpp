@@ -2076,6 +2076,10 @@ bool TransferSubmitter::canUseLocalMemcpy(const std::string& endpoint) const {
             isSameProcessEndpoint(endpoint, local_endpoint_));
 }
 
+bool TransferSubmitter::isUbmemSegment(const std::string& endpoint) const {
+    return engine_.getSegmentProtocol(endpoint) == "ubmem";
+}
+
 bool TransferSubmitter::isSameProcessEndpoint(
     const std::string& handle_endpoint, const std::string& local_endpoint) {
     // Local memcpy requires that handle.buffer_address_ is a virtual address

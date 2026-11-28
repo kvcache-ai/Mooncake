@@ -192,6 +192,11 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
     return impl_->openSegment(segment_name);
 }
 
+std::string TransferEngine::getSegmentProtocol(
+    const std::string& segment_name) {
+    return impl_->getSegmentProtocol(segment_name);
+}
+
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
     return impl_->CheckSegmentStatus(sid);
 }
@@ -867,6 +872,15 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
         return handle;
     } else
         return impl_->openSegment(segment_name);
+}
+
+std::string TransferEngine::getSegmentProtocol(
+    const std::string& segment_name) {
+    if (use_tent_) {
+        // TENT segments do not publish a classic protocol.
+        return {};
+    }
+    return impl_->getSegmentProtocol(segment_name);
 }
 
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {

@@ -1226,27 +1226,56 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_hugepage_for_client_buffer =
-        use_hugepage_ && !globalConfig().ascend_use_fabric_mem;
-#ifdef USE_MEMFABRIC
-    use_hugepage_for_client_buffer &= !memfabric_use_fabric_mem(this->protocol);
-#endif
-    // Inject the SPDK DMA allocator only when NoF is actually available;
-    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
-    // through to exactly the same path as use_spdk_dma=false today
-    // (protocol-specific allocation -> VRAM -> aligned_alloc).
-    try {
+    if (protocol == "ubmem" && local_buffer_size > 0) {
+        /* Device partition: the owner segment starts at offset 0, the
+         * local buffer occupies the end of the device (single-driver
+         * discipline; the owner side uses local_buffer_size=0). */
+        const char *env_size = std::getenv("MC_UBMEM_DEV_SIZE");
+        if (!env_size || !*env_size) {
+            LOG(FATAL) << "MC_UBMEM_DEV_SIZE not set (ubmem store mode)";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        uint64_t window = strtoull(env_size, nullptr, 10);
+        void *ubmem_base = client_->GetBaseAddr();
+        if (!ubmem_base || local_buffer_size > window ||
+            (global_segment_size > 0 &&
+             local_buffer_size + global_segment_size > window)) {
+            LOG(FATAL) << "ubmem device partition invalid: device=" << window
+                       << " seg=" << global_segment_size
+                       << " buf=" << local_buffer_size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        char *buf_base = (char *)ubmem_base + (window - local_buffer_size);
+        LOG(INFO) << "ubmem local buffer at device end: " << (void *)buf_base
+                  << " (" << local_buffer_size << " of " << window << " bytes)";
         client_buffer_allocator_ = ClientBufferAllocator::create(
-            local_buffer_size, this->protocol, use_hugepage_for_client_buffer,
-            nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
-    } catch (const std::bad_alloc &) {
-        // The NoF DMA allocator yields nullptr when the SPDK env is
-        // unavailable; report an error instead of a silent generic-allocation
-        // fallback that would surface later as NoF registration failures.
-        LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
-                      "allocator unavailable or out of memory; check the "
-                      "hugepage/SPDK environment)";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            buf_base, local_buffer_size, protocol);
+    } else {
+        bool use_hugepage_for_client_buffer =
+            use_hugepage_ && !globalConfig().ascend_use_fabric_mem;
+#ifdef USE_MEMFABRIC
+        use_hugepage_for_client_buffer &=
+            !memfabric_use_fabric_mem(this->protocol);
+#endif
+        // Inject the SPDK DMA allocator only when NoF is actually available;
+        // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+        // through to exactly the same path as use_spdk_dma=false today
+        // (protocol-specific allocation -> VRAM -> aligned_alloc).
+        try {
+            client_buffer_allocator_ = ClientBufferAllocator::create(
+                local_buffer_size, this->protocol,
+                use_hugepage_for_client_buffer,
+                nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+        } catch (const std::bad_alloc &) {
+            // The NoF DMA allocator yields nullptr when the SPDK env is
+            // unavailable; report an error instead of a silent
+            // generic-allocation fallback that would surface later as NoF
+            // registration failures.
+            LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
+                          "allocator unavailable or out of memory; check the "
+                          "hugepage/SPDK environment)";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -1290,6 +1319,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
+        }
+
+    } else if (protocol == "ubmem") {
+        /* Segment at offset 0; a pure reader
+         * (global_segment_size=0) skips mounting. */
+        if (global_segment_size > 0) {
+            const char *env_size = std::getenv("MC_UBMEM_DEV_SIZE");
+            uint64_t window =
+                (env_size && *env_size) ? strtoull(env_size, nullptr, 10) : 0;
+            void *ptr = client_->GetBaseAddr();
+            if (!ptr || window == 0 || global_segment_size > window) {
+                LOG(ERROR) << "ubmem segment partition invalid (device="
+                           << window << " seg=" << global_segment_size << ")";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            LOG(INFO) << "Mounting ubmem segment: " << global_segment_size
+                      << " bytes, " << ptr;
+            auto mount_result =
+                client_->MountSegment(ptr, global_segment_size, protocol);
+            if (!mount_result.has_value()) {
+                LOG(ERROR) << "Failed to mount segment: "
+                           << toString(mount_result.error());
+                return tl::unexpected(mount_result.error());
+            }
         }
 
     } else {

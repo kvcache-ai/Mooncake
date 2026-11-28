@@ -672,6 +672,12 @@ class TransferSubmitter {
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
     /**
+     * @brief Whether the segment behind a transport endpoint published the
+     * ubmem protocol. Resolved from the cached segment descriptor.
+     */
+    [[nodiscard]] bool isUbmemSegment(const std::string& endpoint) const;
+
+    /**
      * @brief Pure comparison helper: returns true iff both endpoints are
      * non-empty and identical. Exposed for unit testing of the locality
      * decision without instantiating a full TransferEngine.

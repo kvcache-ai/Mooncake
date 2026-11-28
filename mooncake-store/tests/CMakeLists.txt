@@ -240,6 +240,10 @@ add_store_test(rpc_timeout_test rpc_timeout_test.cpp
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()
+if(USE_UBMEM)
+  add_store_test(ubmem_client_integration_test
+                 ubmem_client_integration_test.cpp)
+endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)

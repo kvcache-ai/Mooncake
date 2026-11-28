@@ -148,6 +148,10 @@ class TransferMetadata {
         // this is for cxl.
         std::string cxl_name;
         uint64_t cxl_base_addr;
+        // this is for ubmem (UB shared memory device). base_addr is the
+        // owner's local mapping address; peers resolve mirror + offset.
+        std::string ubmem_name;
+        uint64_t ubmem_base_addr;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
         // this is for ascend

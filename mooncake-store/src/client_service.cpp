@@ -1143,6 +1143,22 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ubmem") {
+            /* cxl-style "transport-owned segment" model: install maps the
+             * whole device and publishes a protocol="ubmem" segment. */
+            try {
+                transport =
+                    transfer_engine_->installTransport("ubmem", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ubmem_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ubmem transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else if (protocol == "cxi") {
             // Auto-discovery is RDMA-only, so populate the topology with the
             // CXI NICs before installing the transport (an empty device list
@@ -1828,6 +1844,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<Replica::Descriptor> dfs_read_replicas;
+    // ubmem gate, resolved from the cached segment descriptor once per
+    // distinct endpoint in this batch; only memory replicas carry an
+    // endpoint, disk replicas fall back to the per-key path
+    std::unordered_map<std::string, bool> ubmem_segment_cache;
+    auto is_ubmem_replica = [&](const Replica::Descriptor& replica) {
+        if (!replica.is_memory_replica()) {
+            return false;
+        }
+        const auto& endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        auto it = ubmem_segment_cache.find(endpoint);
+        if (it == ubmem_segment_cache.end()) {
+            it = ubmem_segment_cache
+                     .emplace(endpoint,
+                              transfer_submitter_->isUbmemSegment(endpoint))
+                     .first;
+        }
+        return it->second;
+    };
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1914,7 +1949,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
-        } else if (group_by_target && replica.is_memory_replica()) {
+        } else if ((group_by_target || is_ubmem_replica(replica)) &&
+                   replica.is_memory_replica()) {
+            // ubmem groups regardless of group_by_target: it completes
+            // synchronously inside submit, so keys bound for the same segment
+            // share one transfer batch instead of paying the whole per-batch
+            // bookkeeping (batch allocation, status polling, deferred cleanup)
+            // once per key.
             auto& group =
                 target_groups[replica.get_memory_descriptor()
                                   .buffer_descriptor.transport_endpoint_];
@@ -2160,7 +2201,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     ReplicateConfig client_cfg = AttachHostId(config);
     AttachHcaAffinity(client_cfg, slices);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -2372,7 +2413,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     ReplicateConfig client_cfg = AttachHostId(config);
     AttachHcaAffinity(client_cfg, slices);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -3745,7 +3786,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -3795,7 +3836,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -3842,7 +3883,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
