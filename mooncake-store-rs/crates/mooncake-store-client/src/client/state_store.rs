@@ -66,10 +66,11 @@ impl StoreState {
             let segment_name =
                 SegmentName::new(format!("{}-ext-{}", primary.0, self.next_local_segment_id));
             self.next_local_segment_id = self.next_local_segment_id.saturating_add(1);
-            if self
-                .memory
-                .as_ref()
-                .is_none_or(|memory| !memory.has_storage_segment(&segment_name))
+            if !self.pending_retirements.contains_key(&segment_name)
+                && self
+                    .memory
+                    .as_ref()
+                    .is_none_or(|memory| !memory.has_storage_segment(&segment_name))
             {
                 return segment_name;
             }

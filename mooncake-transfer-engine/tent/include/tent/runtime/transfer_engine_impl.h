@@ -471,6 +471,10 @@ class TransferEngineImpl {
 
     Status deregisterRemovedBuffer(BufferDesc& desc);
 
+    bool hasPendingUnpublish(uint64_t addr, size_t length);
+    void markPendingUnpublish(uint64_t addr, size_t length);
+    void clearPendingUnpublish(uint64_t addr);
+
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
     // Submit-stage failover: recover a task whose synchronous
@@ -696,6 +700,9 @@ class TransferEngineImpl {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
+    // Serializes register/unregister; pending entries owe only publication.
+    std::mutex pending_unpublish_mutex_;
+    std::unordered_map<uint64_t, size_t> pending_unpublish_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;

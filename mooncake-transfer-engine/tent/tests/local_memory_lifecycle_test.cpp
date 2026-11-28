@@ -32,13 +32,15 @@
 #if defined(__linux__)
 namespace {
 std::atomic<bool> fail_next_segment_sync{false};
-}
+std::atomic<int> segment_sync_calls{0};
+}  // namespace
 extern "C" mooncake::tent::Status
 __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
     mooncake::tent::SegmentManager* manager);
 extern "C" mooncake::tent::Status
 __wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
     mooncake::tent::SegmentManager* manager) {
+    ++segment_sync_calls;
     if (fail_next_segment_sync.exchange(false))
         return mooncake::tent::Status::MetadataError(
             "injected registry write failure");
@@ -473,6 +475,62 @@ TEST(LocalMemoryLifecycle, InternalHostAllocationDoesNotImplicitlySelectMlu) {
 }
 
 #if defined(__linux__)
+TEST(LocalMemoryLifecycle, UnregisterRetriesMetadataPublicationAfterRemoval) {
+    for (bool vector_api : {false, true}) {
+        TransferEngineImpl engine(makeConfig());
+        ASSERT_TRUE(engine.available());
+        auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+        engine.swapTransportForTest(TCP, tcp);
+        std::vector<char> buffer(4096);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        auto unregister = [&] {
+            return vector_api
+                       ? engine.unregisterLocalMemory(
+                             std::vector<void*>{buffer.data()}, {buffer.size()})
+                       : engine.unregisterLocalMemory(buffer.data(),
+                                                      buffer.size());
+        };
+        const int sync_before = segment_sync_calls.load();
+        fail_next_segment_sync = true;
+
+        auto first = unregister();
+        EXPECT_TRUE(first.IsMetadataError()) << first.ToString();
+        EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+        EXPECT_EQ(tcp->remove_calls, 1);
+        EXPECT_EQ(segment_sync_calls.load(), sync_before + 1);
+
+        auto second = unregister();
+        EXPECT_TRUE(second.ok()) << second.ToString();
+        EXPECT_EQ(tcp->remove_calls, 1);
+        EXPECT_EQ(segment_sync_calls.load(), sync_before + 2);
+
+        auto third = unregister();
+        EXPECT_TRUE(third.ok()) << third.ToString();
+        EXPECT_EQ(tcp->remove_calls, 1);
+        EXPECT_EQ(segment_sync_calls.load(), sync_before + 2);
+    }
+}
+
+TEST(LocalMemoryLifecycle, ReregistrationSupersedesPendingUnpublish) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<char> buffer(4096);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    fail_next_segment_sync = true;
+    ASSERT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size())
+                    .IsMetadataError());
+    EXPECT_EQ(tcp->remove_calls, 1);
+
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_EQ(tcp->remove_calls, 2);
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+}
+
 TEST(LocalMemoryLifecycle,
      StageMetadataFailureDoesNotLeaveFreedRegisteredBuffer) {
     for (bool with_mlu : {false, true}) {

@@ -762,6 +762,14 @@ mod state_core_tests {
 
 }
 
+#[derive(Clone)]
+struct PendingSegmentRetirement {
+    announcement: SegmentAnnouncement,
+    transport: Arc<dyn StoreTransport>,
+    region: Option<Arc<crate::memory::RegisteredRegion>>,
+    unpublished: bool,
+}
+
 #[derive(Default)]
 struct StoreState {
     memory: Option<LocalMemoryState>,
@@ -773,6 +781,8 @@ struct StoreState {
     segment_open_metadata: BTreeMap<String, SegmentTransportMetadata>,
     pending_reclaims: VecDeque<PendingReclaim>,
     pending_delete_notifications: BTreeSet<DeletePendingEntry>,
+    retirement_lock: Arc<Mutex<()>>,
+    pending_retirements: BTreeMap<SegmentName, PendingSegmentRetirement>,
     next_local_segment_id: u64,
 }
 

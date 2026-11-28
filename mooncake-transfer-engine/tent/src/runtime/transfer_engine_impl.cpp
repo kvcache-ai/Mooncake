@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -1122,6 +1123,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
+    std::lock_guard<std::mutex> pending_lock(pending_unpublish_mutex_);
     auto transports = getSupportedTransports(options.type);
     if (transports.empty()) {
         return Status::InvalidArgument(
@@ -1358,7 +1360,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         });
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
-    if (status.ok()) return metadata_->segmentManager().synchronizeLocal();
+    if (status.ok()) {
+        for (void* addr : addr_list) clearPendingUnpublish((uint64_t)addr);
+        return metadata_->segmentManager().synchronizeLocal();
+    }
     if (need_sync) {
         auto sync_status = metadata_->segmentManager().synchronizeLocal();
         if (!sync_status.ok()) LOG(WARNING) << sync_status.ToString();
@@ -1368,16 +1373,23 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
+bool TransferEngineImpl::hasPendingUnpublish(uint64_t addr, size_t length) {
+    auto it = pending_unpublish_.find(addr);
+    return it != pending_unpublish_.end() &&
+           (length == 0 || it->second == length);
+}
+
+void TransferEngineImpl::markPendingUnpublish(uint64_t addr, size_t length) {
+    pending_unpublish_[addr] = length;
+}
+
+void TransferEngineImpl::clearPendingUnpublish(uint64_t addr) {
+    pending_unpublish_.erase(addr);
+}
+
 Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
-    bool removed = false;
-    auto status = local_segment_tracker_->remove(
-        (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
-            removed = true;
-            return deregisterRemovedBuffer(desc);
-        });
-    if (!removed) return status;
-    auto synced = metadata_->segmentManager().synchronizeLocal();
-    return status.ok() ? synced : status;
+    return unregisterLocalMemory(std::vector<void*>{addr},
+                                 std::vector<size_t>{size});
 }
 
 Status TransferEngineImpl::unregisterLocalMemory(
@@ -1386,24 +1398,48 @@ Status TransferEngineImpl::unregisterLocalMemory(
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
     }
-    bool removed_any = false;
+    std::lock_guard<std::mutex> pending_lock(pending_unpublish_mutex_);
+    bool needs_sync = false;
     Status first_error;
+    std::vector<std::pair<uint64_t, size_t>> newly_removed;
+    std::vector<std::pair<uint64_t, size_t>> completed_after_sync;
     for (size_t i = 0; i < addr_list.size(); ++i) {
+        const auto base = (uint64_t)addr_list[i];
+        const auto length = size_list.empty() ? 0 : size_list[i];
+        if (hasPendingUnpublish(base, length)) {
+            needs_sync = true;
+            completed_after_sync.emplace_back(base, length);
+            continue;
+        }
         bool removed = false;
+        size_t removed_length = length;
         auto status = local_segment_tracker_->remove(
-            (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
-            [&](BufferDesc& desc) -> Status {
+            base, length, [&](BufferDesc& desc) -> Status {
                 removed = true;
+                removed_length = desc.length;
                 return deregisterRemovedBuffer(desc);
             });
-        if (removed) removed_any = true;
+        if (removed) needs_sync = true;
+        if (removed && status.ok()) {
+            newly_removed.emplace_back(base, removed_length);
+            completed_after_sync.emplace_back(base, removed_length);
+        }
         if (!status.ok()) {
             first_error = status;
             break;
         }
     }
-    if (!removed_any) return first_error;
+    if (!needs_sync) return first_error;
     auto synced = metadata_->segmentManager().synchronizeLocal();
+    if (!synced.ok()) {
+        for (const auto& removed : newly_removed) {
+            markPendingUnpublish(removed.first, removed.second);
+        }
+    } else {
+        for (const auto& removed : completed_after_sync) {
+            clearPendingUnpublish(removed.first);
+        }
+    }
     return first_error.ok() ? synced : first_error;
 }
 
