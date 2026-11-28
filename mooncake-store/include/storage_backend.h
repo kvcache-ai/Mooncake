@@ -27,6 +27,8 @@
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
+#include "ssd_read_source.h"
+#include "ssd_streaming_config.h"
 
 namespace mooncake {
 struct FileRecord {
@@ -356,6 +358,8 @@ struct FileStorageConfig {
     bool enable_disk_watermark_eviction = true;
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
+
+    ssd_offload::StreamingReadConfig streaming_read;
 
     // Validates the configuration for correctness and consistency
     bool Validate() const;
@@ -975,6 +979,27 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> GetBucketKeys(
         int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    struct ReadSourceRequest {
+        std::string_view key;
+        uint64_t expected_size{0};
+    };
+    struct AcquiredObjectLocation {
+        size_t source_index{0};
+        uint64_t object_bytes{0};
+        uint64_t value_file_offset{0};
+    };
+    struct AcquiredReadSources {
+        std::vector<std::shared_ptr<ssd_offload::ReadSource>> sources;
+        std::vector<AcquiredObjectLocation> locations;
+    };
+
+    // Resolves a batch of keys under one shared metadata lock, deduplicates
+    // open descriptors and BucketReadGuards per bucket, and calls
+    // reserve_credits(unique_bucket_count) before opening any file.
+    tl::expected<AcquiredReadSources, ErrorCode> AcquireReadSources(
+        const std::vector<ReadSourceRequest>& requests,
+        const std::function<bool(size_t)>& reserve_credits = nullptr);
 
     /**
      * @brief Initializes the bucket storage backend.

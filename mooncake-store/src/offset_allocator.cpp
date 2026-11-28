@@ -642,6 +642,29 @@ uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
            << m_multiplier_bits;
 }
 
+std::pair<uint64_t, uint64_t> OffsetAllocator::slotBudget(
+    size_t slot_bytes, uint64_t arena_bytes) noexcept {
+    if (slot_bytes == 0 || arena_bytes == 0) {
+        return {0, 0};
+    }
+    const uint64_t multiplier_bits = calculateMultiplier(arena_bytes);
+    const uint64_t quantum = uint64_t{1} << multiplier_bits;
+    if (slot_bytes > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+        return {0, 0};
+    }
+    const uint64_t fake_size = (slot_bytes + quantum - 1) >> multiplier_bits;
+    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+        return {0, 0};
+    }
+    const uint64_t normalized_slot =
+        static_cast<uint64_t>(SmallFloat::floatToUint(
+            SmallFloat::uintToFloatRoundUp(static_cast<uint32>(fake_size))))
+        << multiplier_bits;
+    const uint64_t effective_arena = (arena_bytes >> multiplier_bits)
+                                     << multiplier_bits;
+    return {normalized_slot, effective_arena};
+}
+
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {

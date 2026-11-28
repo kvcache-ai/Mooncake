@@ -1011,7 +1011,8 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
-        const OffloadReadRange *read_range = nullptr);
+        const OffloadReadRange *read_range = nullptr,
+        bool allow_local_streaming = true);
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
@@ -1411,9 +1412,16 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    class OffloadReadThreadPool;
+    OffloadReadThreadPool *GetOrCreateOffloadReadPool();
+    void StopOffloadReadPool();
+
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
     RpcDrainGuard offload_rpc_drain_;
+    std::mutex offload_read_pool_mutex_;
+    std::unique_ptr<OffloadReadThreadPool> offload_read_pool_;
+    std::atomic<OffloadReadThreadPool *> offload_read_pool_fast_{nullptr};
     friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 

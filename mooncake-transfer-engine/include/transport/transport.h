@@ -771,6 +771,29 @@ class Transport {
         return submitTransferTask(task_list);
     }
 
+    // Validate that every WRITE request in `entries` can guarantee
+    // receiver-visible completion on this transport without silently
+    // downgrading. Transports that do not yet provide receiver-visible writes
+    // fail closed with NotSupportedTransport.
+    virtual Status validateReceiverVisibleWrites(
+        const std::vector<TransferRequest> &entries) const {
+        (void)entries;
+        return Status::NotSupportedTransport(
+            std::string(getName()) +
+            " transport does not support receiver-visible writes");
+    }
+
+    // Submit WRITE tasks with receiver-visible completion guarantees: when a
+    // task reaches COMPLETED, the written bytes are ready for the receiver to
+    // consume.
+    virtual Status submitReceiverVisibleWriteTasks(
+        const std::vector<TransferTask *> &task_list) {
+        (void)task_list;
+        return Status::NotSupportedTransport(
+            std::string(getName()) +
+            " transport does not support receiver-visible writes");
+    }
+
     // Grouped transports must append slices in request order so scatter can
     // recover per-request status after a grouped task fails.
     virtual bool supportsGroupedScatter() const { return false; }
