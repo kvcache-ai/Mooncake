@@ -105,6 +105,15 @@ If a timeout error occurs during startup, check whether a proxy is configured on
 
 ### 3.2 Install SSH Dependencies
 
+The SSD administration commands and `scripts/generate_cluster_topology.py`
+verify SSH server identities using the invoking user's `~/.ssh/known_hosts`.
+Provision trusted host keys before running these tools. Verify fingerprints
+through a trusted channel before accepting keys; unverified `ssh-keyscan`
+output alone does not establish trust. Use the same hostname or IP address as
+the command, and `[host]:port` entries for non-default ports. Unknown or
+mismatched host keys cause the connection to fail before commands run.
+Passwordless user authentication does not replace server identity verification.
+
 ```bash
 python3 -m pip install "paramiko>=3.4.0"
 ```
