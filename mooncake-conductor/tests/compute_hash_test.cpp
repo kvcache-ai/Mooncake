@@ -894,7 +894,13 @@ TEST(SglangHashChain, IncludesPartialFinalBlock) {
     std::vector<HashBlock> blocks;
     ASSERT_TRUE(
         strategy->Compute(context, tokens, std::nullopt, &blocks).empty());
-    EXPECT_EQ(blocks.size(), 2u);
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(
+        DigestToHex(blocks[0].digest),
+        "34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f");
+    EXPECT_EQ(
+        DigestToHex(blocks[1].digest),
+        "3ac5d352be720e428633fe34fc74591b2b80060a7764e195d8f34068203ae98f");
 }
 
 TEST(SglangHashChain, MatchesBigramGolden) {
