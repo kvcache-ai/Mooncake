@@ -1492,6 +1492,7 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
            rank_info == other.rank_info &&
            tcp_data_host == other.tcp_data_host &&
            tcp_data_port == other.tcp_data_port &&
+           tcp_proto_version == other.tcp_proto_version &&
            rdma_server_name == other.rdma_server_name;
 }
 
