@@ -242,6 +242,32 @@ class FilereadOperationState : public OperationState {
     }
 };
 
+enum class TransferTaskOutcome { RUNNING, SUCCEEDED, FAILED };
+
+/**
+ * @brief Tells whether the Store can stop waiting for a task in `status`.
+ *
+ * TENT never changes a task again once it reports TIMEOUT. The classic engine
+ * reports TIMEOUT for a slice that is still in flight (MC_SLICE_TIMEOUT), so
+ * the transfer may still touch the buffers and the Store keeps waiting.
+ */
+inline TransferTaskOutcome ClassifyTransferTaskStatus(TransferStatusEnum status,
+                                                      bool is_tent_batch) {
+    switch (status) {
+        case TransferStatusEnum::COMPLETED:
+            return TransferTaskOutcome::SUCCEEDED;
+        case TransferStatusEnum::FAILED:
+        case TransferStatusEnum::CANCELED:
+        case TransferStatusEnum::INVALID:
+            return TransferTaskOutcome::FAILED;
+        case TransferStatusEnum::TIMEOUT:
+            return is_tent_batch ? TransferTaskOutcome::FAILED
+                                 : TransferTaskOutcome::RUNNING;
+        default:
+            return TransferTaskOutcome::RUNNING;
+    }
+}
+
 /**
  * @brief Operation state for transfer engine operations
  */
