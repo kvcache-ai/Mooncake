@@ -20,10 +20,12 @@ from .lifetime import (
     AllocationLifetimeToken,
     TerminalTransferState,
 )
+from .registered import RegisteredTransferEngine
 from .registration import BufferRegistrationLease
 
 __all__ = [
     "BufferRegistrationLease",
+    "RegisteredTransferEngine",
     "AllocationFence",
     "AllocationLifetimeToken",
     "MooncakeTransferEngineExecutor",
