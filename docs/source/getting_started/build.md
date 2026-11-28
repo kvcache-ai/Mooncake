@@ -316,6 +316,19 @@ Adjust the parallel job count for the available memory. The example uses four
 jobs because optimized C++ and Python binding translation units can each need
 several gigabytes of memory on RISC-V.
 
+### Build a Python Wheel with the Stable ABI
+
+For each target platform, a single wheel containing the Transfer Engine and
+Store supports GIL-enabled CPython 3.12 and newer. Build the wheel with
+CPython 3.12 and CMake 3.26 or newer. Run this command from the repository root:
+
+```bash
+uv build --wheel -Cwheel.py-api=cp312 -Ccmake.define.WITH_CONDUCTOR=OFF
+```
+
+The resulting wheel has the `cp312-abi3` tag. If you need the EP, Conductor, or
+TENT Python extensions, build a regular wheel for each target CPython version.
+
 ### Hardware Backend Setup
 
 Run `sudo bash dependencies.sh` before using any of these backend-specific build
