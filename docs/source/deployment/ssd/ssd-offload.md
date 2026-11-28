@@ -2,7 +2,7 @@
 
 ## Overview
 
-Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
+Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. With `--enable_offload=true`, for objects with a DRAM replica on an offload-enabled client, the master eagerly queues asynchronous disk persistence at `PutEnd` by default, or defers persistence until memory eviction when `--offload_on_evict=true`. On a memory cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
 
 For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../../performance/mooncake/ssd-offload-benchmark-results.md).
 
@@ -27,24 +27,25 @@ mkdir -p /nvme/mooncake_offload
 
 ```bash
 mooncake_master \
-    --rpc_port=50051
+    --rpc_port=50051 \
+    --enable_offload=true
 ```
 
 ### Step 3A (Mode A): Start the application with embedded Real Client
 
-Use the `--enable_ssd_offload` flag to enable SSD offload, and set environment variables to specify the storage path and backend:
+Pass `enable_ssd_offload=True` and `ssd_offload_path` to `MooncakeDistributedStore.setup(...)` (replace `<machine-ip>` and `<rdma-device>` with your node's reachable IP and RDMA device, e.g. `mlx5_0`), and optionally set environment variables to configure the storage backend:
 
 ```python
 from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup(
-    local_hostname="<machine IP>",
+    local_hostname="<machine-ip>",
     metadata_server="P2PHANDSHAKE",
     global_segment_size=4 * 1024 * 1024 * 1024,  # 4 GB
     local_buffer_size=512 * 1024 * 1024,  # 512 MB
     protocol="rdma",
-    rdma_devices="eth0",
+    rdma_devices="<rdma-device>",
     master_server_addr="127.0.0.1:50051",
     enable_ssd_offload=True,
     ssd_offload_path="/nvme/mooncake_offload"
@@ -53,24 +54,24 @@ store.setup(
 
 ### Step 3B (Mode B): Start the standalone real client with SSD offload enabled and connect it with the dummy client
 
-Set the same SSD offload environment variables as in Mode A.
+Set the SSD offload environment variables and start `mooncake_client` with `--enable_offload=true` (replace `<machine-ip>` and `<rdma-device>` with your node's reachable IP and RDMA device, e.g. `mlx5_0`):
 
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 mooncake_client \
-    --master_server_address=127.0.0.1:50051 \
-    --host=<machine IP> \
-    --protocol="rdma"  \
-    --device_names=<NIC name, e.g. eth0> \
+    --master_server_address="127.0.0.1:50051" \
+    --host="<machine-ip>" \
+    --protocol="rdma" \
+    --device_names="<rdma-device>" \
     --port=50052 \
     --global_segment_size="4 GB" \
-    --enable_offload=true  \
+    --enable_offload=true \
     --metadata_server="P2PHANDSHAKE"
 ```
 
-The application (e.g., SGLang) connects to the standalone real client via the `MooncakeDistributedStore` Python SDK. The Python process acts as a DummyClient; SSD offload and fallback loading are handled by the standalone real client process.
+The application (e.g., SGLang) connects to the standalone real client on the **same host** (and in the same network namespace, since non-zero `local_buffer_size` exchanges shared-memory file descriptors over the local abstract Unix socket) via the `MooncakeDistributedStore` Python SDK (replace `<machine-ip>` with the host address of your local `mooncake_client`). The Python process acts as a DummyClient; SSD offload and fallback loading are handled by the standalone real client process.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
@@ -79,11 +80,11 @@ store = MooncakeDistributedStore()
 store.setup_dummy(
     mem_pool_size=4 * 1024 * 1024 * 1024,  # 4 GB
     local_buffer_size=512 * 1024 * 1024,  # 512 MB
-    server_address="<machine IP>:50052"   # mooncake_client RPC address from Step 3
+    server_address="<machine-ip>:50052"   # mooncake_client RPC address from Step 3B
 )
 ```
 
-> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
+> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` truncates its data file on startup by default (`MOONCAKE_OFFSET_PERSIST_MODE=disabled`), and recovers persisted metadata across restarts when `MOONCAKE_OFFSET_PERSIST_MODE` is set to `relaxed` or `strict`.
 
 ---
 
@@ -99,7 +100,10 @@ store.setup_dummy(
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |
 | `--global_segment_size` | `4 GB` | Memory pool size allocated for this node |
 | `--enable_offload` | `false` | **Must be set to `true` to enable SSD offload** |
-| `--start_offload_rpc_server` | `true` | Start the offload RPC server used by DummyClients for SSD reads. Effective only when `--enable_offload=true`; disable only for write-only owners |
+| `--start_offload_rpc_server` | `true` | Start the dedicated offload TCP RPC server on an OS-assigned ephemeral port (`batch_get_offload_object`, `batch_get_offload_object_ranges`, `release_offload_buffer`, `verify_disk_replica`, `prefetch_offload_object`). Effective only when `--enable_offload=true`; peers must be able to reach this port over TCP (leave `MC_RPC_PROTOCOL` unset or `tcp` on clients issuing SSD restore RPCs, even when `--protocol=rdma` is used for data transfers, because neither offload listener enables RDMA RPC). Keep this enabled for deployments serving DummyClient SSD reads: setting `false` routes disk reads, buffer release, and delegated prefetch onto the fixed `--port` main client RPC listener (without `verify_disk_replica` for read-side stale-replica healing), where the default `--threads=1` can stall or deadlock on both local loopback and concurrent cross-node DummyClient SSD reads |
+| `--enable_ssd_prefetch` | `false` | Enable best-effort SSD-to-DRAM prefetch on exist probes (callers must also pass `ExistOptions.prefetch_to_memory=true`, default `false`), demand-side get kicks (only `get_buffer`/`get`/`get_tensor` and `batch_get_into_multi_buffers`, not `batch_get_buffer`/`get_batch`, `get_into`, or `batch_get_into`), and remote delegations. For remote SSD replicas, both the requesting Real Client and the SSD holder must enable prefetch (see [SSD Prefetch](../../design/store/ssd-prefetch.md)) |
+| `--ssd_prefetch_cooldown_sec` | `5` | Memory-pressure backoff window in seconds for SSD prefetch (`0` disables). Demand-side get kicks bypass the requester's cooldown, though a remote holder still honors its own cooldown |
+| `--ssd_prefetch_dedup_ttl_sec` | `30` | Per-key prefetch trigger deduplication TTL in seconds (`0` disables) |
 | `--threads` | `1` | Number of RPC server threads |
 
 ---
@@ -122,6 +126,8 @@ These flags control when the master asks clients to persist objects to SSD, whet
 
 Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
 
+> **Warning:** Do not combine `--offload_on_evict=true` with OpLog (`--enable_oplog=true`) if you rely on automatic `LOCAL_DISK` offload. `--offload_on_evict=true` disables `PutEnd` enqueueing, while OpLog takes precedence in memory eviction (`OpLogReclaimer` instead of `OffloadingReclaimer`), so neither normal offload enqueue path runs.
+
 ---
 
 ## SSD Offload Configuration
@@ -131,14 +137,14 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory. `bucket_storage_backend` also accepts a comma-separated list of paths to spread offload across several disks — see {ref}`Multiple disks <ssd-offload-multiple-disks>` |
-| `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
+| `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type: `bucket_storage_backend`, `file_per_key_storage_backend`, `offset_allocator_storage_backend`, `nvme_kv_storage_backend` (see [NVMe KV Local-Disk Backend](./nvme-kv.md)), or `distributed_storage_backend` (see [Object Storage Offload](../object-storage-offload.md)) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
 | `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores and DFS ranged-session reads into device memory. See the constraints below |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
-| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
+| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval in seconds for reclaiming expired offload buffers |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
@@ -157,12 +163,13 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
+| `MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS` | `false` | Flush trailing partial buckets in the same offload cycle instead of retaining them across heartbeats |
 | `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `0` | Write mode: `0`/`false` keeps buffered writes; `packed` enables packed O_DIRECT/io_uring writes (`true`/`1` are aliases). Packed writes require a build with io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true`; otherwise writes remain buffered. `aligned` enables aligned O_DIRECT writes, which do not need io_uring (see below). Unknown values fail backend initialization. `.meta` writes stay buffered with their exact protobuf length. |
 | `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS` | `1` | Threads used only by `packed` direct writes, clamped to 1–8; invalid values use 1. Buckets smaller than 16 MiB always use one thread. |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes, applied **per disk**. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
-| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes, applied **per disk** when `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` is empty. When set to `0` and an eviction policy (`fifo` or `lru`) is active, each disk defaults to **90% of its physical disk capacity**; with `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none`, no 90% default quota is synthesized. |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one positive entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `fifo` (default) / `lru` / `none` |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Best-effort eviction threshold on **real on-disk** bytes (`du`-equivalent) under each configured offload root (`0` disables). Leave headroom below hard volume limits such as Kubernetes `emptyDir.sizeLimit` — see [Eviction](#eviction) below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
 | `MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS` | `10` | Interval between passes that reclaim buckets of objects the master removed; `0` disables reclaim. See {ref}`Reclaim of removed objects <ssd-offload-reclaim>` |
 | `MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS` | `120` | Target time for the passes to check every stored key against the master once. A lap takes longer when passes hit their time limit. |
@@ -229,10 +236,21 @@ export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST=$((200 * 1024 * 1024 * 1024))
   directory and do not understand a comma list. Configure exactly one path for
   those backends.
 - **Each root is validated independently.** Every entry must be an absolute path
-  to an existing, writable directory; whitespace around entries is trimmed and
-  empty entries are dropped. Roots must not nest inside one another, or startup
-  fails — separate disks are the point, and overlapping roots would double-count
-  usage.
+  to an existing, writable directory; whitespace around entries is trimmed, and
+  empty entries are rejected at startup. Roots must not nest inside one another,
+  or startup fails — separate disks are the point, and overlapping roots would
+  double-count usage.
+- **Exclusive storage ownership.** For filesystem-backed `LOCAL_DISK` backends,
+  always give each live Real Client its own offload directory (and its own
+  directory on every disk when multiple disks are configured) — do not point
+  multiple TP ranks at the same path. `bucket_storage_backend` enforces this at
+  runtime with an exclusive `flock` on every configured root, failing `Init()`
+  with `storage_path already held by another live client` if any directory is
+  already held; other filesystem-backed backends do not acquire this lock, so
+  directory isolation must still be maintained by configuration. Independent
+  `nvme_kv_storage_backend` clients must use separate NVMe KV namespaces rather
+  than relying on separate directories. See the ownership contract in
+  [SSD Offload design](../../design/store/ssd-offload.md).
 - **Writes are spread round-robin** across the disks that can admit the incoming
   bucket, so all drives stay in use. Selection is not free-space-greedy: that
   collapses onto a single disk once the drives equalize.
@@ -264,6 +282,8 @@ export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST=$((200 * 1024 * 1024 * 1024))
   buckets live, while removing a disk from the list makes its buckets
   unreachable.
 
+(ssd-offload-file-per-key-settings)=
+
 ### File-per-key backend settings
 
 Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_backend`.
@@ -284,9 +304,9 @@ Groups multiple objects into bucket files. Reduces filesystem overhead, supports
 **File layout:**
 ```
 /nvme/mooncake_offload/
-├── 1710000000000-0.bucket   # data file (multiple KV pairs)
-├── 1710000000000-0.meta     # metadata file
-├── 1710000000001-0.bucket
+├── 7004160000001.bucket   # data file (multiple KV pairs, integer bucket ID)
+├── 7004160000001.meta     # metadata file
+├── 7004160000002.bucket
 └── ...
 ```
 
@@ -294,12 +314,7 @@ Best for: general-purpose use, large-scale deployments.
 
 ### `file_per_key_storage_backend`
 
-Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale.
-
-| Environment Variable | Default | Description |
-|---|---|---|
-| `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
-| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction for this backend. Short alias: `ENABLE_EVICTION` |
+Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale. See {ref}`File-per-key backend settings <ssd-offload-file-per-key-settings>` above for `MOONCAKE_OFFLOAD_FSDIR` and `MOONCAKE_OFFLOAD_ENABLE_EVICTION`.
 
 Best for: debugging or small-scale deployments.
 
@@ -307,11 +322,26 @@ Best for: debugging or small-scale deployments.
 
 Pre-allocates a single large file and manages offset-based allocation within it. Highest concurrency via 1024-shard metadata.
 
-> **Warning:** This backend does **not** support metadata recovery on restart. On initialization, the data file is truncated and all in-memory metadata is cleared. Any previously offloaded objects become inaccessible after a process restart.
+- **Restart persistence:** Controlled by `MOONCAKE_OFFSET_PERSIST_MODE` (default `disabled`). In `disabled` mode, initialization truncates the data file and clears metadata, so previously offloaded objects are not recoverable after a restart. Set `relaxed` (checkpoints written during subsequent `BatchOffload` calls once `MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS` has elapsed, plus a best-effort checkpoint on clean shutdown) or `strict` (durable checkpoint after each completed `BatchOffload`, though an interrupted batch is not atomic) to recover metadata and re-register objects on restart. Neither `relaxed` nor `strict` guarantees a point-in-time snapshot across a crash before the next checkpoint saves, because extents freed by FIFO eviction or key overwrites/upserts can be reused and overwritten by newer writes. Keep `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` unchanged across restarts: resizing it causes capacity-mismatch fallback, which deletes the checkpoint and truncates the data file (rebuilding the cache from empty).
+- **Capacity and write-time eviction:** `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` sets the pre-allocated file size directly (100%, no safety margin), so set it below physical disk capacity. By default (`MOONCAKE_OFFSET_EVICTION_POLICY=none`), writes fail once capacity is full; set `MOONCAKE_OFFSET_EVICTION_POLICY=fifo` to enable write-time FIFO eviction.
 
-**Capacity:** `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` is used directly as the pre-allocated file size (100%, no safety margin). Unlike `bucket_storage_backend`, there is no separate quota variable — this is the sole disk usage control. Set it below the physical disk capacity to avoid filling the disk; writes are rejected once usage reaches this limit.
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFSET_PERSIST_MODE` | `disabled` | Metadata persistence mode: `disabled`, `relaxed` (write-triggered checkpoint after interval + best-effort shutdown checkpoint), or `strict` (durable checkpoint after each completed `BatchOffload`; interrupted batches are not atomic) |
+| `MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS` | `60` | Minimum interval in seconds before a subsequent `BatchOffload` triggers a checkpoint in `relaxed` mode (must be `>= 5`; not a background timer, so idle writes before a crash may remain uncheckpointed) |
+| `MOONCAKE_OFFSET_RECORD_CRC` | `true` | Attach CRC-32C checksums to newly written records (`0`/`false`/`off` disables for new writes; recovery checks each record's header flag, so existing checksummed records are still verified). Keep enabled for restart recovery unless storage guarantees prevent torn writes, because unchecksummed records skip payload verification and rely only on checkpoint sequence guards |
+| `MOONCAKE_OFFSET_EVICTION_POLICY` | `none` | Write-time eviction policy: `none` or `fifo` |
+| `MOONCAKE_OFFSET_HIGH_RATIO` | `0.90` | High usage ratio in `(0, 1]` that triggers write-time eviction (used for both byte and key watermarks) |
+| `MOONCAKE_OFFSET_LOW_RATIO` | `0.80` | Low target usage ratio in `(0, high_ratio)` for write-time eviction (used for both byte and key watermarks) |
+| `MOONCAKE_OFFSET_MAX_CAPACITY_NODES` | `0` (auto) | Override for allocator node capacity when initializing a fresh allocator (`0` auto-derives from pre-allocated file size; ignored on a successful `relaxed`/`strict` recovery, which restores the saved node limit) |
+| `MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD` | `4096` | Maximum keys evicted in a single eviction pass (`> 0`); `BatchOffload` processes objects individually, so multiple objects in one batch can each trigger an eviction pass |
 
-Best for: high-concurrency scenarios with many small objects where restart durability is not required.
+Best for: high-concurrency scenarios with many small objects.
+
+### Other offload descriptors
+
+- `nvme_kv_storage_backend`: writes directly to an NVMe KV device; see [NVMe KV Local-Disk Backend](./nvme-kv.md).
+- `distributed_storage_backend`: selects an adapter from `MOONCAKE_DFS_FS_ADAPTER` (if set) or `MOONCAKE_DISTRIBUTED_FS_TYPE` (default `hf3fs`). Only `oss` and `s3` (when built with the corresponding adapter support) route `LOCAL_DISK` offload to object storage; `posix`, `hf3fs` (requires a `USE_3FS` build; otherwise client startup fails), and `kvcs-lowlevel` run in `DFS` mode and skip `LOCAL_DISK` offload, while unsupported values fail startup. Note that setting the effective adapter to `kvcs-lowlevel` automatically forces `distributed_storage_backend` and overrides `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR`, so unset both `MOONCAKE_DFS_FS_ADAPTER` and `MOONCAKE_DISTRIBUTED_FS_TYPE` (or clear `kvcs-lowlevel`) when switching to local SSD offload. See [Object Storage Offload](../object-storage-offload.md) for full adapter setup.
 
 ---
 
@@ -319,27 +349,23 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ### Write-time eviction
 
-When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` or `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit. With several disks configured, the limit and the eviction order are per disk: a write evicts only on the disk it is being placed on.
+For `bucket_storage_backend`, `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` defaults to `fifo`. With `fifo` or `lru` active, whenever a write would exceed a disk's effective quota (`MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` entry if set, otherwise `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`, defaulting to 90% of that disk's physical capacity when `<= 0`) or `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES`, the backend evicts buckets on that disk before writing the new bucket.
 
 | Policy | Behavior |
 |--------|----------|
-| `none` | No eviction (default); writes fail when disk is full |
-| `fifo` | Evict the oldest bucket first |
+| `fifo` | Evict the oldest bucket first (default) |
 | `lru` | Evict the least recently read bucket first |
+| `none` | No eviction; no 90% default quota is synthesized, and writes fail or offload stops when the disk is full, an explicitly configured positive per-disk quota (`MAX_TOTAL_SIZE` / `MAX_TOTAL_SIZE_LIST`) would be exceeded, or the aggregate `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` / `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` limit (minus one bucket's headroom) is reached |
 
 Eviction is two-phase: the bucket is removed from metadata and master is notified first, then in-flight reads are drained before files are deleted.
 
 **`MAX_TOTAL_SIZE` vs `MAX_PHYSICAL_BYTES`**
 
-`MAX_TOTAL_SIZE` bounds a *logical* in-memory counter (`data_size + meta_size` summed per object). It undercounts real disk usage: it ignores filesystem block rounding, and a bucket file stays on disk until *every* object in it is evicted while the counter drops per object. `MAX_PHYSICAL_BYTES` instead measures the *real* on-disk bytes (`du`-equivalent), so prefer it when you must not exceed a hard physical limit — most importantly a Kubernetes `emptyDir` with a `sizeLimit`, which the kubelet enforces by the volume's actual `du` usage and evicts the pod when exceeded.
+`MAX_TOTAL_SIZE` bounds a *logical* in-memory counter (object payloads, keys, and bucket metadata). Because bucket eviction removes whole buckets at a time and the counter does not include filesystem block rounding or files awaiting deletion, it can undercount actual disk consumption. `MAX_PHYSICAL_BYTES` instead tracks *real* on-disk bytes (`du`-equivalent) under each configured path as a best-effort threshold (using cached directory scans plus estimated incoming bucket sizes), so prefer it when targeting a physical limit — most importantly a Kubernetes `emptyDir` with a `sizeLimit`, which the kubelet enforces by actual `du` usage.
 
-**Ownership and scope.** LOCAL_DISK allows **one live client per** `ssd_offload_path` / `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. A second live client fails `Init()` with `storage_path already held by another live client`. With several disks configured, every directory in the list is locked, so sharing any one of them fails the same way. Do **not** point several TP ranks at the same path — use **per-rank / per-client directories** (or separate disks). See the ownership contract in [SSD Offload design](../../design/store/ssd-offload.md).
+Because `MAX_PHYSICAL_BYTES` is enforced independently on each configured offload root directory (see {ref}`Multiple disks <ssd-offload-multiple-disks>`), budget it **below** each root's share of the volume to leave headroom for cached scans, block rounding, and in-flight writes (for example, comfortably below `sizeLimit / N` when `N` roots — such as `N` ranks with one directory each — share one volume, or below disk capacity when each root has its own disk).
 
-`MAX_PHYSICAL_BYTES` scans this backend's own path. With the required per-rank layout, the cap bounds **each rank individually**. Set it to the per-rank budget (e.g. `sizeLimit / N` when N ranks share one volume via separate subdirectories, or the disk capacity when each rank has its own disk). A shared offload directory across live clients is no longer a supported deployment shape.
-
-> A cap on the *global* sum across ranks that holds under any layout (including ranks on separate disks) cannot be done by a per-directory scan and would require master-side aggregation; it is not part of this feature.
-
-The two limits are independent and may be combined — eviction fires when either would be exceeded. `MAX_PHYSICAL_BYTES` only takes effect when an eviction policy is set (`fifo`/`lru`); with `none`, eviction never runs.
+The two limits are independent and may be combined — eviction fires when either would be exceeded. `MAX_PHYSICAL_BYTES` only takes effect when an eviction policy is active (`fifo`/`lru`); with `none`, eviction never runs.
 
 ---
 
@@ -349,11 +375,11 @@ When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage hea
 
 | Backend | Behavior |
 |---------|----------|
-| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY`; set it to `fifo` or `lru` because the default policy `none` makes watermark eviction a no-op |
+| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` (`fifo` by default); setting it to `none` makes watermark eviction a no-op |
 | `file_per_key_storage_backend` | Requires `MOONCAKE_OFFLOAD_ENABLE_EVICTION=true`; reuses the FIFO file eviction queue and recovered keys from startup metadata scan |
-| `offset_allocator_storage_backend` | No-op in this version |
+| `offset_allocator_storage_backend` | No-op for background heartbeat watermark eviction; use write-time FIFO eviction (`MOONCAKE_OFFSET_EVICTION_POLICY=fifo`) instead |
 
-The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, the quota is `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` (or the matching entry of `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST`); when that value is `0`, the backend defaults it to 90% of the physical disk capacity. With several disks configured, each disk is checked against its own quota and evicted toward the low watermark on its own. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
+The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, each disk uses its matching entry from `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` if set, otherwise `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`; only when an eviction policy (`fifo` or `lru`) is active and that disk's configured quota is `<= 0` does it default to 90% of that disk's physical capacity. With several disks configured, each disk is checked against its own quota and evicted toward the low watermark independently. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
 
 For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
 
@@ -373,16 +399,18 @@ If the offload directory already holds objects when the real client starts, recl
 
 ## Example
 
+### Single-node example
+
 The following example starts a master and a real client on a single machine.
 
-### Environment
+#### Environment
 
 - Machine IP: `192.168.1.10`
-- NIC: `eth0`
+- RDMA device: `mlx5_0`
 - SSD mount point: `/nvme`
-- Memory pool size: 4 GB (smaller than the total data written, to trigger offload)
+- Memory pool size: 4 GB (smaller than the total data written, since this example enables `--offload_on_evict=true`)
 
-### Start the master
+#### Start the master
 
 ```bash
 mooncake_master \
@@ -393,7 +421,7 @@ mooncake_master \
     --promotion_admission_threshold=2
 ```
 
-### Start the real client (new terminal)
+#### Start the real client (new terminal)
 
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
@@ -406,9 +434,46 @@ export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 mooncake_client \
     --master_server_address="192.168.1.10:50051" \
     --host="192.168.1.10" \
-    --device_names="eth0" \
+    --device_names="mlx5_0" \
     --port=50052 \
     --protocol="rdma" \
+    --metadata_server="P2PHANDSHAKE" \
+    --global_segment_size="4GB" \
+    --enable_offload="true"
+```
+
+(ssd-offload-two-node-example)=
+
+### Two-node example
+
+Suppose Node A (`192.168.1.10`) runs the master and a real client, and Node B (`192.168.1.11`) runs a second real client. Both real clients must point to the same master and advertise their own externally reachable IP (not `127.0.0.1`):
+
+```bash
+# Node A — runs the master and its own real client (--host is Node A's reachable IP)
+mooncake_master --rpc_port=50051 --enable_offload=true &
+
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
+mooncake_client \
+    --master_server_address="192.168.1.10:50051" \
+    --host="192.168.1.10" \
+    --device_names="mlx5_0" \
+    --protocol="rdma" \
+    --metadata_server="P2PHANDSHAKE" \
+    --port=50052 \
+    --global_segment_size="4GB" \
+    --enable_offload="true"
+```
+
+```bash
+# Node B — real client only; points to the master on Node A (--host is Node B's reachable IP)
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
+mooncake_client \
+    --master_server_address="192.168.1.10:50051" \
+    --host="192.168.1.11" \
+    --device_names="mlx5_0" \
+    --protocol="rdma" \
+    --metadata_server="P2PHANDSHAKE" \
+    --port=50052 \
     --global_segment_size="4GB" \
     --enable_offload="true"
 ```
@@ -417,43 +482,10 @@ mooncake_client \
 
 ## Notes
 
-- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected. With `bucket_storage_backend` the value may be a comma-separated list of such directories, one per disk; see {ref}`Multiple disks <ssd-offload-multiple-disks>`.
-- Each live Real Client needs its **own** offload directory — with several disks, its own directory on every disk. Sharing one path across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock, which is taken on every configured directory.
-- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
+- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected. For multi-disk paths and per-client directory ownership rules (including `bucket_storage_backend`'s exclusive `flock`), see {ref}`Multiple disks <ssd-offload-multiple-disks>`.
+- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master automatically; `offset_allocator_storage_backend` recovers persisted metadata only when `MOONCAKE_OFFSET_PERSIST_MODE` is `relaxed` or `strict` (default `disabled` truncates the file).
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
-- Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
-
-**2-node example:** suppose Node A (`192.168.1.10`) runs the master and Node B (`192.168.1.11`) is a second worker. Both real clients must point to the same master and advertise their own externally reachable IP:
-
-```bash
-# Node A — runs the master and its own real client
-mooncake_master --rpc_port=50051 --enable_offload=true &
-
-export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
-mooncake_client \
-    --master_server_address="192.168.1.10:50051" \
-    --host="192.168.1.10" \        # externally reachable IP of Node A
-    --device_names="eth0" \
-    --protocol="rdma" \
-    --metadata_server="P2PHANDSHAKE" \
-    --port=50052 \
-    --global_segment_size="4GB" \
-    --enable_offload="true"
-```
-
-```bash
-# Node B — real client only; points to the same master on Node A
-export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
-mooncake_client \
-    --master_server_address="192.168.1.10:50051" \
-    --host="192.168.1.11" \        # externally reachable IP of Node B, NOT 127.0.0.1
-    --device_names="eth0" \
-    --protocol="rdma" \
-    --metadata_server="P2PHANDSHAKE" \
-    --port=50052 \
-    --global_segment_size="4GB" \
-    --enable_offload="true"
-```
+- Each machine requires its own real client process with externally reachable `--host` and `--port`; see {ref}`Two-node example <ssd-offload-two-node-example>` above.
 
 ---
 
@@ -463,7 +495,9 @@ mooncake_client \
 
 - Confirm `--enable_offload=true` is passed to both `mooncake_client` and `mooncake_master`. Both binaries define the same gflags boolean; hyphenated aliases may work, but the underscored spelling matches the source.
 - Check that `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` points to an existing, writable directory. If the path is invalid, real client setup fails during `FileStorageConfig::Validate()`.
-- Verify memory pressure is actually high enough for the master to trigger offload. If the memory pool (`--global_segment_size`) is large relative to the data written, offload may never activate.
+- Check the offload trigger mode: with the default `--offload_on_evict=false`, eligible objects are queued at `PutEnd` without waiting for memory pressure; with `--offload_on_evict=true`, offload runs only when memory eviction selects objects, so a large `--global_segment_size` relative to written data may never trigger eviction.
+- If `--offload_on_evict=true` is set, verify OpLog (`--enable_oplog=true`) is not also enabled on the master — see the warning under [Master Offload Parameters](#master-offload-parameters).
+- In mixed deployments where only some clients enable SSD offload, confirm that objects place at least one DRAM replica on an offload-enabled client: the master queues offload work only to clients that own a source memory replica and does not route objects to a different SSD owner.
 
 ### "Permission denied" or "No such file or directory" on the storage path
 
