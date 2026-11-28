@@ -685,28 +685,6 @@ impl ClassicTeTransport {
         let allocations = self.allocations.lock();
         classic_buffer_location(&allocations, base, length)
     }
-
-    fn rebuild_engine_for_metadata_recovery(&self) -> Result<()> {
-        let allocations = self
-            .allocations
-            .lock()
-            .iter()
-            .map(|(addr, record)| (*addr, record.clone()))
-            .collect::<Vec<_>>();
-        let replacement = ClassicTransferEngine::new(&self.config, &self.segment_name)?;
-        for (addr, record) in &allocations {
-            self.register_memory_with_engine(
-                &replacement,
-                *addr as *mut c_void,
-                record.size,
-                &record.location,
-            )?;
-        }
-        let mut engine = self.engine.write();
-        let previous = std::mem::replace(&mut *engine, replacement);
-        drop(previous);
-        engine.republish_local_metadata()
-    }
 }
 
 fn classic_te_local_server_name(config: &ClassicEngineConfig, segment_name: &str) -> String {
@@ -1063,7 +1041,14 @@ impl StoreTransport for ClassicTeTransport {
     }
 
     fn republish_local_metadata(&self) -> Result<()> {
-        self.rebuild_engine_for_metadata_recovery()
+        // Recovery must preserve registered memory, cached segment handles and
+        // outstanding batches. Replacing the engine invalidates all three.
+        if self.config.uses_p2p_handshake_metadata() {
+            // P2P metadata lives in the engine; there is no external copy to
+            // restore, and the existing handshake listener must stay alive.
+            return Ok(());
+        }
+        self.engine.write().republish_local_metadata()
     }
 
     fn local_segment_descriptor(&self) -> Result<Option<String>> {
@@ -2014,6 +1999,9 @@ pub(crate) fn wait_for_batch_completion_detailed(
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::ffi::c_void;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2029,7 +2017,7 @@ mod tests {
         classic_buffer_location, classic_te_local_server_name, classic_te_published_segment_name,
         format_host_port, parse_rpc_server_address, registration_chunks, system_page_size,
         wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
-        ClassicAllocationOwner, ClassicAllocationRecord, HttpStoreTransport,
+        ClassicAllocationOwner, ClassicAllocationRecord, ClassicTeTransport, HttpStoreTransport,
         HttpTransportServerHandle, StoreTransport,
     };
 
@@ -2407,6 +2395,273 @@ mod tests {
             classic_te_published_segment_name(&redis_config, "logical-segment", "127.0.0.1:17111"),
             "logical-segment"
         );
+    }
+
+    #[test]
+    fn classic_te_p2p_recovery_preserves_endpoint_and_cached_segments() {
+        let transport = ClassicTeTransport::new(
+            ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1"),
+            "recovery-local",
+        )
+        .expect("classic P2P transport should start");
+        let address = transport.rpc_server_address().unwrap();
+        let segment = transport.segment_name().unwrap();
+        let descriptor = r#"{"name":"ignored","protocol":"tcp","tcp_data_port":0,"buffers":[{"name":"b0","addr":4096,"length":1024}]}"#;
+        transport
+            .cache_remote_segment_descriptor("127.0.0.1:65530", descriptor)
+            .unwrap();
+        let handle = transport.open_segment("127.0.0.1:65530").unwrap();
+        let info = transport.get_segment_info(handle).unwrap();
+
+        for _ in 0..3 {
+            transport.republish_local_metadata().unwrap();
+            assert_eq!(transport.rpc_server_address().unwrap(), address);
+            assert_eq!(transport.segment_name().unwrap(), segment);
+            assert_eq!(transport.get_segment_info(handle).unwrap(), info);
+            assert_eq!(transport.open_segment("127.0.0.1:65530").unwrap(), handle);
+        }
+        transport.close_segment(handle).unwrap();
+    }
+
+    #[test]
+    fn classic_te_p2p_recovery_does_not_reregister_unregistered_memory() {
+        let mut buffer = vec![0u8; 4096];
+        let transport = ClassicTeTransport::new(
+            ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1"),
+            "recovery-unregistered",
+        )
+        .unwrap();
+        let addr = buffer.as_mut_ptr().cast();
+        transport.register_memory(addr, buffer.len()).unwrap();
+        let before: serde_json::Value =
+            serde_json::from_str(&transport.local_segment_descriptor().unwrap().unwrap()).unwrap();
+        assert_eq!(before["buffers"].as_array().unwrap().len(), 1);
+        transport.unregister_memory(addr, buffer.len()).unwrap();
+
+        transport.republish_local_metadata().unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&transport.local_segment_descriptor().unwrap().unwrap()).unwrap();
+        assert!(after["buffers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn classic_te_p2p_recovery_preserves_registered_memory_and_unsubmitted_batch() {
+        let config = ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1");
+        let sender = ClassicTeTransport::new(config.clone(), "recovery-sender").unwrap();
+        let receiver = ClassicTeTransport::new(config, "recovery-receiver").unwrap();
+        let sender_address = sender.rpc_server_address().unwrap();
+        let receiver_address = receiver.rpc_server_address().unwrap();
+        let size = 4096;
+        let source = sender.allocate_memory(size, "*").unwrap();
+        let target = receiver.allocate_memory(size, "*").unwrap();
+        sender.register_memory(source, size).unwrap();
+        receiver.register_memory(target, size).unwrap();
+        let segment = receiver.segment_name().unwrap();
+        let handle = sender.open_segment(&segment).unwrap();
+        let info = sender.get_segment_info(handle).unwrap();
+
+        for value in 0..=3u8 {
+            // The batch is allocated but not submitted across recovery. This
+            // tests resource continuity, not recovery during an active transfer.
+            let batch = sender.allocate_batch(1).unwrap();
+            if value > 0 {
+                sender.republish_local_metadata().unwrap();
+                receiver.republish_local_metadata().unwrap();
+            }
+            assert_eq!(sender.rpc_server_address().unwrap(), sender_address);
+            assert_eq!(receiver.rpc_server_address().unwrap(), receiver_address);
+            assert_eq!(sender.get_segment_info(handle).unwrap(), info);
+            unsafe { std::ptr::write_bytes(source.cast::<u8>(), value, size) };
+            sender
+                .submit(
+                    batch,
+                    &[TransferRequest {
+                        opcode: Opcode::Write,
+                        source,
+                        target_id: handle,
+                        target_offset: target as u64,
+                        length: size as u64,
+                    }],
+                )
+                .unwrap();
+            wait_for_batch_completion(&sender, batch, Duration::from_secs(3)).unwrap();
+            sender.free_batch(batch).unwrap();
+            assert!(
+                unsafe { std::slice::from_raw_parts(target.cast::<u8>(), size) }
+                    .iter()
+                    .all(|byte| *byte == value)
+            );
+        }
+
+        sender.close_segment(handle).unwrap();
+        receiver.unregister_memory(target, size).unwrap();
+        sender.unregister_memory(source, size).unwrap();
+        receiver.free_memory(target).unwrap();
+        sender.free_memory(source).unwrap();
+    }
+
+    struct RecoveryRedisServer {
+        child: Option<Child>,
+        address: SocketAddr,
+    }
+
+    impl RecoveryRedisServer {
+        fn new() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            let mut server = Self {
+                child: None,
+                address,
+            };
+            server.start();
+            server
+        }
+
+        fn start(&mut self) {
+            assert!(self.child.is_none());
+            self.child = Some(
+                Command::new("redis-server")
+                    .args([
+                        "--bind",
+                        "127.0.0.1",
+                        "--port",
+                        &self.address.port().to_string(),
+                        "--save",
+                        "",
+                        "--appendonly",
+                        "no",
+                    ])
+                    .current_dir(std::env::temp_dir())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("redis-server is required for recovery validation"),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = self.child.as_mut().unwrap().try_wait().unwrap();
+                assert!(
+                    status.is_none(),
+                    "Redis exited before readiness: {status:?}"
+                );
+                if self
+                    .expect_reply(b"*1\r\n$4\r\nPING\r\n", b"+PONG\r\n")
+                    .is_ok()
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "Redis did not become ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn stop(&mut self) {
+            let child = self.child.as_mut().expect("Redis must be running");
+            child.kill().unwrap();
+            child.wait().unwrap();
+            self.child = None;
+        }
+
+        fn expect_reply(&self, command: &[u8], expected: &[u8]) -> std::io::Result<()> {
+            let timeout = Duration::from_millis(200);
+            let mut stream = TcpStream::connect_timeout(&self.address, timeout)?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            stream.write_all(command)?;
+            let mut reply = vec![0; expected.len()];
+            stream.read_exact(&mut reply)?;
+            if reply != expected {
+                return Err(std::io::Error::other("unexpected Redis response"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for RecoveryRedisServer {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn classic_te_redis_recovery_republishes_metadata_and_preserves_resources() {
+        // Own the Redis process: restart without persistence to lose metadata,
+        // and keep buffers alive until both engines have been dropped on panic.
+        let mut redis = RecoveryRedisServer::new();
+        let mut source = vec![0u8; 4096];
+        let mut target = vec![0u8; source.len()];
+        let config = ClassicEngineConfig::new(format!("redis://{}", redis.address), "127.0.0.1");
+        let sender = ClassicTeTransport::new(config.clone(), "recovery-redis-sender").unwrap();
+        let receiver = ClassicTeTransport::new(config.clone(), "recovery-redis-receiver").unwrap();
+        let sender_address = sender.rpc_server_address().unwrap();
+        let receiver_address = receiver.rpc_server_address().unwrap();
+        let source_addr = source.as_mut_ptr().cast();
+        let target_addr = target.as_mut_ptr().cast();
+        sender.register_memory(source_addr, source.len()).unwrap();
+        receiver.register_memory(target_addr, target.len()).unwrap();
+        let segment = receiver.segment_name().unwrap();
+        let handle = sender.open_segment(&segment).unwrap();
+        let info = sender.get_segment_info(handle).unwrap();
+
+        for cycle in 0..=3u8 {
+            // Allocate before recovery; submission happens after it completes.
+            let batch = sender.allocate_batch(1).unwrap();
+            if cycle > 0 {
+                redis.stop();
+                assert!(
+                    sender.republish_local_metadata().is_err(),
+                    "publication during the outage must fail"
+                );
+                redis.start();
+                redis
+                    .expect_reply(b"*1\r\n$6\r\nDBSIZE\r\n", b":0\r\n")
+                    .unwrap();
+                sender.republish_local_metadata().unwrap();
+                receiver.republish_local_metadata().unwrap();
+
+                // An engine without cached descriptors must discover the
+                // republished registration from the restarted Redis server.
+                let observer = ClassicTeTransport::new(
+                    config.clone(),
+                    &format!("recovery-redis-observer-{cycle}"),
+                )
+                .unwrap();
+                let observed = observer.open_segment(&segment).unwrap();
+                assert_eq!(observer.get_segment_info(observed).unwrap(), info);
+                observer.close_segment(observed).unwrap();
+            }
+            assert_eq!(sender.rpc_server_address().unwrap(), sender_address);
+            assert_eq!(receiver.rpc_server_address().unwrap(), receiver_address);
+            assert_eq!(sender.get_segment_info(handle).unwrap(), info);
+            assert_eq!(sender.open_segment(&segment).unwrap(), handle);
+            source.fill(cycle + 1);
+            sender
+                .submit(
+                    batch,
+                    &[TransferRequest {
+                        opcode: Opcode::Write,
+                        source: source_addr,
+                        target_id: handle,
+                        target_offset: target_addr as u64,
+                        length: source.len() as u64,
+                    }],
+                )
+                .unwrap();
+            wait_for_batch_completion(&sender, batch, Duration::from_secs(3)).unwrap();
+            sender.free_batch(batch).unwrap();
+            assert_eq!(target, source, "content mismatch in recovery cycle {cycle}");
+        }
+
+        sender.close_segment(handle).unwrap();
+        receiver
+            .unregister_memory(target_addr, target.len())
+            .unwrap();
+        sender.unregister_memory(source_addr, source.len()).unwrap();
     }
 
     #[test]
