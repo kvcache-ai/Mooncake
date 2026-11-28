@@ -833,7 +833,9 @@ complete. A nonempty name clears completed replicas on that segment.
 :maxdepth: 1
 
 metadata-management
+high-availability
 ssd-offload
+ssd-prefetch
 immutable-dfs-bucket-allocator
 ssd-free-ratio-first-allocation
 nvme-kv-backend
