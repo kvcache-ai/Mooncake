@@ -70,6 +70,13 @@ class TpuPjrtShim {
     // NUMA node closest to TPU device `index`, or -1 if unknown.
     int deviceNumaNode(int index) const;
 
+    // Registers page-aligned host memory with the TPU DMA engine. On failure
+    // the memory still works for copies, only slower.
+    Status dmaMap(void *host, size_t length) const;
+
+    // Undoes a successful dmaMap of the range starting at `host`.
+    Status dmaUnmap(void *host) const;
+
    private:
     TpuPjrtShim();
     ~TpuPjrtShim();
@@ -89,6 +96,8 @@ class TpuPjrtShim {
     int (*fn_copy_h2d_)(void *, const void *, size_t) = nullptr;
     int (*fn_device_count_)() = nullptr;
     int (*fn_device_numa_)(int) = nullptr;
+    int (*fn_dma_map_)(void *, size_t) = nullptr;
+    int (*fn_dma_unmap_)(void *) = nullptr;
 };
 
 }  // namespace tent

@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "mock_tpu_env.h"
@@ -52,6 +53,11 @@ class TransferEngineImplTestPeer {
     }
     static tent::Status stopStaging(tent::TransferEngineImpl& engine) {
         return engine.staging_proxy_->deconstruct();
+    }
+    static std::pair<size_t, size_t> stagingWorkersAndChunks(
+        tent::TransferEngineImpl& engine) {
+        return {engine.staging_proxy_->worker_count_,
+                engine.staging_proxy_->chunk_count_};
     }
     static tent::Status sweep(tent::TransferEngineImpl& engine) {
         return engine.lazyFreeBatch();
@@ -145,6 +151,7 @@ class TpuAdapterEngineTest : public ::testing::TestWithParam<Params> {
     void TearDown() override {
         env().setFailCopies(false);
         env().setDeviceAlignment(0);
+        env().setFailDmaMap(false);
         // Stop staging while transports and registrations are still alive.
         for (auto* engine : {a_.get(), b_.get()}) {
             if (!engine) continue;
@@ -449,6 +456,49 @@ TEST_P(TpuAdapterEngineTest, BatchOfRequestsAcrossManyBuffers) {
     }
 }
 
+// Each request needs every pool slot; concurrent ones wait instead of failing.
+TEST_P(TpuAdapterEngineTest, BatchLargerThanTheStagePoolWaitsForBuffers) {
+    constexpr int kRequests = 3;
+    std::vector<Side> local, peer;
+    for (int i = 0; i < kRequests; ++i) {
+        local.push_back(tpu(*a_, kLength));
+        peer.push_back(tpu(*b_, kLength));
+    }
+    for (auto op : {Request::WRITE, Request::READ}) {
+        SCOPED_TRACE(op == Request::WRITE ? "WRITE" : "READ");
+        auto& src = op == Request::WRITE ? local : peer;
+        auto& dst = op == Request::WRITE ? peer : local;
+        std::vector<Request> requests;
+        std::vector<std::vector<uint8_t>> expected;
+        for (int i = 0; i < kRequests; ++i) {
+            expected.push_back(pattern(kLength, ++seed_));
+            std::memcpy(src[i].bytes, expected.back().data(), kLength);
+            std::memset(dst[i].bytes, kGuard, kLength);
+            requests.push_back(request(op, local[i], 0, peer[i], 0, kLength));
+        }
+        auto status = run(requests);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kRequests * kLength);
+        for (int i = 0; i < kRequests; ++i) {
+            EXPECT_EQ(0, std::memcmp(dst[i].bytes, expected[i].data(), kLength))
+                << "request " << i;
+        }
+    }
+    expectIdle();
+}
+
+TEST_P(TpuAdapterEngineTest, OnlyEnginesWithTpuTransportGetMoreStaging) {
+    auto host_config = config();
+    host_config->set("transports/tpu/enable", false);
+    TransferEngineImpl tpu_engine(config()), host_engine(host_config);
+    ASSERT_TRUE(tpu_engine.available());
+    ASSERT_TRUE(host_engine.available());
+    EXPECT_EQ(TransferEngineImplTestPeer::stagingWorkersAndChunks(tpu_engine),
+              std::make_pair(size_t{32}, size_t{256}));
+    EXPECT_EQ(TransferEngineImplTestPeer::stagingWorkersAndChunks(host_engine),
+              std::make_pair(size_t{8}, size_t{64}));
+}
+
 TEST_P(TpuAdapterEngineTest, ProviderCopyFailureFailsThenRecovers) {
     Side local = tpu(*a_, kLength);
     Side peer = tpu(*b_, kLength);
@@ -483,6 +533,69 @@ TEST_P(TpuAdapterEngineTest, UnregisterReleasesProviderHandles) {
     EXPECT_FALSE(env().unregister(buffer));
 
     roundTrip(tpu(*a_, kLength), peer, kLength);
+}
+
+TEST_P(TpuAdapterEngineTest, StagingPoolsAreDmaMappedWhileStaging) {
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    // User host memory (even when page aligned) must never be DMA-mapped.
+    Side user_host = host(*a_, 4 * kChunk);
+    ASSERT_NE(user_host.addr, nullptr);
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_GT(env().dmaMappingCount(), mappings);
+    EXPECT_EQ(env().unmappedCopyCount(), unmapped_copies);
+
+    for (auto* engine : {a_.get(), b_.get()})
+        ASSERT_TRUE(TransferEngineImplTestPeer::stopStaging(*engine).ok());
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+}
+
+TEST_P(TpuAdapterEngineTest, StagesWhenDmaMappingFails) {
+    env().setFailDmaMap(true);
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+    EXPECT_GT(env().unmappedCopyCount(), unmapped_copies);
+}
+
+TEST_P(TpuAdapterEngineTest, DmaUnmapMatchesInternalBufferRange) {
+    void* addr = nullptr;
+    MemoryOptions alloc_opts;
+    alloc_opts.location = "cpu:0";
+    ASSERT_TRUE(a_->allocateLocalMemory(&addr, 2 * kChunk, alloc_opts).ok());
+    allocations_.push_back({a_.get(), addr});
+
+    const int before = env().dmaMappingCount();
+
+    // Unaligned internal registration is skipped rather than failing.
+    // allocateLocalMemory() fills alloc_opts.type with the allocator transport,
+    // so build fresh options with UNSPEC to register across all transports.
+    MemoryOptions internal_opts;
+    internal_opts.location = "cpu:0";
+    internal_opts.internal = true;
+    ASSERT_TRUE(
+        a_->registerLocalMemory({addr}, {kChunk + 3}, internal_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before);
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, kChunk + 3).ok());
+
+    // Register a mapped internal range and a non-internal range at the same
+    // base address; removing the latter must not unmap the live internal range.
+    MemoryOptions user_opts;
+    user_opts.location = "cpu:0";
+    ASSERT_TRUE(
+        a_->registerLocalMemory({addr}, {2 * kChunk}, internal_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+    ASSERT_TRUE(a_->registerLocalMemory({addr}, {kChunk}, user_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, kChunk).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, 2 * kChunk).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before);
 }
 
 INSTANTIATE_TEST_SUITE_P(

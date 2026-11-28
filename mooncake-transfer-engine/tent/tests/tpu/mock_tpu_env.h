@@ -75,9 +75,16 @@ class MockTpuEnv {
             provider, "mock_provider_set_device_alignment");
         rejected_count_ =
             sym<int (*)()>(provider, "mock_provider_rejected_count");
+        set_fail_dma_map_ =
+            sym<void (*)(int)>(provider, "mock_provider_set_fail_dma_map");
+        dma_mapping_count_ =
+            sym<int (*)()>(provider, "mock_provider_dma_mapping_count");
+        unmapped_copy_count_ =
+            sym<int (*)()>(provider, "mock_provider_unmapped_copy_count");
         if (!load_provider_ || !register_ || !unregister_ || !create_ ||
             !data_ || !live_count_ || !set_fail_copies_ ||
-            !set_device_alignment_ || !rejected_count_) {
+            !set_device_alignment_ || !rejected_count_ || !set_fail_dma_map_ ||
+            !dma_mapping_count_ || !unmapped_copy_count_) {
             *error = "adapter or mock provider is missing a symbol";
             return false;
         }
@@ -117,6 +124,9 @@ class MockTpuEnv {
         set_device_alignment_(alignment);
     }
     int rejectedCount() const { return rejected_count_(); }
+    void setFailDmaMap(bool fail) { set_fail_dma_map_(fail ? 1 : 0); }
+    int dmaMappingCount() const { return dma_mapping_count_(); }
+    int unmappedCopyCount() const { return unmapped_copy_count_(); }
 
    private:
     template <typename Fn>
@@ -134,6 +144,9 @@ class MockTpuEnv {
     void (*set_fail_copies_)(int) = nullptr;
     void (*set_device_alignment_)(size_t) = nullptr;
     int (*rejected_count_)() = nullptr;
+    void (*set_fail_dma_map_)(int) = nullptr;
+    int (*dma_mapping_count_)() = nullptr;
+    int (*unmapped_copy_count_)() = nullptr;
 };
 
 }  // namespace tent

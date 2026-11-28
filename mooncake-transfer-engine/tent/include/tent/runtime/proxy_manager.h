@@ -27,9 +27,11 @@
 // Beta version -- use with own risk
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 class TransferEngineImpl;
 class TaskInfo;
+struct StagedRoute;
 struct StageBufferCache;
 namespace internal {
 class RemoteStageOperation;
@@ -39,6 +41,8 @@ struct StagingTask {
     TaskInfo* native{nullptr};
     BatchID batch{0};
     std::vector<std::string> params;
+    // Route for the host-to-host hops; null routes each hop by itself.
+    std::shared_ptr<const StagedRoute> route;
 };
 
 class ProxyManager {
@@ -52,14 +56,15 @@ class ProxyManager {
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
                           size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64);
+                          size_t chunk_count = 64, size_t worker_count = 8);
 
     ~ProxyManager();
 
     Status deconstruct();
 
     Status submit(TaskInfo* task, BatchID batch,
-                  const std::vector<std::string>& params);
+                  const std::vector<std::string>& params,
+                  std::shared_ptr<const StagedRoute> route = nullptr);
 
     Status getStatus(TaskInfo* task, TransferStatus& task_status);
 
@@ -70,9 +75,15 @@ class ProxyManager {
    private:
     void runner(size_t id);
 
+    // Pins `count` buffers per staged side, all or none. A full pool makes it
+    // wait while holding none: the other workers share the pool.
+    Status reserveStageBuffers(const StagingTask& task, StageBufferCache* cache,
+                               size_t count, uint64_t* local, uint64_t* remote);
+
     Status transferEventLoop(
         StagingTask& task, StageBufferCache* cache,
-        bool& buffers_safe_to_release, std::vector<BatchID>& undrained_batches,
+        bool& buffers_safe_to_release, bool& suppress_failover,
+        std::vector<BatchID>& undrained_batches,
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
             undrained_remote_operations);
 
@@ -83,6 +94,7 @@ class ProxyManager {
     Status freeStageBuffers(const std::string& location);
 
     BatchID submitCrossStage(const Request& request,
+                             const std::shared_ptr<const StagedRoute>& route,
                              uint64_t local_stage_buffer,
                              uint64_t remote_stage_buffer,
                              uint64_t chunk_length);
@@ -127,7 +139,7 @@ class ProxyManager {
     const std::chrono::milliseconds shutdown_drain_timeout_;
     // Guards the map, not the chunk bitmaps in it: those are atomic_flags and
     // stay lock-free under a shared lock. Exclusive only to insert or erase an
-    // entry, at most once per location. Reached by the kShards staging workers
+    // entry, at most once per location. Reached by the staging workers
     // via StageBufferCache and by the RPC thread via Pin/Unpin.
     mutable std::shared_mutex stage_buffers_mutex_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
@@ -141,9 +153,13 @@ class ProxyManager {
         std::mutex mu;
         std::condition_variable cv;
         std::queue<StagingTask> queue;
+        // Tasks queued on or running in this worker.
+        std::atomic<size_t> pending{0};
     };
-    const static size_t kShards = 8;
-    WorkerShard shards_[kShards];
+    const size_t worker_count_;
+    std::unique_ptr<WorkerShard[]> shards_;
+
+    friend class ::mooncake::TransferEngineImplTestPeer;
 };
 }  // namespace tent
 }  // namespace mooncake

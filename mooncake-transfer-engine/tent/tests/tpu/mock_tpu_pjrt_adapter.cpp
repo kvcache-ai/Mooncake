@@ -120,6 +120,11 @@ int mc_tpu_pjrt_device_numa(int index) {
     return index % 2;
 }
 
+// The mock copies with memcpy, so host memory needs no DMA mapping.
+int mc_tpu_pjrt_dma_map(void *, size_t) { return 0; }
+
+int mc_tpu_pjrt_dma_unmap(void *) { return 0; }
+
 // --- Test-only helpers (not part of the shim ABI) --------------------------
 
 // Creates a fake device buffer of `size` bytes on device `index` and returns

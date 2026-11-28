@@ -15,7 +15,7 @@
 // C ABI between Mooncake's built-in TPU adapter (libmooncake_tpu_pjrt.so, see
 // tent/plugins/tpu) and a TPU BUFFER PROVIDER: the library that owns the
 // framework-side device buffers and performs the actual HBM<->host DMA, e.g.
-// google/tpu-sync for JAX arrays.
+// google/tpu-sync for PyTorch (TorchTPU) tensors and JAX arrays.
 //
 // Reaching a framework's device buffers needs framework internals (for JAX,
 // jaxlib and XLA headers of the installed version), which Mooncake does not
@@ -78,13 +78,28 @@ typedef struct mc_tpu_buffer_provider {
 
     // Drops the adapter's reference to `buffer`.
     void (*release)(mc_tpu_buffer_t buffer);
+
+    // Optional pair (set both or leave both null).
+    // Registers host memory [host, host + len) with the TPU DMA engine (for
+    // PJRT, PjRtClient::DmaMap) so copies to and from it run as direct DMA.
+    // TENT only passes page-aligned, non-empty host staging pools. Providers
+    // must still reject overlapping or unsupported ranges and return non-zero
+    // on failure (TENT then uses the memory unmapped, with slower copies).
+    int (*dma_map)(void *host, size_t len);
+
+    // Undoes a successful dma_map of the range at `host`, once every copy
+    // using it has returned. Return 0 on success, non-zero on failure.
+    int (*dma_unmap)(void *host);
 } mc_tpu_buffer_provider_t;
 
 // Entry point signature exported by TPU buffer provider plugins
 // (MC_TPU_BUFFER_PROVIDER_ENTRY).
 //
 // Mooncake resolves this function via dlsym() after dlopen()ing the plugin
-// shared library to populate `*out` with the provider's callback table.
+// shared library to populate `*out` (zero-initialized by the adapter) with the
+// provider's callback table. `size`, `device_index`, `numa_node`,
+// `copy_to_host`, `copy_from_host`, and `release` must be non-null; `dma_map`
+// and `dma_unmap` are optional as a pair.
 //
 // Returns 0 on success, non-zero on failure.
 typedef int (*mc_tpu_buffer_provider_get_fn)(mc_tpu_buffer_provider_t *out);

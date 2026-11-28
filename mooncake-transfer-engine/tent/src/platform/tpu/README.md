@@ -29,10 +29,16 @@ double-buffering, staging-buffer lifecycle, and async status tracking.
 |------|------|
 | `tpu_platform.cpp` (`TpuPlatform`) | Derives `CpuPlatform`. Host DRAM + NIC topology are inherited (RDMA NICs if present, otherwise just host NUMA nodes for TCP); only the TPU-device-aware paths are overridden (`copy`, `getMemoryType`, `getLocation`, and one `MemEntry` per device in `probe`). |
 | `tpu_pjrt_shim.cpp` (`TpuPjrtShim`) | Isolates all PJRT dependency. Resolves the device-copy adapter at runtime via `dlopen`. |
-| `../../transport/tpu/tpu_transport.cpp` (`TpuTransport`) | The local HBM↔host staging executor. Advertises only `gpu_to_dram` / `dram_to_gpu`; runs the copy via `Platform::copy` for `LOCAL_SEGMENT_ID` requests. |
+| `../../transport/tpu/tpu_transport.cpp` (`TpuTransport`) | The local HBM↔host staging executor. Advertises only `gpu_to_dram` / `dram_to_gpu`; runs the copy via `Platform::copy` for `LOCAL_SEGMENT_ID` requests, on a pool of `transports/tpu/max_concurrent_tasks` threads (default 4). |
 
-The staging policy that ties these together lives in
-`TransferEngineImpl::findStagingPolicy` (case "TPU").
+The staging policy that ties these together is planned in
+`TransferEngineImpl::getTransportType` (before transport selection) using the
+shared TPU/XPU/MLU case in `TransferEngineImpl::findStagingPolicy`.
+
+Each process copies only its own HBM. The initiator stages its local TPU side
+through its `TpuTransport` and delegates the peer's TPU side to the peer, so a
+host-only initiator, even one built without `USE_TPU`, can read and write a
+peer's TPU memory. A local TPU side without a local `TpuTransport` is refused.
 
 ## The device-copy adapter (runtime dependency)
 
@@ -48,6 +54,8 @@ int mc_tpu_pjrt_copy_d2h(void *host_dst, const void *device_src, size_t len);
 int mc_tpu_pjrt_copy_h2d(void *device_dst, const void *host_src, size_t len);
 int mc_tpu_pjrt_device_count(void);
 int mc_tpu_pjrt_device_numa(int index);
+int mc_tpu_pjrt_dma_map(void *host, size_t len);
+int mc_tpu_pjrt_dma_unmap(void *host);
 ```
 
 - **Discovery:** the library path defaults to `libmooncake_tpu_pjrt.so` and can
@@ -76,10 +84,20 @@ A mock adapter and unit tests that exercise this ABI on any Linux host live in
 backed by shadow storage, so a copy that bypasses the adapter yields `0xDD`
 rather than accidentally producing the right answer.
 
+## DMA-mapped staging pools
+
+HBM↔host copies through host memory that the TPU runtime has not DMA-mapped
+are slower, and their speed depends on the host page size. `TpuTransport`
+therefore DMA-maps every host staging pool that TENT registers
+(`MemoryOptions::internal`) through `mc_tpu_pjrt_dma_map`, and unmaps it when
+the pool is unregistered. Both the shim symbols and the provider's
+`dma_map`/`dma_unmap` callbacks are optional pairs; the built-in adapter
+forwards both calls to the buffer provider (implemented in tpu-sync with
+`PjRtClient::DmaMap`/`DmaUnmap` for both PyTorch and JAX).
+
 ## Not yet included (follow-ups)
 
 - Serving-framework (JAX / PyTorch-XLA) integration that registers TPU buffers.
-- DMA-mapped (pinned) staging buffers for true async device DMA, and the
-  interaction between device DMA-mapping and RDMA memory registration on the
-  same host buffer.
+- Testing DMA-mapped staging pools that are also RDMA-registered: both pin the
+  same host pages, and so far only TCP and HP TCP carried the host-to-host hop.
 - Benchmarks on real TPU hardware.

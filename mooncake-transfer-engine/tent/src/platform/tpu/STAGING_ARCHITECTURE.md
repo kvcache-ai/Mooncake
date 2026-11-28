@@ -42,13 +42,16 @@ Follow one transfer from the top:
 1. **Submit** → `TransferEngineImpl::submitTransfer` → `prepareSubmit`
    (`src/runtime/transfer_engine_impl.cpp`).
 
-2. **Should this be staged?** For each request, `prepareSubmit` calls
-   [`findStagingPolicy`](../../runtime/transfer_engine_impl.cpp) (defined at
-   `transfer_engine_impl.cpp:1278`). It returns a 3-element plan
+2. **Should this be staged?** While routing each request, `getTransportType`
+   checks whether either side is TPU memory on a peer segment. If so it calls
+   [`findStagingPolicy`](../../runtime/transfer_engine_impl.cpp) *before*
+   selecting a transport. It returns a 3-element plan
    `[server, local_stage_location, remote_stage_location]`; empty entries mean
-   "no staging on that side". Then:
+   "no staging on that side". The network hop is then selected only among
+   host-to-host transports (RDMA, FABRIC, TCP, HP TCP), and the plan travels
+   with the route. Then:
    ```cpp
-   owner.staging = !owner.staging_params.empty() && staging_proxy_;  // ~line 1401
+   owner.staging = !owner.staging_params.empty() && staging_proxy_;
    ```
 
 3. **If staged**, the task is handed to the proxy instead of a transport:
@@ -75,6 +78,8 @@ Follow one transfer from the top:
    ```cpp
    status = Platform::getLoader().copy(dst, src, length);  // :122 / :126
    ```
+   For the HBM↔host stages, `TpuTransport` is listed ahead of the network
+   transports on every buffer, so it wins over TCP's device-copy fallback.
 
 So the real device-copy seam is **`Platform::copy`**
 (`CudaPlatform::copy` does `cudaMemcpyAsync`; `TpuPlatform::copy` will call the
@@ -113,14 +118,20 @@ Now look at who advertises what:
 | `RdmaTransport` | `dram_to_dram`; adds `gpu_*` **only if `nvidia_peermem` is loaded** (CUDA GPUDirect) | `rdma_transport.cpp` `install` |
 | `ShmTransport` | `dram_to_dram` **only** | `shm_transport.cpp` `install` |
 | `NvlinkTransport` | `dram_to_gpu` / `gpu_to_dram` / `gpu_to_gpu` (CUDA) | `nvlink_transport.cpp` `install` |
+| `TcpTransport` | `dram_to_dram`, `dram_to_gpu`; adds `gpu_to_dram` / `gpu_to_gpu` on **any non-CPU platform**, because its RPC data path copies device memory through `Platform::copy` on each end | `tcp_transport.cpp` `install` |
 
-On a TPU host there is **no transport that advertises `gpu_to_dram`**:
+On a TPU host, no *direct* transport can do the HBM↔host local stage:
 - `ShmTransport` = `dram_to_dram` only.
 - `RdmaTransport` won't set `gpu_to_dram` (no `nvidia_peermem`), and it *couldn't*
   DMA out of HBM anyway.
+- `TcpTransport` claims `gpu_*`, but only as an unpipelined RPC fallback, and it
+  is absent when standard TCP is disabled (e.g. RDMA- or HP-TCP-only hosts).
+  This is why TPU staging is planned before transport selection (step 2)
+  rather than inferred from whichever transport the selector picks.
 
 **Therefore, without a new transport, the TPU local-stage sub-transfer has no
-route, and it fails — even though `TpuPlatform::copy` exists and could do the
+route when standard TCP is disabled, and otherwise falls back to TCP's
+unpipelined RPC copy — even though `TpuPlatform::copy` exists and could do the
 copy.** `findStagingPolicy` would also have nothing to hang the policy on.
 
 This is the answer to "why not just one branch": the copy *mechanism* is a clean
@@ -145,7 +156,7 @@ host↔host hop is still RDMA/TCP.
 | Local device copy primitive | `TpuPlatform::copy` → PJRT adapter (the clean seam) | `src/platform/tpu/tpu_platform.cpp` |
 | A transport that *advertises* `gpu_to_dram`/`dram_to_gpu` so routing can pick the copy | thin `TpuTransport` | `src/transport/tpu/tpu_transport.cpp` |
 | Teach the capability checks that TPU is a device type | add `MTYPE_TPU` to `isGpuType` **and** the selector's `is_gpu` lambda | `transfer_engine_impl.cpp:880`, `transport_selector.cpp:337` |
-| Decide to stage TPU transfers | `findStagingPolicy` TPU case | `transfer_engine_impl.cpp:1278` |
+| Decide to stage TPU transfers | detect a TPU side in `getTransportType` and plan staging up front; TPU shares the TPU/XPU/MLU case in `findStagingPolicy` | `transfer_engine_impl.cpp` |
 
 Note the **two** capability helpers (line 880 and 337): there are two routing
 modes (selector = default, legacy), each with its own device-type predicate.
@@ -160,8 +171,9 @@ both paths.
 TENT's `ProxyManager` already implements the staged-DRAM pipeline, and
 `Platform::copy` is a clean place to plug in a PJRT device copy. But a staged
 sub-transfer is still *routed*, and routing only selects a transport that
-*advertises* the matching capability. No existing transport advertises
-`device↔host` on a TPU host, so the copy would never be reached. `TpuTransport`
+*advertises* the matching capability. Without a new transport, the TPU local
+stage has no route when standard TCP is disabled, and otherwise falls back to
+TCP's unpipelined RPC copy. `TpuTransport`
 exists solely to answer that capability query and dispatch to `Platform::copy`;
 it is the unavoidable "interface tax" of participating in TENT's transport
 system, and it accounts for most of the non-test, non-doc line count in this

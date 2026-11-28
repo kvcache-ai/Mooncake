@@ -79,6 +79,17 @@ int mc_tpu_pjrt_device_count(void);
 // NUMA node closest to device `index`, or -1 if unknown.
 int mc_tpu_pjrt_device_numa(int index);
 
+// Optional pair: if either symbol is absent, TENT still loads the adapter and
+// runs staging copies through unmapped host memory.
+// Registers page-aligned host memory [host, host + len) with the TPU DMA
+// engine so device copies to and from it run as direct DMA. Returns 0 on
+// success, non-zero on failure (the memory still works, with slower copies).
+int mc_tpu_pjrt_dma_map(void *host, size_t len);
+
+// Undoes a successful mc_tpu_pjrt_dma_map of the range starting at `host`,
+// once no copy uses it. Returns 0 on success, non-zero on failure.
+int mc_tpu_pjrt_dma_unmap(void *host);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
