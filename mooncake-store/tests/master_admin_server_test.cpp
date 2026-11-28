@@ -82,6 +82,31 @@ class DfsAdminEnvironment {
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
 };
 
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(std::string key, const char* value) : key_(std::move(key)) {
+        const char* previous = ::getenv(key_.c_str());
+        if (previous) previous_ = previous;
+        if (value) {
+            ::setenv(key_.c_str(), value, 1);
+        } else {
+            ::unsetenv(key_.c_str());
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_) {
+            ::setenv(key_.c_str(), previous_->c_str(), 1);
+        } else {
+            ::unsetenv(key_.c_str());
+        }
+    }
+
+   private:
+    std::string key_;
+    std::optional<std::string> previous_;
+};
+
 // Queue filesystem work deterministically without adding a production test
 // hook. HTTP uses its own pool, so it must remain responsive while this pool
 // is held. Release before destroying futures that may await queued work.
@@ -221,6 +246,14 @@ class MasterAdminServerTest : public ::testing::Test {
 
     HttpResponse HttpGet(int port, const std::string& path) {
         coro_http::coro_http_client client;
+        auto result = client.get(BaseUrl(port) + path);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpGetWithAuthorization(int port, const std::string& path,
+                                          const std::string& authorization) {
+        coro_http::coro_http_client client;
+        client.add_header("Authorization", authorization);
         auto result = client.get(BaseUrl(port) + path);
         return {result.status, std::string(result.resp_body)};
     }
@@ -764,6 +797,58 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(drain_cancel.http_status, 503);
 
     admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, KeyInspectionRoutesRequireAdminTokenWhenSet) {
+    ScopedEnvVar token("MC_MASTER_ADMIN_TOKEN", "s3cret-admin-token");
+    ScopedEnvVar insecure("MC_MASTER_ADMIN_ALLOW_INSECURE", nullptr);
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    const std::vector<std::string> paths = {
+        "/get_all_keys", "/query_key?key=foo", "/batch_query_keys?keys=foo"};
+    for (const auto& path : paths) {
+        SCOPED_TRACE(path);
+        EXPECT_EQ(HttpGet(port, path).http_status, 401);
+        EXPECT_EQ(HttpGetWithAuthorization(port, path, "Bearer wrong-token")
+                      .http_status,
+                  401);
+        EXPECT_EQ(HttpGetWithAuthorization(port, path, "s3cret-admin-token")
+                      .http_status,
+                  401);
+        // A valid token passes authorization and reaches service-plane
+        // gating, which rejects with 503 on a standby master.
+        EXPECT_EQ(
+            HttpGetWithAuthorization(port, path, "Bearer s3cret-admin-token")
+                .http_status,
+            503);
+        EXPECT_EQ(
+            HttpGetWithAuthorization(port, path, "bearer s3cret-admin-token")
+                .http_status,
+            503);
+    }
+
+    // Monitoring and health endpoints stay unauthenticated.
+    EXPECT_NE(HttpGet(port, "/health").http_status, 401);
+    EXPECT_EQ(HttpGet(port, "/metrics").http_status, 200);
+
+    admin.Stop();
+}
+
+TEST(MasterAdminServerAuthTest, IsLoopbackRemoteAddress) {
+    EXPECT_TRUE(MasterAdminServer::IsLoopbackRemoteAddress("127.0.0.1:5000"));
+    EXPECT_TRUE(MasterAdminServer::IsLoopbackRemoteAddress("127.1.2.3:1"));
+    EXPECT_TRUE(MasterAdminServer::IsLoopbackRemoteAddress("::1:5000"));
+    EXPECT_TRUE(
+        MasterAdminServer::IsLoopbackRemoteAddress("::ffff:127.0.0.1:5000"));
+    EXPECT_FALSE(
+        MasterAdminServer::IsLoopbackRemoteAddress("::ffff:10.0.0.1:5000"));
+    EXPECT_FALSE(MasterAdminServer::IsLoopbackRemoteAddress("10.0.0.1:5000"));
+    EXPECT_FALSE(MasterAdminServer::IsLoopbackRemoteAddress("0.0.0.0:5000"));
+    EXPECT_FALSE(MasterAdminServer::IsLoopbackRemoteAddress(""));
+    EXPECT_FALSE(MasterAdminServer::IsLoopbackRemoteAddress("not-an-ip:1"));
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
