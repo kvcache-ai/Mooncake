@@ -532,9 +532,18 @@ class ActiveEndpointSetupExecutor {
             rejected.set_value(ERR_SOCKET);
             return rejected.get_future();
         }
-        // One RPC per server; an invalid future defers admission without
-        // queuing.
+        // One RPC per server, and at most half of the slots per host, so the
+        // engines of one hung machine cannot occupy every slot and starve
+        // new connections to healthy peers. An invalid future defers
+        // admission without queuing.
         if (in_flight_.size() >= workers_.size() || in_flight_.count(server))
+            return {};
+        auto host = getHostNameWithoutPort(server);
+        // The in-flight set is bounded by the executor's eight threads.
+        const size_t host_in_flight = std::count_if(
+            in_flight_.begin(), in_flight_.end(),
+            [&host](const auto &entry) { return entry.second == host; });
+        if (host_in_flight >= std::max<size_t>(1, workers_.size() / 2))
             return {};
         std::packaged_task<int()> task([this, operation = std::move(operation),
                                         server, exception_error]() mutable {
@@ -551,7 +560,7 @@ class ActiveEndpointSetupExecutor {
             return ret;
         });
         auto future = task.get_future();
-        in_flight_.insert(server);
+        in_flight_.emplace(server, std::move(host));
         try {
             tasks_.emplace(std::move(task));
         } catch (...) {
@@ -593,7 +602,8 @@ class ActiveEndpointSetupExecutor {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool running_;
-    std::unordered_set<std::string> in_flight_;
+    // Server name -> host name, for admission by either key.
+    std::unordered_map<std::string, std::string> in_flight_;
 };
 
 static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {

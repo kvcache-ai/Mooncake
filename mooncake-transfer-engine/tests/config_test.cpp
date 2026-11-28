@@ -337,6 +337,39 @@ TEST_F(ConnPauseTtlEnvTest, NonNumericKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 13);
 }
 
+// MC_HANDSHAKE_READ_TIMEOUT bounds how long an outbound handshake-port request
+// waits for the peer's reply (SO_RCVTIMEO). The default keeps the previous
+// hardcoded 60 seconds; invalid values preserve the current setting.
+class HandshakeReadTimeoutEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_HANDSHAKE_READ_TIMEOUT"); }
+};
+
+TEST_F(HandshakeReadTimeoutEnvTest, DefaultIsSixtySecondsWhenUnset) {
+    ::unsetenv("MC_HANDSHAKE_READ_TIMEOUT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.handshake_read_timeout, 60);
+}
+
+TEST_F(HandshakeReadTimeoutEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_HANDSHAKE_READ_TIMEOUT", "15", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.handshake_read_timeout, 15);
+}
+
+TEST_F(HandshakeReadTimeoutEnvTest, InvalidValuesAreIgnored) {
+    for (const char* value :
+         {"0", "-1", "3600", "abc", "15s", "999999999999999999999"}) {
+        ASSERT_EQ(::setenv("MC_HANDSHAKE_READ_TIMEOUT", value, 1), 0);
+        GlobalConfig config;
+        config.handshake_read_timeout = 17;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.handshake_read_timeout, 17) << value;
+    }
+}
+
 TEST_F(ConnPauseTtlEnvTest, NumericSuffixKeepsDefault) {
     ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000s", 1), 0);
     GlobalConfig config;

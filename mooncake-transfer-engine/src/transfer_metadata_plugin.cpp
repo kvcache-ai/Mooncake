@@ -1227,7 +1227,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
 
         struct timeval timeout;
-        timeout.tv_sec = 60;
+        timeout.tv_sec = globalConfig().handshake_read_timeout;
         timeout.tv_usec = 0;
         if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
