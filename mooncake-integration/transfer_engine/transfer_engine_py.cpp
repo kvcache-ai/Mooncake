@@ -540,8 +540,7 @@ char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        // A failed rollback leaves the engine tracking the buffer.
-        if (!engine_->checkOverlap(buffer, capacity)) freeMemory(buffer);
+        engine_->releaseFailedRegistrationBuffer({buffer, freeMemory});
         return nullptr;
     }
     return (char*)buffer;

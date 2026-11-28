@@ -1258,6 +1258,8 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
+    // Reserve each address while TE and NoF registration run without the lock.
+    std::unordered_set<void *> registering_buffers_;
     struct BufferRegistrationRecord {
         size_t size;
         bool te_released = false;

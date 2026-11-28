@@ -194,6 +194,11 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    using OwnedBuffer = std::unique_ptr<void, void (*)(void*)>;
+    // Takes ownership of an allocation after registerLocalMemory fails. Its
+    // deleter runs immediately unless its base is still pending rollback.
+    void releaseFailedRegistrationBuffer(OwnedBuffer buffer);
+
     // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr

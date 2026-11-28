@@ -1404,6 +1404,11 @@ std::string TransferEngine::showLinks(bool json) const {
 
 namespace mooncake {
 
+void TransferEngine::releaseFailedRegistrationBuffer(OwnedBuffer buffer) {
+    if (!use_tent_ && impl_)
+        impl_->releaseFailedRegistrationBuffer(std::move(buffer));
+}
+
 bool TransferEngine::isBatchSubmitEligible(size_t count) const {
 #ifdef USE_TENT
     if (use_tent_)
