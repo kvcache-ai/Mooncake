@@ -526,6 +526,77 @@ TEST(HipIpcTest, TwoProcessCopies) {
     EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
 }
 
+// Two engines in one process: the target's IPC handle was exported by this
+// process, which HIP cannot reopen, so the copy must use the buffer directly.
+// Once its owner unregisters it, the target must no longer be reachable.
+TEST(HipIpcTest, SameProcessCopies) {
+    if (getenv("MC_HIP_TEST_IPC_TARGET")) GTEST_SKIP();
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 1) GTEST_SKIP() << "Needs a GPU.";
+
+    TransferEngine owner(false), engine(false);
+    ASSERT_EQ(owner.init(P2PHANDSHAKE, "127.0.0.1:17822", "127.0.0.1", 17822),
+              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17823", "127.0.0.1", 17823),
+              0);
+    ASSERT_NE(owner.installTransport("hip", nullptr), nullptr);
+    ASSERT_NE(engine.installTransport("hip", nullptr), nullptr);
+
+    void* target = allocOnDevice(kIpcLen, 0);
+    void* local = allocOnDevice(kIpcLen, 0);
+    void* back = allocOnDevice(kIpcLen, 0);
+    ASSERT_EQ(cudaMemset(target, 0x5A, kIpcLen), cudaSuccess);
+    ASSERT_EQ(cudaMemset(local, 0x3C, kIpcLen), cudaSuccess);
+    ASSERT_EQ(cudaMemset(back, 0, kIpcLen), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(owner.registerLocalMemory(target, kIpcLen, GPU_PREFIX + "0"), 0);
+    for (void* ptr : {local, back}) {
+        ASSERT_EQ(engine.registerLocalMemory(ptr, kIpcLen, GPU_PREFIX + "0"),
+                  0);
+    }
+    auto segment = engine.openSegment(owner.getLocalIpAndPort());
+    ASSERT_GE(segment, 0);
+
+    auto copy = [&](TransferRequest::OpCode op, void* buf) {
+        TransferRequest r;
+        r.opcode = op;
+        r.length = kIpcLen;
+        r.source = buf;
+        r.target_id = segment;
+        r.target_offset = reinterpret_cast<uint64_t>(target);
+        auto batch_id = engine.allocateBatchID(1);
+        TransferStatus status;
+        status.s = TransferStatusEnum::FAILED;
+        if (engine.submitTransfer(batch_id, {r}).ok()) {
+            do {
+                EXPECT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+            } while (status.s == TransferStatusEnum::WAITING);
+        }
+        EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+        return status.s;
+    };
+    auto all = [](void* ptr, uint8_t value) {
+        std::vector<uint8_t> host(kIpcLen);
+        EXPECT_EQ(cudaMemcpy(host.data(), ptr, kIpcLen, cudaMemcpyDefault),
+                  cudaSuccess);
+        return std::all_of(host.begin(), host.end(),
+                           [value](uint8_t b) { return b == value; });
+    };
+    EXPECT_EQ(copy(TransferRequest::READ, back), TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(all(back, 0x5A));
+    EXPECT_EQ(copy(TransferRequest::WRITE, local),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(all(target, 0x3C));
+
+    ASSERT_EQ(owner.unregisterLocalMemory(target), 0);
+    ASSERT_EQ(cudaMemset(back, 0, kIpcLen), cudaSuccess);
+    EXPECT_NE(copy(TransferRequest::READ, back), TransferStatusEnum::COMPLETED);
+
+    for (void* ptr : {local, back}) engine.unregisterLocalMemory(ptr);
+    for (void* ptr : {target, local, back}) (void)cudaFree(ptr);
+}
+
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
