@@ -6,6 +6,7 @@
 #include <future>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -380,6 +381,13 @@ class FileStorage {
         BucketStorageBackend& backend,
         const std::unordered_map<std::string, int64_t>& storage_object_sizes);
 
+    uint64_t RecoveryGeneration();
+
+    tl::expected<void, ErrorCode> NotifyRecoveredObjects(
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas,
+        uint64_t generation);
+
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
     void OnDiskError(int err, const char* op);
@@ -522,6 +530,11 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+    std::atomic<bool> recovery_stopping_{false};
+    // Mutations may run concurrently, but recovery registration excludes them
+    // for one RPC. Eviction/reset invalidates snapshots captured before it.
+    std::shared_mutex recovery_mutex_;
+    std::atomic<uint64_t> recovery_generation_{0};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
     // heartbeat -- which would otherwise re-mount the segment the drain just
     // deregistered -- and aborts an in-flight metadata rescan. Checked at
