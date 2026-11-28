@@ -4888,7 +4888,12 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 append_preferred_segment(preferred_segment);
             }
         }
-        AllocatorManager allocator_snapshot;
+        const bool apply_hca_affinity =
+            StoreHcaAffinityEnabled() &&
+            config.preferred_hca_names.has_value() &&
+            !config.preferred_hca_names->empty();
+        std::shared_ptr<const AllocatorManager> shared_snapshot;
+        std::optional<AllocatorManager> mutable_snapshot;
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
@@ -4922,14 +4927,19 @@ auto MasterService::AllocateReplicas(const std::string& key,
                             << host_ordered_segments.size();
                 }
             }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            if (apply_hca_affinity) {
+                mutable_snapshot.emplace(
+                    allocator_access.SnapshotAllocatorManager());
+            } else {
+                shared_snapshot = allocator_access.GetSharedAllocatorSnapshot();
+            }
         }
 
-        if (StoreHcaAffinityEnabled()) {
-            allocator_snapshot.SetHcaAffinity(
-                config.preferred_hca_names.value_or(
-                    std::vector<std::string>{}));
+        if (mutable_snapshot) {
+            mutable_snapshot->SetHcaAffinity(*config.preferred_hca_names);
         }
+        const AllocatorManager& allocator_snapshot =
+            mutable_snapshot ? *mutable_snapshot : *shared_snapshot;
         auto allocation_result = allocation_strategy_->AllocateForRequest(
             allocator_snapshot, value_length, config, preferred_segments);
 
@@ -4943,10 +4953,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
              allocation_result->size() != config.replica_num)) {
             const auto resolved = AllocationStrategy::ResolvePlacement(config);
             has_enough_memory_segments =
-                allocator_snapshot
-                    .FilterForFabric(resolved ? resolved->fabric_domain
-                                              : std::string{})
-                    .hasEnoughServingNames(config.replica_num);
+                allocator_snapshot.hasEnoughServingNamesForFabric(
+                    config.replica_num,
+                    resolved ? resolved->fabric_domain : std::string{});
         }
 
         if (!allocation_result.has_value()) {
@@ -6018,10 +6027,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // or modifying metadata; callers can explicitly replace
                 // instead.
                 if (metadata.TotalLength() == slice_length) {
-                    AllocatorManager snapshot;
+                    std::shared_ptr<const AllocatorManager> snapshot;
                     {
                         auto access = segment_manager_.getAllocatorAccess();
-                        snapshot = access.SnapshotAllocatorManager();
+                        snapshot = access.GetSharedAllocatorSnapshot();
                     }
                     if (metadata.HasReplica([&](const Replica& replica) {
                             if (!replica.is_completed() ||
@@ -6030,7 +6039,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             for (const auto& name :
                                  replica.get_segment_names()) {
                                 if (name &&
-                                    !snapshot.IsFabricEligible(
+                                    !snapshot->IsFabricEligible(
                                         *name, placement->fabric_domain))
                                     return true;
                             }
@@ -6655,12 +6664,12 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     // locked, so terminal cleanup cannot pass this operation before its
     // metadata changes become visible.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
+    std::shared_ptr<const AllocatorManager> allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         allocator_snapshot =
-            allocator_access.SnapshotAllocatorManager(src_segment);
+            allocator_access.GetSharedAllocatorSnapshot(src_segment);
     }
 
     for (const auto& tgt_segment : tgt_segments) {
@@ -6668,12 +6677,13 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
             // Skip used segments.
             continue;
         }
-        if (!allocator_snapshot.CanCopyWithinFabric(src_segment, tgt_segment)) {
+        if (!allocator_snapshot->CanCopyWithinFabric(src_segment,
+                                                     tgt_segment)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.TotalLength(), tgt_segment);
+            *allocator_snapshot, metadata.TotalLength(), tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -7034,12 +7044,12 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     // be nested under the source executor's guard. The key's lock keeps
     // terminal cleanup ordered after this already-admitted MoveStart.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
+    std::shared_ptr<const AllocatorManager> allocator_snapshot;
     {
         auto access = segment_manager_.getAllocatorAccess();
-        allocator_snapshot = access.SnapshotAllocatorManager(src_segment);
+        allocator_snapshot = access.GetSharedAllocatorSnapshot(src_segment);
     }
-    if (!allocator_snapshot.CanCopyWithinFabric(src_segment, tgt_segment))
+    if (!allocator_snapshot->CanCopyWithinFabric(src_segment, tgt_segment))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     const bool needs_target = target == nullptr;
     if (auto grown = accessor.Grow(
@@ -7049,7 +7059,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     }
     if (needs_target) {
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.TotalLength(), tgt_segment);
+            *allocator_snapshot, metadata.TotalLength(), tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -9279,14 +9289,14 @@ auto MasterService::PromotionAllocStart(
     // already admitted and its key stays locked until the staged
     // replica and task state are committed or rolled back.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
+    std::shared_ptr<const AllocatorManager> allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+        allocator_snapshot = allocator_access.GetSharedAllocatorSnapshot();
     }
     auto allocation_result = allocation_strategy_->AllocateForRequest(
-        allocator_snapshot, size, config, preferred_segments);
+        *allocator_snapshot, size, config, preferred_segments);
     if (!allocation_result) {
         return tl::make_unexpected(allocation_result.error());
     }

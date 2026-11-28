@@ -1468,4 +1468,156 @@ TEST_P(AllocationStrategyParameterizedTest,
               "receiver1");
 }
 
+namespace {
+
+std::shared_ptr<BufferAllocatorBase> MakeOffsetTestAllocator(
+    const std::string& segment_name, size_t base_offset,
+    size_t size = 64 * MiB) {
+    const size_t base = 0x100000000ULL + base_offset;
+    auto allocator =
+        CreateBufferAllocator(BufferAllocatorType::OFFSET, segment_name, base,
+                              size, segment_name, "tcp");
+    EXPECT_TRUE(allocator.has_value());
+    return std::move(*allocator);
+}
+
+std::shared_ptr<ClientLivenessRecord> MakeSuspectedSession() {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto record =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
+    EXPECT_EQ(
+        record->Evaluate(initial + std::chrono::seconds(1),
+                         std::chrono::seconds(1), std::chrono::seconds(10)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    return record;
+}
+
+Segment MakeTestSegmentMeta(const std::string& name,
+                            const std::string& protocol,
+                            const std::string& domain) {
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = name;
+    seg.size = 64 * MiB;
+    seg.protocol = protocol;
+    if (!domain.empty()) {
+        seg.physical_placement = PhysicalPlacement{domain, "rack0", "tray0", 0};
+    }
+    return seg;
+}
+
+}  // namespace
+
+TEST(AllocatorManagerFabricTrackingTest,
+     HasMnnvlSegmentsTracksLifecycleFilteringAndMove) {
+    AllocatorManager manager;
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+
+    auto rdma_alloc = MakeOffsetTestAllocator("rdma0", 0x10000000ULL);
+    auto rdma_reg = manager.addAllocator("rdma0", rdma_alloc);
+    manager.SetSegmentMetadata(MakeTestSegmentMeta("rdma0", "rdma", "ignored"));
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+
+    auto mnnvl_alloc1 = MakeOffsetTestAllocator("mnnvl0", 0x20000000ULL);
+    auto mnnvl_alloc2 = MakeOffsetTestAllocator("mnnvl0", 0x30000000ULL);
+    auto mnnvl_reg1 = manager.addAllocator("mnnvl0", mnnvl_alloc1);
+    auto mnnvl_reg2 = manager.addAllocator("mnnvl0", mnnvl_alloc2);
+    manager.SetSegmentMetadata(
+        MakeTestSegmentMeta("mnnvl0", "mnnvl", "fabric-a"));
+    EXPECT_TRUE(manager.HasMnnvlSegments());
+
+    // Snapshot preserves MNNVL count; FilterForFabric clears it when excluding
+    // MNNVL segments and keeps it when selecting an MNNVL fabric.
+    auto snapshot = manager.Snapshot();
+    EXPECT_TRUE(snapshot.HasMnnvlSegments());
+    EXPECT_FALSE(snapshot.FilterForFabric("").HasMnnvlSegments());
+    EXPECT_TRUE(snapshot.FilterForFabric("fabric-a").HasMnnvlSegments());
+    EXPECT_FALSE(snapshot.FilterForFabric("fabric-b").HasMnnvlSegments());
+
+    // Moving transfers MNNVL count and resets moved-from source cleanly.
+    AllocatorManager moved_ctor(std::move(snapshot));
+    EXPECT_TRUE(moved_ctor.HasMnnvlSegments());
+    EXPECT_FALSE(snapshot.HasMnnvlSegments());
+    AllocatorManager moved_assign;
+    moved_assign = std::move(moved_ctor);
+    EXPECT_TRUE(moved_assign.HasMnnvlSegments());
+    EXPECT_FALSE(moved_ctor.HasMnnvlSegments());
+
+    // Overwriting metadata protocol updates the counter accurately.
+    manager.SetSegmentMetadata(MakeTestSegmentMeta("mnnvl0", "rdma", ""));
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+    manager.SetSegmentMetadata(
+        MakeTestSegmentMeta("mnnvl0", "mnnvl", "fabric-a"));
+    EXPECT_TRUE(manager.HasMnnvlSegments());
+
+    // Partial removal keeps segment metadata and MNNVL count; removing the last
+    // registration clears the count.
+    EXPECT_TRUE(manager.removeAllocator("mnnvl0", mnnvl_reg1));
+    EXPECT_TRUE(manager.HasMnnvlSegments());
+    EXPECT_TRUE(manager.removeAllocator("mnnvl0", mnnvl_reg2));
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+    EXPECT_TRUE(manager.removeAllocator("rdma0", rdma_reg));
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+}
+
+TEST(AllocatorManagerFabricTrackingTest,
+     HasEnoughServingNamesForFabricMatchesFilteredCount) {
+    auto verify_all = [](const AllocatorManager& manager) {
+        for (const std::string& domain :
+             {std::string{}, std::string{"fabric-a"}, std::string{"fabric-b"},
+              std::string{"fabric-missing"}}) {
+            auto filtered = manager.FilterForFabric(domain);
+            for (size_t min_count = 0; min_count <= 4; ++min_count) {
+                EXPECT_EQ(
+                    manager.hasEnoughServingNamesForFabric(min_count, domain),
+                    filtered.hasEnoughServingNames(min_count))
+                    << "domain=" << domain << " min_count=" << min_count;
+            }
+        }
+    };
+
+    // Empty manager (fast path)
+    AllocatorManager manager;
+    verify_all(manager);
+
+    const auto suspected = MakeSuspectedSession();
+
+    // Non-MNNVL-only manager (fast path: domain.empty() && !HasMnnvlSegments())
+    manager.addAllocator("rdma0",
+                         MakeOffsetTestAllocator("rdma0", 0x10000000ULL));
+    manager.SetSegmentMetadata(MakeTestSegmentMeta("rdma0", "rdma", "ignored"));
+    manager.addAllocator("rdma1",
+                         MakeOffsetTestAllocator("rdma1", 0x20000000ULL),
+                         suspected);  // non-serving
+    manager.SetSegmentMetadata(MakeTestSegmentMeta("rdma1", "rdma", ""));
+    // Duplicate name with mixed serving states (one suspected, one serving)
+    manager.addAllocator("rdma_mixed",
+                         MakeOffsetTestAllocator("rdma_mixed", 0x28000000ULL),
+                         suspected);
+    manager.addAllocator("rdma_mixed",
+                         MakeOffsetTestAllocator("rdma_mixed", 0x2C000000ULL));
+    manager.SetSegmentMetadata(MakeTestSegmentMeta("rdma_mixed", "rdma", ""));
+    // Segment with no metadata entry
+    manager.addAllocator("no_meta",
+                         MakeOffsetTestAllocator("no_meta", 0x2E000000ULL));
+    EXPECT_FALSE(manager.HasMnnvlSegments());
+    verify_all(manager);
+
+    // Mixed RDMA + MNNVL across multiple fabric domains
+    manager.addAllocator("mnnvl_a0",
+                         MakeOffsetTestAllocator("mnnvl_a0", 0x30000000ULL));
+    manager.SetSegmentMetadata(
+        MakeTestSegmentMeta("mnnvl_a0", "mnnvl", "fabric-a"));
+    manager.addAllocator("mnnvl_a1",
+                         MakeOffsetTestAllocator("mnnvl_a1", 0x40000000ULL));
+    manager.SetSegmentMetadata(
+        MakeTestSegmentMeta("mnnvl_a1", "mnnvl", "fabric-a"));
+    manager.addAllocator("mnnvl_b0",
+                         MakeOffsetTestAllocator("mnnvl_b0", 0x50000000ULL));
+    manager.SetSegmentMetadata(
+        MakeTestSegmentMeta("mnnvl_b0", "mnnvl", "fabric-b"));
+    EXPECT_TRUE(manager.HasMnnvlSegments());
+    verify_all(manager);
+}
+
 }  // namespace mooncake

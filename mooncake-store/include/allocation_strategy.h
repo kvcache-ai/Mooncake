@@ -47,9 +47,37 @@ class AllocatorManager {
     AllocatorManager(const AllocatorManager&) = delete;
     AllocatorManager& operator=(const AllocatorManager&) = delete;
 
-    // Move-construct allowed.
-    AllocatorManager(AllocatorManager&&) = default;
-    AllocatorManager& operator=(AllocatorManager&&) = default;
+    // Move-construct allowed. Reset moved-from state so mnnvl_segment_count_
+    // stays consistent with segment_metadata_ if the source is reused.
+    AllocatorManager(AllocatorManager&& other)
+        : names_(std::move(other.names_)),
+          allocators_(std::move(other.allocators_)),
+          owner_by_name_(std::move(other.owner_by_name_)),
+          preferred_hcas_(std::move(other.preferred_hcas_)),
+          segment_metadata_(std::move(other.segment_metadata_)),
+          mnnvl_segment_count_(std::exchange(other.mnnvl_segment_count_, 0)) {
+        other.names_.clear();
+        other.allocators_.clear();
+        other.owner_by_name_.clear();
+        other.preferred_hcas_.clear();
+        other.segment_metadata_.clear();
+    }
+    AllocatorManager& operator=(AllocatorManager&& other) {
+        if (this != &other) {
+            names_ = std::move(other.names_);
+            allocators_ = std::move(other.allocators_);
+            owner_by_name_ = std::move(other.owner_by_name_);
+            preferred_hcas_ = std::move(other.preferred_hcas_);
+            segment_metadata_ = std::move(other.segment_metadata_);
+            mnnvl_segment_count_ = std::exchange(other.mnnvl_segment_count_, 0);
+            other.names_.clear();
+            other.allocators_.clear();
+            other.owner_by_name_.clear();
+            other.preferred_hcas_.clear();
+            other.segment_metadata_.clear();
+        }
+        return *this;
+    }
 
     /**
      * @brief Add an allocator of segment `name` into the manager.
@@ -99,7 +127,13 @@ class AllocatorManager {
 
         if (it->second.empty()) {
             allocators_.erase(name);
-            segment_metadata_.erase(name);
+            auto meta_it = segment_metadata_.find(name);
+            if (meta_it != segment_metadata_.end()) {
+                if (meta_it->second.protocol == "mnnvl") {
+                    --mnnvl_segment_count_;
+                }
+                segment_metadata_.erase(meta_it);
+            }
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
                 std::swap(*name_it, names_.back());
@@ -151,6 +185,7 @@ class AllocatorManager {
         snapshot.names_ = names_;
         snapshot.allocators_ = allocators_;
         snapshot.segment_metadata_ = segment_metadata_;
+        snapshot.mnnvl_segment_count_ = mnnvl_segment_count_;
         snapshot.preferred_hcas_ = preferred_hcas_;
         if (owners) {
             snapshot.owner_by_name_ = *owners;
@@ -159,7 +194,24 @@ class AllocatorManager {
     }
 
     void SetSegmentMetadata(const Segment& segment) {
-        segment_metadata_[segment.name] = segment;
+        auto it = segment_metadata_.find(segment.name);
+        const bool was_mnnvl =
+            it != segment_metadata_.end() && it->second.protocol == "mnnvl";
+        const bool is_mnnvl = segment.protocol == "mnnvl";
+        if (it != segment_metadata_.end()) {
+            Segment copy = segment;
+            it->second = std::move(copy);
+        } else {
+            segment_metadata_.emplace(segment.name, segment);
+        }
+        if (was_mnnvl && !is_mnnvl) {
+            --mnnvl_segment_count_;
+        } else if (!was_mnnvl && is_mnnvl) {
+            ++mnnvl_segment_count_;
+        }
+    }
+    [[nodiscard]] bool HasMnnvlSegments() const noexcept {
+        return mnnvl_segment_count_ > 0;
     }
     const Segment* GetSegmentMetadata(const std::string& name) const {
         auto it = segment_metadata_.find(name);
@@ -207,7 +259,13 @@ class AllocatorManager {
         for (const auto& name : names_) {
             if (!IsFabricEligible(name, domain)) {
                 result.allocators_.erase(name);
-                result.segment_metadata_.erase(name);
+                auto meta_it = result.segment_metadata_.find(name);
+                if (meta_it != result.segment_metadata_.end()) {
+                    if (meta_it->second.protocol == "mnnvl") {
+                        --result.mnnvl_segment_count_;
+                    }
+                    result.segment_metadata_.erase(meta_it);
+                }
                 result.owner_by_name_.erase(name);
             }
         }
@@ -268,6 +326,26 @@ class AllocatorManager {
         return false;
     }
 
+    // Equivalent to FilterForFabric(domain).hasEnoughServingNames(min_count),
+    // without copying the underlying segment maps.
+    [[nodiscard]] bool hasEnoughServingNamesForFabric(
+        size_t min_count, const std::string& domain) const {
+        if (min_count == 0) {
+            return true;
+        }
+        if (domain.empty() && !HasMnnvlSegments()) {
+            return hasEnoughServingNames(min_count);
+        }
+        size_t count = 0;
+        for (const auto& name : names_) {
+            if (IsFabricEligible(name, domain) && isServing(name) &&
+                ++count == min_count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * @brief Get allocator registrations belonging to the given segment name.
      * @return a vector of registrations belonging to the segment name
@@ -301,6 +379,7 @@ class AllocatorManager {
     std::unordered_map<std::string, UUID> owner_by_name_;
     std::vector<std::string> preferred_hcas_;
     std::unordered_map<std::string, Segment> segment_metadata_;
+    size_t mnnvl_segment_count_{0};
     friend class ScopedSegmentAccess;
 };
 
