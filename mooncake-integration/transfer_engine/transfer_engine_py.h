@@ -309,6 +309,8 @@ class TransferEnginePy {
 
     int sendProbe(const std::string &peer_server_name);
 
+    int refreshSession(const std::string &peer_server_name);
+
     std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
 
     // Experimental: the caller must globally fence transfers and exclude all
