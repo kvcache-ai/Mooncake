@@ -38,6 +38,24 @@ function(mooncake_provide_xxhash)
                INTERFACE_INCLUDE_DIRECTORIES "${MOONCAKE_XXHASH_INCLUDE_DIR}")
 endfunction()
 
+function(mooncake_provide_otel)
+  find_package(utf8_range CONFIG REQUIRED)
+  find_package(opentelemetry-cpp CONFIG REQUIRED)
+  add_library(Mooncake::otel INTERFACE IMPORTED)
+  target_link_libraries(
+    Mooncake::otel
+    INTERFACE opentelemetry-cpp::trace
+              opentelemetry-cpp::resources
+              opentelemetry-cpp::otlp_recordable
+              opentelemetry-cpp::otlp_http_exporter
+              opentelemetry-cpp::otlp_http_client
+              opentelemetry-cpp::otlp_grpc_exporter)
+  if(TARGET opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(Mooncake::otel
+                          INTERFACE opentelemetry-cpp::otlp_grpc_client)
+  endif()
+endfunction()
+
 function(mooncake_provide_liburing)
   find_path(MOONCAKE_LIBURING_INCLUDE_DIR liburing.h)
   find_library(MOONCAKE_LIBURING_LIBRARY uring)

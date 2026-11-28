@@ -24,6 +24,7 @@
 #include "dummy_client.h"
 #include "../src/config/client_object_checksum_config.h"
 #include "real_client.h"
+#include "request_context.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -43,16 +44,25 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::put_dummy_helper>(&rc);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&rc);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&rc);
+    server.register_handler<&RealClient::put_dummy_helper_rpc>(&rc);
+    server.register_handler<&RealClient::put_batch_dummy_helper_rpc>(&rc);
+    server.register_handler<&RealClient::put_parts_dummy_helper_rpc>(&rc);
     server.register_handler<&RealClient::remove_internal>(&rc);
+    server.register_handler<&RealClient::remove_internal_rpc>(&rc);
     server.register_handler<&RealClient::removeAll_internal>(&rc);
     server.register_handler<&RealClient::isExist_internal>(&rc);
+    server.register_handler<&RealClient::isExist_internal_rpc>(&rc);
+    server.register_handler<&RealClient::batchIsExist_internal_rpc>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
+    server.register_handler<&RealClient::getSize_internal_rpc>(&rc);
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(&rc);
     server.register_handler<&RealClient::get_into_ranges_staged_shm_helper>(
         &rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
+    server.register_handler<&RealClient::batch_get_into_dummy_helper_rpc>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
+    server.register_handler<&RealClient::batch_put_from_dummy_helper_rpc>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
@@ -413,6 +423,65 @@ TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {
               toInt(ErrorCode::CHECKSUM_MISMATCH));
 
     stored_data[0] ^= 0x01;
+    EXPECT_EQ(dummy_client_->unregister_buffer(target), 0);
+    EXPECT_EQ(ShmHelper::getInstance()->free(target), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, RegistersViewsOfSharedAllocation) {
+    ASSERT_TRUE(SetupStack());
+
+    constexpr size_t kViewSize = 4096;
+    const auto addr = dummy_client_->alloc_from_mem_pool(2 * kViewSize);
+    ASSERT_NE(addr, 0);
+    auto *base = reinterpret_cast<char *>(addr);
+    auto *second = base + kViewSize;
+
+    EXPECT_NE(dummy_client_->register_buffer(second, kViewSize + 1), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(base, kViewSize), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(second, kViewSize), 0);
+
+    const std::string key = "dummy_shared_allocation_view";
+    const std::string data(kViewSize, 'v');
+    PutData(key, data);
+    ASSERT_EQ(dummy_client_->get_into(key, second, kViewSize), kViewSize);
+    EXPECT_EQ(std::string(second, kViewSize), data);
+
+    EXPECT_EQ(dummy_client_->unregister_buffer(base), 0);
+    EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, BatchGetForwardsRequestContextToMaster) {
+    ASSERT_TRUE(SetupStack());
+
+    const std::string key = "dummy_batch_get_trace";
+    const std::string data = "trace the replica lookup";
+    PutData(key, data);
+
+    const auto addr = dummy_client_->alloc_from_mem_pool(data.size());
+    ASSERT_NE(addr, 0);
+    auto *target = reinterpret_cast<char *>(addr);
+    ASSERT_EQ(dummy_client_->register_buffer(target, data.size()), 0);
+
+    RequestContext context;
+    context.request_id = "batch-get-context-regression";
+    context.trace_id = "1234abcd1234abcd1234abcd1234abcd";
+    const auto expected_log = "request_id=[" + context.request_id +
+                              "] trace_id=[" + context.trace_id + "]";
+    const int previous_verbosity = google::SetVLOGLevel("rpc_service", 2);
+    ::testing::internal::CaptureStderr();
+    const auto results = [&] {
+        CurrentCtxScope scope(std::move(context));
+        return dummy_client_->batch_get_into({key}, {target}, {data.size()});
+    }();
+    const auto logs = ::testing::internal::GetCapturedStderr();
+    google::SetVLOGLevel("rpc_service", previous_verbosity);
+
+    ASSERT_EQ(results,
+              (std::vector<int64_t>{static_cast<int64_t>(data.size())}));
+    EXPECT_EQ(std::string(target, data.size()), data);
+    EXPECT_NE(logs.find("hop-B BatchGetReplicaList_with_context"),
+              std::string::npos);
+    EXPECT_NE(logs.find(expected_log), std::string::npos);
     EXPECT_EQ(dummy_client_->unregister_buffer(target), 0);
     EXPECT_EQ(ShmHelper::getInstance()->free(target), 0);
 }

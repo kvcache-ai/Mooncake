@@ -73,6 +73,10 @@ if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
 endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
+option(
+  MOONCAKE_ENABLE_OTEL_TRACING
+  "Enable OpenTelemetry tracing (OTLP/HTTP & OTLP/gRPC spans) for mooncake_master and mooncake_client. Requires an installed opentelemetry-cpp (run dependencies.sh --with-otel on Ubuntu/Debian). Default OFF: tracing compiles to no-op stubs."
+  OFF)
 
 # Clear the shared wheel staging directory on every configure so disabled
 # components cannot leak stale artifacts into a later build.
@@ -101,6 +105,7 @@ if(SKBUILD)
 else()
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 endif()
+
 execute_process(
   COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
   OUTPUT_VARIABLE PYTHON_SYS_PATH)
@@ -165,6 +170,9 @@ endif()
 if(WITH_STORE)
   mooncake_provide_zstd()
   mooncake_provide_xxhash()
+  if(MOONCAKE_ENABLE_OTEL_TRACING)
+    mooncake_provide_otel()
+  endif()
 endif()
 if(WITH_CONDUCTOR OR (WITH_STORE AND ENABLE_KV_EVENTS))
   mooncake_provide_libzmq()

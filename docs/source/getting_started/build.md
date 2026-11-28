@@ -29,6 +29,21 @@ make -j
 sudo make install
 ```
 
+### Build with OpenTelemetry Tracing
+
+On Ubuntu or Debian, install the OpenTelemetry C++ SDK with both OTLP/HTTP and
+OTLP/gRPC exporters, then enable tracing when configuring Mooncake:
+
+```bash
+sudo bash dependencies.sh --with-otel
+cmake -S . -B build-otel -DMOONCAKE_ENABLE_OTEL_TRACING=ON
+cmake --build build-otel --parallel --target mooncake_master mooncake_client
+```
+
+The SDK installs to `/usr/local` by default. To use another prefix, set
+`MOONCAKE_OTEL_INSTALL_PREFIX` when running `dependencies.sh` and add that prefix
+to `CMAKE_PREFIX_PATH` when configuring Mooncake.
+
 (build-with-hpe-slingshot-cxi)=
 ### Build with HPE Slingshot (CXI)
 

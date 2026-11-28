@@ -49,6 +49,73 @@ check_success() {
     fi
 }
 
+download_otel_source() {
+    local repository=$1
+    local revision=$2
+    local source_dir=$3
+    local github_base=${GITHUB_PROXY%/}
+    local url="$github_base/$repository/archive/$revision.tar.gz"
+    if [ "$github_base" = "https://github.com" ]; then
+        url="https://codeload.github.com/$repository/tar.gz/$revision"
+    fi
+
+    mkdir -p "$source_dir" || print_error "Failed to create $source_dir"
+    wget -q --show-progress --timeout=30 --tries=3 -O "$source_dir.tar.gz" "$url" ||
+        print_error "Failed to download $repository at $revision"
+    tar -xzf "$source_dir.tar.gz" -C "$source_dir" --strip-components=1 ||
+        print_error "Failed to extract $repository"
+}
+
+install_otel() (
+    local otel_version=1.28.0
+    local utf8_range_revision=1d1ea7e3fedf482d4a12b473c1ed25fe0f371a45
+    local prefix=${MOONCAKE_OTEL_INSTALL_PREFIX:-/usr/local}
+    local jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}
+    local work_dir proto_version json_version
+    work_dir=$(mktemp -d) || print_error "Failed to create OpenTelemetry build directory"
+    trap 'rm -rf -- "$work_dir"' EXIT
+
+    print_section "Building utf8_range"
+    download_otel_source protocolbuffers/utf8_range "$utf8_range_revision" "$work_dir/utf8_range"
+    cmake -S "$work_dir/utf8_range" -B "$work_dir/utf8_range-build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dutf8_range_ENABLE_TESTS=OFF ||
+        print_error "Failed to configure utf8_range"
+    cmake --build "$work_dir/utf8_range-build" --parallel "$jobs" ||
+        print_error "Failed to build utf8_range"
+    cmake --install "$work_dir/utf8_range-build" --prefix "$work_dir/utf8_range-prefix" ||
+        print_error "Failed to stage utf8_range for the OpenTelemetry build"
+
+    print_section "Building OpenTelemetry C++ $otel_version"
+    download_otel_source open-telemetry/opentelemetry-cpp "refs/tags/v$otel_version" "$work_dir/opentelemetry-cpp"
+    # Honor the SDK's pinned versions and use the same mirror for their sources.
+    proto_version=$(sed -n 's/^opentelemetry-proto=//p' "$work_dir/opentelemetry-cpp/third_party_release")
+    json_version=$(sed -n 's/^nlohmann-json=//p' "$work_dir/opentelemetry-cpp/third_party_release")
+    if [ -z "$proto_version" ] || [ -z "$json_version" ]; then
+        print_error "Failed to read OpenTelemetry C++ dependency versions"
+    fi
+    download_otel_source open-telemetry/opentelemetry-proto "refs/tags/$proto_version" "$work_dir/opentelemetry-proto"
+    download_otel_source nlohmann/json "refs/tags/$json_version" "$work_dir/nlohmann-json"
+    # The standalone utf8_range package does not export its header directory.
+    CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-isystem \"$work_dir/utf8_range-prefix/include\"" \
+    cmake -S "$work_dir/opentelemetry-cpp" -B "$work_dir/opentelemetry-cpp-build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+        -DCMAKE_PREFIX_PATH="$work_dir/utf8_range-prefix;$prefix" -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DOTELCPP_PROTO_PATH="$work_dir/opentelemetry-proto" \
+        -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON="$work_dir/nlohmann-json" \
+        -DBUILD_TESTING=OFF -DWITH_BENCHMARK=OFF -DWITH_EXAMPLES=OFF \
+        -DWITH_FUNC_TESTS=OFF \
+        -DWITH_HTTP_CLIENT_CURL=ON -DWITH_OTLP_HTTP=ON -DWITH_OTLP_GRPC=ON ||
+        print_error "Failed to configure OpenTelemetry C++"
+    cmake --build "$work_dir/opentelemetry-cpp-build" --parallel "$jobs" ||
+        print_error "Failed to build OpenTelemetry C++"
+    cmake --install "$work_dir/utf8_range-build" ||
+        print_error "Failed to install utf8_range to $prefix"
+    cmake --install "$work_dir/opentelemetry-cpp-build" ||
+        print_error "Failed to install OpenTelemetry C++ to $prefix"
+    print_success "OpenTelemetry C++ $otel_version installed to $prefix"
+)
+
 # Detect ScaleFabric SHCA (shca-tools).
 has_shca_tools() {
     if command -v dpkg-query >/dev/null 2>&1; then
@@ -91,13 +158,10 @@ detect_os() {
     echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
 }
 
-if [ $(id -u) -ne 0 ]; then
-	print_error "Require root permission, try sudo ./dependencies.sh"
-fi
-
 # Parse command line arguments
 SKIP_CONFIRM=false
 INSTALL_SPDK=false
+INSTALL_OTEL=false
 for arg in "$@"; do
     case $arg in
         -y|--yes)
@@ -106,17 +170,25 @@ for arg in "$@"; do
         --with-spdk)
             INSTALL_SPDK=true
             ;;
+        --with-otel)
+            INSTALL_OTEL=true
+            ;;
         -h|--help)
             echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
             echo -e "Usage: ./dependencies.sh [OPTIONS]"
             echo -e "\nOptions:"
             echo -e "  -y, --yes       Skip confirmation and install all dependencies"
             echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  --with-otel     Install OpenTelemetry C++ for Store tracing (Ubuntu/Debian)"
             echo -e "  -h, --help      Show this help message and exit"
             exit 0
             ;;
     esac
 done
+
+if [ $(id -u) -ne 0 ]; then
+    print_error "Require root permission, try sudo ./dependencies.sh"
+fi
 
 # Print welcome message
 echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
@@ -127,6 +199,9 @@ echo -e "  - Git submodules (pybind11)"
 echo -e "  - Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
+fi
+if [ "$INSTALL_OTEL" = true ]; then
+    echo -e "  - OpenTelemetry C++ (for Store tracing)"
 fi
 echo
 
@@ -142,6 +217,9 @@ fi
 
 # Detect OS
 detect_os
+if [ "$INSTALL_OTEL" = true ] && [ "$OS" != "ubuntu" ] && [ "$OS" != "debian" ]; then
+    print_error "--with-otel supports Ubuntu and Debian. Install OpenTelemetry C++ separately on $OS."
+fi
 
 # Update package lists
 print_section "Updating package lists"
@@ -208,6 +286,9 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     # libmsgpack-cxx-dev and ships msgpack.hpp in libmsgpack-dev.
     if apt-cache show libmsgpack-cxx-dev > /dev/null 2>&1; then
         SYSTEM_PACKAGES="$SYSTEM_PACKAGES libmsgpack-cxx-dev"
+    fi
+    if [ "$INSTALL_OTEL" = true ]; then
+        SYSTEM_PACKAGES="$SYSTEM_PACKAGES libabsl-dev libc-ares-dev protobuf-compiler"
     fi
 
     apt-get install -y $SYSTEM_PACKAGES
@@ -503,6 +584,10 @@ if [ "$INSTALL_SPDK" = true ]; then
     cd "${REPO_ROOT}"
 fi
 
+if [ "$INSTALL_OTEL" = true ]; then
+    install_otel || exit 1
+fi
+
 # Return to the repository root
 cd "${REPO_ROOT}"
 
@@ -515,6 +600,9 @@ echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+fi
+if [ "$INSTALL_OTEL" = true ]; then
+    echo -e "  ${GREEN}✓${NC} OpenTelemetry C++ (build with -DMOONCAKE_ENABLE_OTEL_TRACING=ON)"
 fi
 echo
 echo -e "You can now build and run Mooncake."

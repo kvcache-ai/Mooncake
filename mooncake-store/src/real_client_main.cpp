@@ -9,6 +9,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "tracing.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -42,13 +43,26 @@ DEFINE_int64(ssd_prefetch_dedup_ttl_sec, DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
+DEFINE_string(otlp_traces_endpoint, "",
+              "OTLP traces collector endpoint, without a scheme: "
+              "\"host:port\" for --otlp_traces_protocol=grpc, or "
+              "\"host:port/path\" for http. When empty, tracing is disabled.");
+DEFINE_string(otlp_traces_protocol, "http",
+              "OTLP transport protocol for traces: http (default) or grpc.");
+
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
                               RealClient &real_client) {
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::put_dummy_helper_rpc>(&real_client);
+    server.register_handler<&RealClient::put_batch_dummy_helper_rpc>(
+        &real_client);
+    server.register_handler<&RealClient::put_parts_dummy_helper_rpc>(
+        &real_client);
     server.register_handler<&RealClient::remove_internal>(&real_client);
+    server.register_handler<&RealClient::remove_internal_rpc>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);
     server.register_handler<&RealClient::batchRemove_internal>(&real_client);
@@ -58,13 +72,19 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::batchIsExistWithOptions_internal>(
         &real_client);
+    server.register_handler<&RealClient::isExist_internal_rpc>(&real_client);
+    server.register_handler<&RealClient::batchIsExist_internal_rpc>(
+        &real_client);
     server.register_handler<&RealClient::probeKey_internal>(&real_client);
     server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::get_replica_desc>(&real_client);
     server.register_handler<&RealClient::batch_get_replica_desc>(&real_client);
     server.register_handler<&RealClient::batch_get_query_results>(&real_client);
+    server.register_handler<&RealClient::getSize_internal_rpc>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_put_from_dummy_helper_rpc>(
         &real_client);
     server.register_handler<
         &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
@@ -86,6 +106,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::upsert_batch_dummy_helper>(
         &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_get_into_dummy_helper_rpc>(
         &real_client);
     server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
@@ -145,6 +167,8 @@ int main(int argc, char *argv[]) {
 
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    mooncake::InitTracing(FLAGS_otlp_traces_endpoint, "mooncake-real-client",
+                          FLAGS_otlp_traces_protocol);
     if (!FLAGS_log_dir.empty()) {
         // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
         // a static initializer before main — see glog_compat.h.
