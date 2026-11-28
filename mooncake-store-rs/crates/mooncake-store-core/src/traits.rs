@@ -171,6 +171,11 @@ pub trait MetadataBackend: Send + Sync {
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>>;
 
+    /// Returns one route or miss per input key, in input order.
+    fn get_object_routes(&self, keys: &[ObjectKey]) -> Result<Vec<Option<ObjectRoute>>> {
+        keys.iter().map(|key| self.get_object_route(key)).collect()
+    }
+
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
 
     /// Lists matching cold-backed routes in object-key order, after the exclusive

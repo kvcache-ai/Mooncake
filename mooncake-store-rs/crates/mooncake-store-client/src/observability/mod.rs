@@ -1209,7 +1209,7 @@ mod tests {
     use super::*;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        CompatibilityDescriptor, MetadataBackend, StoreError,
+        CompatibilityDescriptor, MetadataBackend, ObjectKey, StoreError,
     };
     use mooncake_store_rs_metadata::InMemoryMetadataBackend;
     use std::io::{Read, Write};
@@ -1340,8 +1340,15 @@ mod tests {
             .get_client_lease(&lease.runtime)
             .expect("lease lookup should succeed");
 
+        let routes = metadata
+            .get_object_routes(&[ObjectKey::new("first"), ObjectKey::new("second")])
+            .expect("batch lookup should succeed");
+        assert_eq!(routes, vec![None, None]);
         assert!(fetched.is_some());
         let metrics = render_prometheus_metrics_with_registry(&registry);
+        assert!(metrics.contains(
+            "mooncake_store_metadata_operation_total{tenant=\"default\",backend=\"in_memory\",operation=\"get_object_routes\",result=\"ok\"} 1"
+        ));
         assert!(metrics.contains(
             "mooncake_store_metadata_operation_total{tenant=\"default\",backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\"} 1"
         ));

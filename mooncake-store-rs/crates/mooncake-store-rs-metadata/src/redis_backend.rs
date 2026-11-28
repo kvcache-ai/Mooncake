@@ -862,6 +862,7 @@ const MAX_REDIS_CONNECTION_POOL_SIZE: usize = 256;
 const MAX_REDIS_LIST_ITEMS: usize = 4096;
 const MAX_REDIS_SCAN_PAGES: usize = 64;
 const REDIS_SCAN_COUNT: usize = 256;
+const ROUTE_READ_PIPELINE_SIZE: usize = 256;
 const DEFAULT_TENANT_QUOTA_TERMINAL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
@@ -2083,6 +2084,38 @@ impl MetadataBackend for RedisMetadataBackend {
         payload
             .map(|payload| serde_json::from_str(&payload).map_err(json_error))
             .transpose()
+    }
+
+    fn get_object_routes(&self, keys: &[ObjectKey]) -> Result<Vec<Option<ObjectRoute>>> {
+        let mut routes = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(ROUTE_READ_PIPELINE_SIZE) {
+            let mut pipeline = redis::pipe();
+            for key in chunk {
+                pipeline
+                    .cmd("HGET")
+                    .arg(self.keyspace.object(key))
+                    .arg("payload");
+            }
+            let payloads: Vec<Option<String>> = self
+                .query_readonly("redis hget route payloads", |connection| {
+                    pipeline.query(connection)
+                })?;
+            if payloads.len() != chunk.len() {
+                return Err(StoreError::Metadata(format!(
+                    "Redis route pipeline returned {} replies for {} keys",
+                    payloads.len(),
+                    chunk.len()
+                )));
+            }
+            for payload in payloads {
+                routes.push(
+                    payload
+                        .map(|value| serde_json::from_str(&value).map_err(json_error))
+                        .transpose()?,
+                );
+            }
+        }
+        Ok(routes)
     }
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
@@ -6064,6 +6097,44 @@ mod tests {
     // -----------------------------------------------------------------------
     // Adversarial: Redis integration (skipped if redis-server unavailable)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn redis_batch_route_lookup_preserves_order_duplicates_and_misses() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url())).unwrap();
+        let mut inputs = vec![ObjectKey::new("missing"); super::ROUTE_READ_PIPELINE_SIZE + 2];
+        for (index, name) in [(0, "first"), (1, "second")] {
+            let key = ObjectKey::new(name);
+            let mut route = sample_route(1);
+            route.key = key.clone();
+            assert!(
+                backend
+                    .compare_and_swap_object_route(&key, None, Some(&route))
+                    .unwrap()
+                    .applied
+            );
+            inputs[index] = key;
+        }
+        *inputs.last_mut().unwrap() = inputs[0].clone();
+        assert!(backend.get_object_routes(&[]).unwrap().is_empty());
+        let other = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(MetadataKeyspace::new("other")),
+        )
+        .unwrap();
+        assert_eq!(
+            other.get_object_routes(&inputs[..2]).unwrap(),
+            vec![None, None]
+        );
+        for keys in [&inputs[..1], inputs.as_slice()] {
+            let expected: Vec<_> = keys
+                .iter()
+                .map(|key| backend.get_object_route(key).unwrap())
+                .collect();
+            assert_eq!(backend.get_object_routes(keys).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn redis_backend_concurrent_route_cas_only_one_wins() {

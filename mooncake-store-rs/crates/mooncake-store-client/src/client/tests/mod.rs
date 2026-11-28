@@ -148,6 +148,7 @@ struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
+    get_object_routes_calls: AtomicUsize,
     upsert_client_lease_calls: AtomicUsize,
     update_client_state_calls: AtomicUsize,
     reject_state_patch: bool,
@@ -511,6 +512,7 @@ impl CountingMetadataBackend {
             inner,
             list_live_clients_calls: AtomicUsize::new(0),
             get_object_route_calls: AtomicUsize::new(0),
+            get_object_routes_calls: AtomicUsize::new(0),
             upsert_client_lease_calls: AtomicUsize::new(0),
             update_client_state_calls: AtomicUsize::new(0),
             reject_state_patch,
@@ -1862,6 +1864,14 @@ impl MetadataBackend for CountingMetadataBackend {
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
         self.get_object_route_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.get_object_route(key)
+    }
+
+    fn get_object_routes(
+        &self,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_object_routes(keys)
     }
 
     fn list_object_routes(
@@ -21704,6 +21714,28 @@ fn delete_reclaim_does_not_downgrade_unknown_owner_to_legacy_release() {
         client.state.lock().pending_reclaims.is_empty(),
         "unknown owner capability must not use the destructive legacy reclaim path"
     );
+}
+
+#[test]
+fn metadata_only_directory_forwards_multi_key_lookup_once() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let client = StoreClientBuilder::new(metadata.clone(), "batch-forwarding")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(Arc::new(TestTransport::new("batch-forwarding-segment")))
+        .build(test_future_expiry_ms())
+        .expect("metadata-only client should build");
+
+    let keys = [ObjectKey::new("first"), ObjectKey::new("second")];
+    let routes = client
+        .route_directory
+        .get_object_routes(&client.lease(), &keys)
+        .expect("batch lookup should succeed");
+
+    assert_eq!(routes, vec![None, None]);
+    assert_eq!(metadata.get_object_routes_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(metadata.get_object_route_calls(), 0);
 }
 
 #[test]
