@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "allocator.h"
+#include "eviction/offload_ledger.h"
 #include "eviction/offloading_reclaimer.h"
 #include "eviction/report_observers.h"
 #include "master_metric_manager.h"
@@ -40,6 +41,8 @@ bool InPlan(const eviction::Plan& plan, const Replica& replica) {
 // deferred when `defer_soft_pinned` is set, and never taken otherwise.
 class FakePolicy final : public eviction::EvictionPolicy {
    public:
+    bool SupportsParallel() const override { return parallel; }
+
     tl::expected<eviction::Plan, SkipReason> Decide(
         const eviction::Candidate& candidate) const override {
         if (!candidate.fallback && soft_pinned.count(candidate.key) > 0) {
@@ -62,6 +65,8 @@ class FakePolicy final : public eviction::EvictionPolicy {
 
     bool defer_soft_pinned = false;
     std::set<std::string> soft_pinned;
+    // Whether it says it supports concurrent callbacks.
+    bool parallel = false;
 };
 
 // Takes the planned replicas off on the spot and records what it did; fails
@@ -72,6 +77,8 @@ class FakePolicy final : public eviction::EvictionPolicy {
 // instead, as an offload-on-evict run with every destination full does.
 class FakeReclaimer final : public eviction::Reclaimer {
    public:
+    bool SupportsParallel() const override { return parallel; }
+
     tl::expected<eviction::Effect, ErrorCode> Apply(
         metadata::Namespace& ns, const route::WriteGuard& hold,
         const eviction::Plan& plan, const eviction::Report&) override {
@@ -108,6 +115,9 @@ class FakeReclaimer final : public eviction::Reclaimer {
     int fail_at = -1;
     int exhaust_at = -1;
     bool keep = false;
+    // Whether it says it supports concurrent callbacks; it does not, but a
+    // test may need an evictor that would run in parallel.
+    bool parallel = false;
     std::function<void(metadata::Namespace&, const std::string&)> on_apply;
     size_t applies = 0;
     std::vector<std::string> applied;
@@ -765,20 +775,39 @@ TEST_F(EvictorTest, AScopedRunStaysInItsNamespace) {
 
 // --- OffloadingReclaimer -----------------------------------------------------
 
-// Accepts the first `capacity` offloads.
+// Accepts the first `capacity` offloads, and charges each to `ledger` when
+// set.
 class FakeOffloadQueue final : public eviction::OffloadQueue {
    public:
-    bool Push(const TenantId&, const std::string& key, Replica&,
-              std::vector<UUID>* mirror_clients) override {
+    Pushed Push(const TenantId& tenant_id, const std::string& key,
+                Replica& source, std::vector<UUID>* mirror_clients) override {
+        ++attempts;
+        Pushed result;
         if (pushed.size() >= capacity) {
-            return false;
+            result.result = refused_as;
+            return result;
         }
         pushed.push_back(key);
         mirror_clients->push_back(UUID{7, 7});
-        return true;
+        result.result = Pushed::Result::kQueued;
+        if (ledger != nullptr) {
+            result.credit = ledger->Take(tenant_id, {UUID{7, 7}},
+                                         source.get_descriptor()
+                                             .get_memory_descriptor()
+                                             .buffer_descriptor.size_);
+        }
+        return result;
+    }
+
+    bool AllFull() const override {
+        return report_all_full && pushed.size() >= capacity;
     }
 
     size_t capacity = SIZE_MAX;
+    Pushed::Result refused_as = Pushed::Result::kOwnerFull;
+    bool report_all_full = false;
+    eviction::OffloadLedger* ledger = nullptr;
+    size_t attempts = 0;
     std::vector<std::string> pushed;
 };
 
@@ -786,8 +815,9 @@ class OffloadingReclaimerTest : public EvictorTest {
    protected:
     tl::expected<eviction::Effect, ErrorCode> Apply(
         const std::string& key, eviction::OffloadingReclaimer::Options options,
-        const eviction::Report& so_far = {}) {
+        const eviction::Report& so_far = {}, bool pressure = false) {
         eviction::OffloadingReclaimer reclaimer(inner_, queue_, options);
+        reclaimer.SetPressure(pressure);
         metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
         auto hold = ns.objects.Write(key);
         EXPECT_TRUE(hold.has_value());
@@ -903,6 +933,126 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
     EXPECT_TRUE(queue_.pushed.empty());
 }
 
+// Async: each owner's room bounds the offloads in flight, not a run's cap.
+TEST_F(OffloadingReclaimerTest, AnAsyncRunIsNotCapped) {
+    Publish("a", "k", seconds(10));
+    eviction::Report so_far;
+    so_far.outcomes[static_cast<size_t>(Outcome::kOffloadQueued)] = 2;
+
+    auto effect =
+        Apply("k", {.cap = 2, .force_evict = true, .async = true}, so_far);
+
+    ASSERT_TRUE(effect.has_value());
+    EXPECT_EQ(effect->outcome, Outcome::kOffloadQueued);
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"k"});
+}
+
+// Async force_evict drops an object it cannot queue only under pressure.
+TEST_F(OffloadingReclaimerTest, AsyncForceEvictDropsOnlyUnderPressure) {
+    Publish("a", "k", seconds(10));
+    queue_.capacity = 0;
+    const eviction::OffloadingReclaimer::Options options{
+        .cap = 100, .force_evict = true, .async = true};
+
+    auto kept = Apply("k", options);
+    ASSERT_TRUE(kept.has_value());
+    EXPECT_EQ(kept->outcome, Outcome::kKept);
+    EXPECT_TRUE(inner_.applied.empty());
+
+    auto dropped = Apply("k", options, {}, /*pressure=*/true);
+    ASSERT_TRUE(dropped.has_value());
+    EXPECT_EQ(dropped->outcome, Outcome::kDropped);
+    EXPECT_EQ(dropped->reason, eviction::DropReason::kOffloadRejected);
+}
+
+// The task holds the queue's credit, and gives it back when it goes.
+TEST_F(OffloadingReclaimerTest, TheTaskHoldsTheOffloadsCredit) {
+    eviction::OffloadLedger ledger;
+    queue_.ledger = &ledger;
+    Publish("a", "k", seconds(10));
+
+    ASSERT_EQ(Apply("k", {.async = true})->outcome, Outcome::kOffloadQueued);
+    EXPECT_EQ(ledger.bytes(), 128u);
+    EXPECT_EQ(ledger.objects(UUID{7, 7}), 1u);
+
+    auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
+    ASSERT_TRUE(hold.has_value());
+    ASSERT_TRUE(hold->state().offloading_task.has_value());
+    EXPECT_NE(hold->state().offloading_task->credit, nullptr);
+    hold->state().offloading_task.reset();
+    EXPECT_EQ(ledger.bytes(), 0u);
+    EXPECT_EQ(ledger.objects(UUID{7, 7}), 0u);
+    EXPECT_EQ(ledger.release_seq(), 1u);
+}
+
+// A destination that refuses for another reason than a full queue is not
+// asked about the object again for a while, unless the round may drop it.
+TEST_F(OffloadingReclaimerTest, ARefusedObjectWaitsBeforeItIsAskedAgain) {
+    Publish("a", "k", seconds(10));
+    queue_.capacity = 0;
+    queue_.refused_as = eviction::OffloadQueue::Pushed::Result::kRejected;
+    const eviction::OffloadingReclaimer::Options options{.force_evict = true,
+                                                         .async = true};
+
+    ASSERT_EQ(Apply("k", options)->outcome, Outcome::kKept);
+    EXPECT_EQ(queue_.attempts, 1u);
+    ASSERT_EQ(Apply("k", options)->outcome, Outcome::kKept);
+    EXPECT_EQ(queue_.attempts, 1u);
+    {
+        auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
+        ASSERT_TRUE(hold.has_value());
+        EXPECT_NE(hold->state().offload_retry_after, 0u);
+    }
+
+    auto dropped = Apply("k", options, {}, /*pressure=*/true);
+    ASSERT_TRUE(dropped.has_value());
+    EXPECT_EQ(dropped->outcome, Outcome::kDropped);
+    EXPECT_EQ(queue_.attempts, 1u);
+}
+
+// A full destination leaves no wait on the object: it is asked again as soon
+// as a round reaches it.
+TEST_F(OffloadingReclaimerTest, AFullDestinationLeavesNoWait) {
+    Publish("a", "k", seconds(10));
+    queue_.capacity = 0;
+
+    ASSERT_EQ(Apply("k", {.async = true})->outcome, Outcome::kKept);
+    ASSERT_EQ(Apply("k", {.async = true})->outcome, Outcome::kKept);
+    EXPECT_EQ(queue_.attempts, 2u);
+    auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_EQ(hold->state().offload_retry_after, 0u);
+}
+
+// A run that queues nothing new (RunScope with queueing off, as while
+// eviction waits for the copies in flight to land) does not ask the queue,
+// keeps what it cannot free, and puts the defaults back when it ends.
+TEST_F(OffloadingReclaimerTest, ARunThatQueuesNothingNewDoesNotAsk) {
+    Publish("a", "idle", seconds(10));
+    eviction::OffloadingReclaimer reclaimer(inner_, queue_, {.async = true});
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    auto apply = [&] {
+        auto hold = ns.objects.Write("idle");
+        EXPECT_TRUE(hold.has_value());
+        auto plan = policy_.Decide(eviction::Candidate{
+            ns.id(), "idle", hold->metadata(), Clock::now(), false});
+        EXPECT_TRUE(plan.has_value());
+        return reclaimer.Apply(ns, *hold, *plan, {});
+    };
+    {
+        const eviction::OffloadingReclaimer::RunScope scope(
+            reclaimer, /*pressure=*/false, /*queueing=*/false);
+        auto idle = apply();
+        ASSERT_TRUE(idle.has_value());
+        EXPECT_EQ(idle->outcome, Outcome::kKept);
+        EXPECT_EQ(queue_.attempts, 0u);
+    }
+    auto queued = apply();
+    ASSERT_TRUE(queued.has_value());
+    EXPECT_EQ(queued->outcome, Outcome::kOffloadQueued);
+    EXPECT_EQ(queue_.attempts, 1u);
+}
+
 // --- Counting queued offloads ------------------------------------------------
 
 // Runs the evictor over an OffloadingReclaimer that queues into queue_ and
@@ -993,6 +1143,66 @@ TEST_F(QueuedOffloadTest, AKeptKeyKeepsItsRank) {
     RunOffloading(ObjectGoal{.target_ratio = 0.5, .count_queued = true});
     EXPECT_EQ(queue_.pushed, std::vector<std::string>{"old"});
     EXPECT_EQ(observer_.applied, std::vector<std::string>{"old"});
+}
+
+// Once every destination is full the run ends: nothing after it could be
+// queued, and the keys it did not reach keep their rank.
+TEST_F(QueuedOffloadTest, ARunEndsOnceEveryDestinationIsFull) {
+    PublishFour();
+    queue_.capacity = 1;
+    queue_.report_all_full = true;
+
+    const auto report = RunOffloading(
+        ObjectGoal{.target_ratio = 1.0, .count_queued = true}, {.async = true});
+
+    EXPECT_TRUE(report.exhausted);
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"k0"});
+    EXPECT_EQ(observer_.applied, (std::vector<std::string>{"k0", "k1"}));
+    EXPECT_EQ(queue_.attempts, 2u);
+}
+
+// Under pressure the run goes on: objects already on disk can still go.
+TEST_F(QueuedOffloadTest, UnderPressureAFullSetOfDestinationsDoesNotEndTheRun) {
+    PublishFour();
+    queue_.capacity = 1;
+    queue_.report_all_full = true;
+    eviction::OffloadingReclaimer reclaimer(inner_, queue_, {.async = true});
+    reclaimer.SetPressure(true);
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer, {&observer_});
+
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .count_queued = true});
+
+    EXPECT_FALSE(report.exhausted);
+    EXPECT_EQ(queue_.attempts, 4u);
+}
+
+// The OffloadingReclaimer keeps the run-wide state of its runs (the cap, the
+// pressure a RunScope sets) and does not support concurrent callbacks, so an
+// evictor with it runs serially whatever its worker count and however
+// parallel the policy and the reclaimer it wraps: count_queued and the kept
+// keys' rank hold as on the serial walk, for a tenant's run too.
+TEST_F(QueuedOffloadTest, AnOffloadingRunStaysSerialWithWorkers) {
+    PublishFour();
+    policy_.parallel = true;
+    inner_.parallel = true;
+    eviction::OffloadingReclaimer reclaimer(inner_, queue_, {.async = true});
+    EXPECT_FALSE(reclaimer.SupportsParallel());
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer, {}, 4);
+
+    auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 0.5, .count_queued = true});
+    EXPECT_EQ(report.workers, 1u);
+    EXPECT_EQ(report.scan_waves, 0u);
+    EXPECT_EQ(queue_.pushed, (std::vector<std::string>{"k0", "k1"}));
+
+    // A tenant's run, as EvictNamespaceMemory makes it.
+    report = evictor.Run(TenantId("a"),
+                         ByteGoal{.target_bytes = 256, .count_queued = true});
+    EXPECT_EQ(report.workers, 1u);
+    EXPECT_EQ(report.scan_waves, 0u);
+    EXPECT_EQ(queue_.pushed,
+              (std::vector<std::string>{"k0", "k1", "k2", "k3"}));
 }
 
 // --- Report observers --------------------------------------------------------

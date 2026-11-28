@@ -493,6 +493,24 @@ MasterMetricManager::MasterMetricManager()
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
           "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
+      offload_evict_pending_bytes_(
+          "master_offload_evict_pending_bytes",
+          "Memory queued for SSD offload by eviction whose copy has not "
+          "ended yet (--offload_on_evict_async)"),
+      offload_evict_pending_objects_(
+          "master_offload_evict_pending_objects",
+          "Objects queued for SSD offload by eviction whose copy has not "
+          "ended yet (--offload_on_evict_async)"),
+      offload_evict_stalled_bytes_(
+          "master_offload_evict_stalled_bytes",
+          "Of master_offload_evict_pending_bytes, the bytes queued to owners "
+          "that ended no copy for --offload_on_evict_stall_ms "
+          "(--offload_on_evict_async)"),
+      offload_evict_no_room_total_(
+          "master_offload_evict_no_room_total",
+          "Eviction offload pushes refused because the owner had "
+          "offloading_queue_limit x offload_cap_ratio offloads in flight, "
+          "or had stalled (--offload_on_evict_async)"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1565,6 +1583,36 @@ void MasterMetricManager::inc_offload_enqueue_rejected(
     offload_enqueue_rejected_total_.inc({client_id}, val);
 }
 
+void MasterMetricManager::set_offload_evict_pending(int64_t bytes,
+                                                    int64_t objects) {
+    offload_evict_pending_bytes_.update(bytes);
+    offload_evict_pending_objects_.update(objects);
+}
+
+int64_t MasterMetricManager::get_offload_evict_pending_bytes() {
+    return offload_evict_pending_bytes_.value();
+}
+
+int64_t MasterMetricManager::get_offload_evict_pending_objects() {
+    return offload_evict_pending_objects_.value();
+}
+
+void MasterMetricManager::set_offload_evict_stalled_bytes(int64_t bytes) {
+    offload_evict_stalled_bytes_.update(bytes);
+}
+
+int64_t MasterMetricManager::get_offload_evict_stalled_bytes() {
+    return offload_evict_stalled_bytes_.value();
+}
+
+void MasterMetricManager::inc_offload_evict_no_room(int64_t val) {
+    offload_evict_no_room_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_evict_no_room() {
+    return offload_evict_no_room_total_.value();
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2432,6 +2480,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_failed_total_);
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
+    serialize_metric(offload_evict_pending_bytes_);
+    serialize_metric(offload_evict_pending_objects_);
+    serialize_metric(offload_evict_stalled_bytes_);
+    serialize_metric(offload_evict_no_room_total_);
     serialize_metric(weight_revisions_by_availability_);
     serialize_metric(weight_revisions_by_residency_);
     serialize_metric(weight_active_leases_);

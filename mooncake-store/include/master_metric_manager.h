@@ -388,6 +388,21 @@ class MasterMetricManager {
     void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
     void inc_offload_enqueue_rejected(const std::string& client_id,
                                       int64_t val = 1);
+    // Async offload-on-evict (--offload_on_evict_async); never touched with
+    // it off.
+    // Memory queued for offload by eviction whose copy has not ended yet.
+    void set_offload_evict_pending(int64_t bytes, int64_t objects);
+    int64_t get_offload_evict_pending_bytes();
+    int64_t get_offload_evict_pending_objects();
+    // Of those, the bytes queued to owners that have stalled
+    // (--offload_on_evict_stall_ms without ending a copy).
+    void set_offload_evict_stalled_bytes(int64_t bytes);
+    int64_t get_offload_evict_stalled_bytes();
+    // Eviction pushes refused because the owner had as many offloads in
+    // flight as offloading_queue_limit x offload_cap_ratio allows, or had
+    // stalled.
+    void inc_offload_evict_no_room(int64_t val = 1);
+    int64_t get_offload_evict_no_room();
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -816,6 +831,10 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_failed_total_;
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
+    ylt::metric::gauge_t offload_evict_pending_bytes_;
+    ylt::metric::gauge_t offload_evict_pending_objects_;
+    ylt::metric::gauge_t offload_evict_stalled_bytes_;
+    ylt::metric::counter_t offload_evict_no_room_total_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;

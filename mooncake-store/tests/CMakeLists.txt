@@ -317,6 +317,7 @@ target_link_libraries(
 add_test(NAME parallel_eviction_test COMMAND parallel_eviction_test)
 set_tests_properties(parallel_eviction_test PROPERTIES TIMEOUT 90)
 add_store_test(evictor_test evictor_test.cpp)
+add_store_test(offload_ledger_test offload_ledger_test.cpp)
 add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
 add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)

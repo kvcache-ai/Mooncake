@@ -69,6 +69,9 @@ class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 class KvcsCapacityProvider;
+namespace eviction {
+class OffloadLedger;
+}  // namespace eviction
 
 // Forward declarations
 class AllocationStrategy;
@@ -1565,6 +1568,15 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    // Async offload-on-evict: the ledger's totals to its gauges.
+    void PublishOffloadLedgerGauges();
+    // Async offload-on-evict: whether `owner` may be handed another copy
+    // (fewer than offload_owner_room_ in flight and not stalled), and
+    // whether any owner whose store accepts offloads may.
+    bool AnyOffloadOwnerHasRoom() const;
+    bool OffloadOwnerHasRoom(const UUID& owner) const;
+    // Async: what eviction has queued for offload and not yet seen end.
+    const eviction::OffloadLedger& offload_ledger() const;
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -1574,10 +1586,14 @@ class MasterService {
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
-    // appended to it on success.
+    // appended to it on success. When `credit` is non-null (async
+    // offload-on-evict), a destination with offload_owner_room_ offloads in
+    // flight refuses with KEYS_ULTRA_LIMIT, and a push that succeeds charges
+    // the eviction ledger and returns the credit there.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        std::vector<UUID>* mirror_clients = nullptr,
+        std::shared_ptr<void>* credit = nullptr);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -1965,6 +1981,21 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
+    // offload_on_evict_async with its prerequisites met (offload on,
+    // offload_on_evict, no OpLog): eviction queues each owner up to
+    // offload_owner_room_ offloads in flight and counts them toward its goal.
+    bool offload_async_{false};
+    // Offloads in flight one owner may have: offloading_queue_limit x
+    // offload_cap_ratio. Async only.
+    uint64_t offload_owner_room_{0};
+    // offload_on_evict_stall_ms: an owner that has not ended a copy (or
+    // received its first one) for this long is stalled: it is handed no more
+    // copies, and its copies in flight no longer count as memory about to be
+    // freed.
+    std::chrono::milliseconds offload_stall_window_{30'000};
+    // offload_force_evict, async only: drop what cannot be queued, and only
+    // under pressure.
+    bool offload_force_evict_{false};
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

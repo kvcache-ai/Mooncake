@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -49,6 +50,10 @@ struct OffloadingTask {
     // offload is pushed once per completed MEMORY replica and those
     // replicas may live on different clients.
     std::vector<UUID> mirror_clients;
+    // Async offload-on-evict: the offload's charge to the eviction ledger
+    // (eviction::OffloadLedger::Credit), given back when the task goes.
+    // Empty otherwise.
+    std::shared_ptr<void> credit;
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
