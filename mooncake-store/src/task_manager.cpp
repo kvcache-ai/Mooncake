@@ -155,7 +155,7 @@ size_t ScopedTaskReadAccess::size() const {
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload,
-    bool retained_by_drain) {
+    std::optional<UUID> drain_job_id) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -176,7 +176,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .message = "",
                  .assigned_client = client_id,
                  .max_retry_attempts = manager_->max_retry_attempts_,
-                 .retained_by_drain = retained_by_drain};
+                 .retained_by_drain = drain_job_id.has_value(),
+                 .drain_job_id = drain_job_id};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push_back(task.id);
@@ -238,10 +239,12 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
     return result;
 }
 
-ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
-                                               const UUID& task_id,
-                                               TaskStatus status,
-                                               const std::string& message) {
+ErrorCode ScopedTaskWriteAccess::complete_task(
+    const UUID& client_id, const UUID& task_id, TaskStatus status,
+    const std::string& message, std::optional<UUID>* drain_job_id) {
+    if (drain_job_id != nullptr) {
+        drain_job_id->reset();
+    }
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
@@ -273,6 +276,9 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         manager_->total_pending_tasks_--;
     }
     task.mark_complete(status, message);
+    if (drain_job_id != nullptr) {
+        *drain_job_id = task.drain_job_id;
+    }
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
     if (ps_it != manager_->processing_tasks_.end()) {

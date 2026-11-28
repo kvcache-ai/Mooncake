@@ -352,7 +352,11 @@ class MasterServiceTestPeer {
     }
 
     static void StopDrainDispatchForTesting(MasterService& service) {
-        service.job_dispatch_running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(service.job_dispatch_mutex_);
+            service.job_dispatch_running_.store(false);
+        }
+        service.job_dispatch_cv_.notify_all();
         service.job_dispatch_thread_.join();
     }
 

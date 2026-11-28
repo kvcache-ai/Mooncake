@@ -340,7 +340,7 @@ TEST_F(ClientTaskManagerTest, DrainTasksAwaitCompletionAndObservation) {
         .key = "key", .source = "source", .target = "target"};
     auto task =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
-            client, payload, true);
+            client, payload, generate_uuid());
     ASSERT_TRUE(task);
     ASSERT_EQ(manager.get_write_access().pop_tasks(client, 1).size(), 1u);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -552,6 +552,50 @@ TEST_P(PendingTaskCompletionQuotaTest, ReleasesPendingQuotaExactlyOnce) {
             waiting_client, payload);
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+}
+
+TEST_F(ClientTaskManagerTest, CompleteTaskReportsDrainJobOnce) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    const UUID client_id = generate_uuid();
+    const UUID wrong_client = generate_uuid();
+    const UUID drain_job_id = generate_uuid();
+    const ReplicaMovePayload payload{
+        .key = "key", .source = "source", .target = "target"};
+
+    auto regular =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, payload);
+    auto drain =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, payload, drain_job_id);
+    ASSERT_TRUE(regular.has_value());
+    ASSERT_TRUE(drain.has_value());
+
+    std::optional<UUID> completed_job = drain_job_id;
+    EXPECT_EQ(
+        manager.get_write_access().complete_task(
+            client_id, *regular, TaskStatus::SUCCESS, "done", &completed_job),
+        ErrorCode::OK);
+    EXPECT_FALSE(completed_job.has_value());
+
+    completed_job = drain_job_id;
+    EXPECT_EQ(
+        manager.get_write_access().complete_task(
+            wrong_client, *drain, TaskStatus::SUCCESS, "wrong", &completed_job),
+        ErrorCode::ILLEGAL_CLIENT);
+    EXPECT_FALSE(completed_job.has_value());
+
+    EXPECT_EQ(
+        manager.get_write_access().complete_task(
+            client_id, *drain, TaskStatus::SUCCESS, "done", &completed_job),
+        ErrorCode::OK);
+    EXPECT_EQ(completed_job, drain_job_id);
+
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client_id, *drain, TaskStatus::SUCCESS, "duplicate",
+                  &completed_job),
+              ErrorCode::OK);
+    EXPECT_FALSE(completed_job.has_value());
 }
 
 INSTANTIATE_TEST_SUITE_P(

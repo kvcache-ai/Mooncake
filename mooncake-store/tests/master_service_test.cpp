@@ -5630,11 +5630,13 @@ TEST_F(MasterServiceTest, DrainJobRechecksExhaustedSourceOnFinalScan) {
     request.max_concurrency = 2;
     auto job_id = service.CreateDrainJob(request);
     ASSERT_TRUE(job_id);
-    MasterServiceTestPeer::RunDrainRoundForTesting(service);
     for (int attempt = 0; attempt < 3; ++attempt) {
-        ASSERT_TRUE(FailPendingMoveTasks(service, source_a.client_id));
-        MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        WaitUntil([&] {
+            MasterServiceTestPeer::RunDrainRoundForTesting(service);
+            return FailPendingMoveTasks(service, source_a.client_id);
+        });
     }
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
     auto job = service.QueryDrainJob(*job_id);
     ASSERT_TRUE(job);
     ASSERT_EQ(job->status, JobStatus::RUNNING);
@@ -5677,8 +5679,10 @@ TEST_F(MasterServiceTest, DrainJobWaitsForBusyKeyWhenConfirmingFailure) {
     auto job_id = service.CreateDrainJob(request);
     ASSERT_TRUE(job_id);
     for (int attempt = 0; attempt < 3; ++attempt) {
-        MasterServiceTestPeer::RunDrainRoundForTesting(service);
-        ASSERT_TRUE(FailPendingMoveTasks(service, source.client_id));
+        WaitUntil([&] {
+            MasterServiceTestPeer::RunDrainRoundForTesting(service);
+            return FailPendingMoveTasks(service, source.client_id);
+        });
     }
 
     std::promise<void> round_started;
@@ -5850,6 +5854,231 @@ TEST_F(MasterServiceTest, DrainSourceOperationsDoNotWaitForJobLock) {
     held.unlock();
     EXPECT_EQ(completion, std::future_status::ready);
     operations.get();
+}
+
+TEST_F(MasterServiceTest,
+       DrainJobRefillsAndCompletesWithoutWaitingForPollInterval) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    constexpr int kObjectCount = 10;
+    for (int i = 0; i < kObjectCount; ++i) {
+        PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    // Start timing after the first move so the initial poll wait is excluded.
+    WaitUntil(
+        [&] { return ExecutePendingMoveTasks(*service_, source.client_id); },
+        std::chrono::milliseconds(4000), std::chrono::milliseconds(5));
+
+    const auto start = std::chrono::steady_clock::now();
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, source.client_id);
+            auto query = service_->QueryDrainJob(*job_id);
+            return query.has_value() && query->status == JobStatus::SUCCEEDED;
+        },
+        std::chrono::milliseconds(8000), std::chrono::milliseconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_LT(elapsed, std::chrono::milliseconds(2000));
+    auto query = service_->QueryDrainJob(*job_id);
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::SUCCEEDED);
+    EXPECT_EQ(query->succeeded_units, static_cast<uint64_t>(kObjectCount));
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINED);
+}
+
+TEST_F(MasterServiceTest, DrainTaskCompletionProcessesOnlyItsJob) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto other_source = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
+    for (int i = 0; i < 3; ++i) {
+        PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    }
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_1");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_2"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil(
+        [&] {
+            auto query = service_->QueryDrainJob(*job_id);
+            return query.has_value() && query->active_units == 1;
+        },
+        std::chrono::milliseconds(4000), std::chrono::milliseconds(1));
+
+    // A sweep just scheduled the first move, so only completion rounds run
+    // until the next sweep. The second refill means the first round ended.
+    request.segments = {"segment_1"};
+    auto other_job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(other_job_id.has_value());
+    ASSERT_TRUE(ExecutePendingMoveTasks(*service_, source.client_id));
+    for (int refill = 0; refill < 2; ++refill) {
+        WaitUntil(
+            [&] {
+                return ExecutePendingMoveTasks(*service_, source.client_id);
+            },
+            std::chrono::milliseconds(4000), std::chrono::milliseconds(1));
+    }
+
+    auto other_job = service_->QueryDrainJob(*other_job_id);
+    ASSERT_TRUE(other_job.has_value());
+    EXPECT_EQ(other_job->status, JobStatus::CREATED);
+}
+
+TEST_F(MasterServiceTest, DrainJobSweepRunsWhileAnotherJobKeepsCompleting) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto other_source = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
+    // Completion rounds are at least 10 ms apart, so this job outlasts the
+    // 500 ms sweep interval.
+    constexpr uint64_t kObjectCount = 100;
+    for (uint64_t i = 0; i < kObjectCount; ++i) {
+        PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    }
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_1");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_2"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil(
+        [&] { return ExecutePendingMoveTasks(*service_, source.client_id); },
+        std::chrono::milliseconds(4000), std::chrono::milliseconds(1));
+
+    request.segments = {"segment_1"};
+    auto other_job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(other_job_id.has_value());
+    bool other_job_started = false;
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, source.client_id);
+            other_job_started =
+                service_->QueryDrainJob(*other_job_id)->status !=
+                JobStatus::CREATED;
+            return other_job_started ||
+                   service_->QueryDrainJob(*job_id)->succeeded_units ==
+                       kObjectCount;
+        },
+        std::chrono::milliseconds(8000), std::chrono::milliseconds(1));
+    EXPECT_TRUE(other_job_started);
+}
+
+TEST_F(MasterServiceTest, DrainJobWaitsBeforeRetryingFailedMove) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] { return FailPendingMoveTasks(*service_, source.client_id); },
+              std::chrono::milliseconds(4000), std::chrono::milliseconds(5));
+    const auto failed_at = std::chrono::steady_clock::now();
+    WaitUntil([&] { return FailPendingMoveTasks(*service_, source.client_id); },
+              std::chrono::milliseconds(4000), std::chrono::milliseconds(5));
+
+    EXPECT_GE(std::chrono::steady_clock::now() - failed_at,
+              std::chrono::milliseconds(400));
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobSettlesWithoutWaitingForPollInterval) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    std::chrono::steady_clock::duration total_settle{0};
+    for (int round = 0; round < 4; ++round) {
+        auto job_id = service_->CreateDrainJob(request);
+        ASSERT_TRUE(job_id.has_value());
+
+        std::vector<TaskAssignment> assignments;
+        WaitUntil(
+            [&] {
+                auto fetched = service_->FetchTasks(source.client_id, 1);
+                if (!fetched || fetched->empty()) {
+                    return false;
+                }
+                assignments = std::move(*fetched);
+                return true;
+            },
+            std::chrono::milliseconds(4000), std::chrono::milliseconds(5));
+        ASSERT_EQ(assignments.size(), 1u);
+        ASSERT_TRUE(service_->CancelDrainJob(*job_id).has_value());
+
+        const auto settle_start = std::chrono::steady_clock::now();
+        TaskCompleteRequest completion;
+        completion.id = assignments.front().id;
+        completion.status = TaskStatus::CANCELED;
+        completion.message = "canceled";
+        ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+        WaitUntil(
+            [&] {
+                auto query = service_->QueryDrainJob(*job_id);
+                return query.has_value() &&
+                       query->status == JobStatus::CANCELED;
+            },
+            std::chrono::milliseconds(4000), std::chrono::milliseconds(5));
+        total_settle += std::chrono::steady_clock::now() - settle_start;
+        EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+                  SegmentStatus::OK);
+    }
+    EXPECT_LT(total_settle, std::chrono::milliseconds(900));
 }
 
 // ===================== Client Offboarding Tests =====================

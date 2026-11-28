@@ -2235,8 +2235,11 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
         const std::string& key, const TenantId& tenant_id,
         const std::string& source, const std::string& target,
-        bool retained_by_drain);
-    void ProcessDrainJobs();
+        std::optional<UUID> drain_job_id);
+    // Processes every drain job, or only `job_ids` when given.
+    void ProcessDrainJobs(
+        const std::unordered_set<UUID, boost::hash<UUID>>* job_ids = nullptr);
+    void NotifyJobDispatch(const UUID& job_id);
     void ProcessDrainJobStop(DrainJob& job);
     void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
     void RefreshDrainJobTasks(DrainJob& job);
@@ -2256,10 +2259,17 @@ class MasterService {
         const std::string& source_segment,
         const CreateDrainJobRequest& request);
 
-    std::thread job_dispatch_thread_;
+    // Leaf lock synchronizing job_dispatch_thread_ wake-ups and shutdown.
+    std::mutex job_dispatch_mutex_;
+    std::condition_variable job_dispatch_cv_;
+    // Drain jobs waiting for a round, e.g. after one of their tasks finished.
+    std::unordered_set<UUID, boost::hash<UUID>> woken_drain_jobs_;
     std::atomic<bool> job_dispatch_running_{false};
+    std::thread job_dispatch_thread_;
     DeadlineScheduler<std::weak_ptr<DrainJob>> drain_job_deadline_scheduler_;
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    // Floor for post-round cooldown; slow scans back off by their own duration.
+    static constexpr uint64_t kMinJobDispatchIntervalMs = 10;
     std::mutex job_mutex_;
     std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
         GUARDED_BY(job_mutex_);
