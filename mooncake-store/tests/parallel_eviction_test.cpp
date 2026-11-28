@@ -4,10 +4,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -22,6 +24,46 @@
 #include "eviction/range_executor.h"
 #include "metadata/lease_eviction_index.h"
 #include "metadata/namespace.h"
+
+namespace {
+// Counts down to the allocation that fails on this thread; 0 fails none. A
+// test arms it to make task admission throw part-way through a wave.
+thread_local size_t fail_allocation_in = 0;
+
+bool FailsThisAllocation() {
+    return fail_allocation_in != 0 && --fail_allocation_in == 0;
+}
+}  // namespace
+
+// Replace the whole set of replaceable allocation functions, as
+// session_tag_test.cpp does: every delete below frees with free, so every new
+// must allocate with malloc.
+void* operator new(size_t size) {
+    if (!FailsThisAllocation()) {
+        if (void* ptr = std::malloc(size ? size : 1)) {
+            return ptr;
+        }
+    }
+    throw std::bad_alloc();
+}
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+    return FailsThisAllocation() ? nullptr : std::malloc(size ? size : 1);
+}
+void* operator new[](size_t size) { return operator new(size); }
+void* operator new[](size_t size, const std::nothrow_t& tag) noexcept {
+    return operator new(size, tag);
+}
+
+void operator delete(void* ptr) noexcept { std::free(ptr); }
+void operator delete(void* ptr, size_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, const std::nothrow_t&) noexcept {
+    std::free(ptr);
+}
+void operator delete[](void* ptr) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, size_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept {
+    std::free(ptr);
+}
 
 namespace mooncake {
 namespace {
@@ -411,6 +453,50 @@ TEST(RangeExecutorTest, AdmissionFailureDoesNotWaitOnAnUnadmittedFuture) {
                                 return uint64_t{1};
                             }),
         std::runtime_error);
+}
+
+TEST(RangeExecutorTest, AdmissionFailureJoinsAdmittedWorkersBeforeReturning) {
+    // Fails each allocation of one wave's admission in turn, so admission
+    // throws before the first worker is admitted, between two workers and
+    // after the last one, whatever the standard library allocates per task.
+    size_t partial_admissions = 0;
+    for (size_t nth = 1;; ++nth) {
+        TwoWaves cursor;
+        ThreadPool pool(4);
+        std::atomic<bool> returned{false};
+        std::atomic<int> visits{0};
+        std::atomic<int> late{0};
+        bool failed = false;
+        fail_allocation_in = nth;
+        try {
+            eviction::RunRanges(
+                cursor, pool, 1,
+                [&](uint32_t, uint64_t i, eviction::RangeStop&) {
+                    // Outlasts the unwinding of a run that does not join.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    ++visits;
+                    if (returned.load()) {
+                        ++late;
+                    }
+                    return uint64_t(cursor.alive[i].exchange(false));
+                },
+                1);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        fail_allocation_in = 0;
+        returned.store(true);
+        pool.stop();
+        EXPECT_EQ(late.load(), 0) << "failing allocation " << nth;
+        if (!failed) {
+            break;
+        }
+        if (visits.load() > 0) {
+            ++partial_admissions;
+        }
+    }
+    // The sweep is only a test if some failure followed an admission.
+    EXPECT_GT(partial_admissions, 0u);
 }
 
 TEST(RangeExecutorTest, SerialExceptionPropagatesWithoutAnotherWave) {

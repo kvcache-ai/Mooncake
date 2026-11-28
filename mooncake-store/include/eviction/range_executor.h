@@ -101,12 +101,21 @@ class RangeExecutor {
         // Reserve up front so appending an admitted future cannot reallocate.
         std::vector<std::future<void>> pending;
         pending.reserve(workers);
-        for (uint32_t worker = 0; worker < workers; ++worker) {
-            auto task = std::make_shared<std::packaged_task<void()>>(
-                [this, worker] { RunWorker(worker); });
-            auto future = task->get_future();
-            pool->enqueue([task] { (*task)(); });
-            pending.push_back(std::move(future));
+        try {
+            for (uint32_t worker = 0; worker < workers; ++worker) {
+                auto task = std::make_shared<std::packaged_task<void()>>(
+                    [this, worker] { RunWorker(worker); });
+                auto future = task->get_future();
+                pool->enqueue([task] { (*task)(); });
+                pending.push_back(std::move(future));
+            }
+        } catch (...) {
+            // Admission failed part-way. The tasks already admitted still run
+            // against this executor, so join them before the failure leaves.
+            for (auto& future : pending) {
+                future.wait();
+            }
+            throw;
         }
 
         // Join every task first: get() rethrows, and that must not skip the
