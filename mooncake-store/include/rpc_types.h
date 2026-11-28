@@ -18,8 +18,15 @@ using WeightRpcResult =
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
+    uint64_t shared_kv_allocation_id = 0;
 };
-YLT_REFL(ObjectMeta, key, object_checksum);
+YLT_REFL(ObjectMeta, key, object_checksum, shared_kv_allocation_id);
+
+struct SharedKvObjectRef {
+    std::string key;
+    uint64_t allocation_id = 0;
+};
+YLT_REFL(SharedKvObjectRef, key, allocation_id);
 
 enum class ReplicaActionType {
     ADD = 0,
