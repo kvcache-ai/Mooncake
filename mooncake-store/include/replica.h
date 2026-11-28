@@ -617,6 +617,14 @@ class Replica {
         return true;
     }
 
+    bool replace_nof_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
+        if (!buffer || !is_nof_replica()) {
+            return false;
+        }
+        std::get<NoFReplicaData>(data_).buffer = std::move(buffer);
+        return true;
+    }
+
     [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);
