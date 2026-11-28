@@ -208,6 +208,7 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
   add_store_test(nof_env_reacquire_test nof_env_reacquire_test.cpp)
 endif()
+add_store_test(nof_io_layout_test nof_io_layout_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
