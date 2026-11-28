@@ -1710,6 +1710,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(build_bucket_result.error());
     }
     auto bucket = build_bucket_result.value();
+    // The .meta file is part of the bucket's footprint: encode it now so that
+    // admission below reserves its real size, and write these same bytes.
+    // meta_size is not serialized, so setting it leaves the encoding as is.
+    std::string serialized_meta;
+    struct_pb::to_pb(*bucket, serialized_meta);
+    bucket->meta_size = static_cast<int64_t>(serialized_meta.size());
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
@@ -1751,9 +1757,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             << finalize_result.error();
     }
 
-    auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs, disk_index);
+    auto write_bucket_result =
+        WriteBucket(bucket_id, bucket, iovs, disk_index, serialized_meta);
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
+        // Not every failed write removes what it left on disk: the packed
+        // io_uring path (UringFile::write_aligned) keeps a partial data
+        // file. No index entry points at it, so eviction would never reclaim
+        // it. Nothing else uses this bucket id, and the files are gone
+        // before the reservation that covers them is released.
+        CleanupOrphanedBucket(bucket_id, disk_index);
         ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
@@ -3076,7 +3089,8 @@ BucketStorageBackend::BuildAlignedDirectBucket(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-    std::vector<iovec>& iovs, int disk_index) {
+    std::vector<iovec>& iovs, int disk_index,
+    const std::string& serialized_meta) {
     namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id, disk_index);
     if (!bucket_data_path_res) {
@@ -3262,7 +3276,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
 
     auto store_bucket_metadata_result =
-        StoreBucketMetadata(bucket_id, bucket_metadata, disk_index);
+        StoreBucketMetadata(bucket_id, disk_index, serialized_meta);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
@@ -4309,7 +4323,7 @@ void BucketStorageBackend::RemoveAll() {
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
-    int64_t id, std::shared_ptr<BucketMetadata> metadata, int disk_index) {
+    int64_t id, int disk_index, const std::string& serialized_meta) {
     auto meta_path_res = GetBucketMetadataPath(id, disk_index);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
@@ -4322,22 +4336,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
+    auto write_result = file->write(serialized_meta, serialized_meta.size());
     if (!write_result) {
         NotifyDiskError(file->sys_errno(), "write");
         LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-    if (write_result.value() != str.size()) {
+    if (write_result.value() != serialized_meta.size()) {
         LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
+                   << ", expected: " << serialized_meta.size()
                    << ", got: " << write_result.value();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    metadata->meta_size = str.size();
     return {};
 }
 

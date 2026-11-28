@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -28,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -6583,6 +6585,277 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     ASSERT_TRUE(exists.has_value());
     EXPECT_FALSE(exists.value());
 }
+
+namespace {
+
+// One bucket of long keys and one-byte values, so that its .meta file is
+// larger than its data file.
+struct SmallValueBatch {
+    std::string value = "v";
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+
+    SmallValueBatch(const std::string& prefix, int count) {
+        for (int i = 0; i < count; ++i) {
+            batch.emplace(prefix + std::string(100, 'k') + std::to_string(i),
+                          std::vector<Slice>{Slice{value.data(), 1}});
+        }
+    }
+};
+
+// Sizes of the bucket data and .meta files in a directory.
+struct BucketFileSizes {
+    int64_t data = 0;
+    int64_t meta = 0;
+};
+
+BucketFileSizes MeasureBucketFiles(const std::string& dir) {
+    BucketFileSizes sizes;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const auto size = static_cast<int64_t>(entry.file_size());
+        if (entry.path().extension() == ".bucket") sizes.data += size;
+        if (entry.path().extension() == ".meta") sizes.meta += size;
+    }
+    return sizes;
+}
+
+// Caps the size of any file this process writes (RLIMIT_FSIZE), the way a
+// full disk stops a write partway: a write past the cap fails with EFBIG.
+class FileSizeLimitForTest {
+   public:
+    explicit FileSizeLimitForTest(rlim_t limit) {
+        EXPECT_EQ(getrlimit(RLIMIT_FSIZE, &saved_limit_), 0);
+        struct sigaction ignore{};
+        ignore.sa_handler = SIG_IGN;
+        EXPECT_EQ(sigaction(SIGXFSZ, &ignore, &saved_action_), 0);
+        struct rlimit limited = saved_limit_;
+        limited.rlim_cur = limit;
+        EXPECT_EQ(setrlimit(RLIMIT_FSIZE, &limited), 0);
+    }
+    ~FileSizeLimitForTest() {
+        setrlimit(RLIMIT_FSIZE, &saved_limit_);
+        sigaction(SIGXFSZ, &saved_action_, nullptr);
+    }
+
+   private:
+    struct rlimit saved_limit_{};
+    struct sigaction saved_action_{};
+};
+
+ErrorCode AcceptOffload(const std::vector<std::string>&,
+                        std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
+// The .meta file is part of a bucket's footprint: admission must reserve its
+// encoded size along with the data, against both the logical quota and the
+// physical cap. Reserving the data alone lets every bucket overshoot both caps
+// by the size of its metadata.
+TEST_F(StorageBackendTest, BucketAdmissionReservesMetadataSize) {
+    SmallValueBatch bucket("reserve_", 64);
+    struct Outcome {
+        bool admitted = false;
+        int completions = 0;
+        int64_t total_size = 0;
+        int64_t total_keys = 0;
+        int files = 0;
+    };
+    auto offload = [&](const std::string& name, int64_t max_total_size,
+                       int64_t max_physical_bytes) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/" + name;
+        fs::create_directories(config.storage_filepath);
+        BucketBackendConfig bucket_config;
+        bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+        bucket_config.max_total_size = max_total_size;
+        bucket_config.max_physical_bytes = max_physical_bytes;
+        BucketStorageBackend backend(config, bucket_config);
+        Outcome outcome;
+        EXPECT_TRUE(backend.Init());
+        outcome.admitted =
+            backend
+                .BatchOffload(bucket.batch,
+                              [&outcome](const std::vector<std::string>&,
+                                         std::vector<StorageObjectMetadata>&) {
+                                  ++outcome.completions;
+                                  return ErrorCode::OK;
+                              })
+                .has_value();
+        auto state = backend.GetStoreMetadata();
+        EXPECT_TRUE(state.has_value());
+        if (state) {
+            outcome.total_size = state->total_size;
+            outcome.total_keys = state->total_keys;
+        }
+        outcome.files = CountDataFiles(config.storage_filepath);
+        return outcome;
+    };
+
+    // With room to spare, the committed size is the bucket's footprint: its
+    // data plus its .meta file.
+    const auto loose = offload("loose", 1LL << 30, 0);
+    ASSERT_TRUE(loose.admitted);
+    const int64_t footprint = loose.total_size;
+    const auto files = MeasureBucketFiles(data_path + "/loose");
+    ASSERT_GT(files.meta, 0);
+    ASSERT_EQ(footprint, files.data + files.meta);
+
+    struct Case {
+        const char* name;
+        int64_t max_total_size;
+        int64_t max_physical_bytes;
+        bool admitted;
+    };
+    for (const auto& c :
+         {Case{"quota_short", footprint - 1, 0, false},
+          Case{"quota_exact", footprint, 0, true},
+          Case{"physical_short", 4 * footprint, footprint - 1, false}}) {
+        SCOPED_TRACE(c.name);
+        const auto outcome =
+            offload(c.name, c.max_total_size, c.max_physical_bytes);
+        if (c.admitted) {
+            ASSERT_TRUE(outcome.admitted);
+            EXPECT_EQ(outcome.completions, 1);
+            EXPECT_EQ(outcome.total_size, footprint);
+        } else {
+            EXPECT_FALSE(outcome.admitted)
+                << "the bucket's metadata does not fit under the cap";
+            EXPECT_EQ(outcome.completions, 0);
+            EXPECT_EQ(outcome.total_size, 0);
+            EXPECT_EQ(outcome.total_keys, 0);
+            EXPECT_EQ(outcome.files, 0);
+        }
+    }
+}
+
+// A bucket write that fails partway must not leave its data or .meta file
+// behind. Nothing indexes such a file, so eviction never reclaims it: it holds
+// disk space and counts against the physical cap until the next restart.
+TEST_F(StorageBackendTest, BucketWriteFailureRemovesPartialFiles) {
+    SmallValueBatch bucket("partial_", 64);
+    BucketFileSizes sizes;
+    {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/measure";
+        fs::create_directories(config.storage_filepath);
+        BucketStorageBackend backend(config, BucketBackendConfig{});
+        ASSERT_TRUE(backend.Init());
+        ASSERT_TRUE(backend.BatchOffload(bucket.batch, AcceptOffload));
+        sizes = MeasureBucketFiles(config.storage_filepath);
+    }
+    ASSERT_GT(sizes.meta, sizes.data + 64);
+    struct Case {
+        const char* name;
+        rlim_t file_size_limit;
+    };
+    // Below the data size, the data file is cut short. Between the two sizes,
+    // the data file is complete and the .meta file is cut short.
+    for (const auto& c :
+         {Case{"data_cut_short", static_cast<rlim_t>(sizes.data / 2)},
+          Case{"meta_cut_short",
+               static_cast<rlim_t>((sizes.data + sizes.meta) / 2)}}) {
+        SCOPED_TRACE(c.name);
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/" + c.name;
+        fs::create_directories(config.storage_filepath);
+        BucketStorageBackend backend(config, BucketBackendConfig{});
+        ASSERT_TRUE(backend.Init());
+
+        tl::expected<int64_t, ErrorCode> result;
+        {
+            FileSizeLimitForTest limit(c.file_size_limit);
+            result = backend.BatchOffload(bucket.batch, AcceptOffload);
+        }
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(CountDataFiles(config.storage_filepath), 0)
+            << "a failed bucket write left a partial file behind";
+        auto state = backend.GetStoreMetadata();
+        ASSERT_TRUE(state.has_value());
+        EXPECT_EQ(state->total_size, 0);
+        EXPECT_EQ(state->total_keys, 0);
+
+        // The reservation was released: the same keys go through on retry.
+        ASSERT_TRUE(backend.BatchOffload(bucket.batch, AcceptOffload));
+        EXPECT_EQ(CountDataFiles(config.storage_filepath), 2);
+    }
+}
+
+#ifdef USE_URING
+// Packed direct writes go through UringFile::write_aligned, which does not
+// remove the data file when the ring reports a write error. BatchOffload must
+// remove it, or the partial file stays on disk with nothing indexing it.
+TEST_F(StorageBackendTest, UringPackedBucketWriteFailureRemovesPartialFile) {
+    {
+        struct io_uring ring;
+        if (io_uring_queue_init(2, &ring, 0) < 0)
+            GTEST_SKIP() << "io_uring is unavailable";
+        io_uring_queue_exit(&ring);
+    }
+    const char* kDirectWrite = "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE";
+    std::optional<std::string> saved_direct_write;
+    if (const char* value = std::getenv(kDirectWrite)) {
+        saved_direct_write = value;
+    }
+    setenv(kDirectWrite, "packed", 1);
+    struct RestoreEnv {
+        const char* name;
+        const std::optional<std::string>& saved;
+        ~RestoreEnv() {
+            if (saved) {
+                setenv(name, saved->c_str(), 1);
+            } else {
+                unsetenv(name);
+            }
+        }
+    } restore_env{kDirectWrite, saved_direct_write};
+
+    // Eight 64 KiB values: a 512 KiB bucket, cut short at 128 KiB.
+    const std::string value(64 * 1024, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (int i = 0; i < 8; ++i) {
+        batch.emplace("uring_partial_" + std::to_string(i),
+                      std::vector<Slice>{Slice{const_cast<char*>(value.data()),
+                                               value.size()}});
+    }
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/target";
+    fs::create_directories(config.storage_filepath);
+    config.use_uring = true;
+    {
+        // The packed path must work here at all for the failure to mean
+        // anything.
+        FileStorageConfig probe_config = config;
+        probe_config.storage_filepath = data_path + "/probe";
+        fs::create_directories(probe_config.storage_filepath);
+        BucketStorageBackend probe(probe_config, BucketBackendConfig{});
+        ASSERT_TRUE(probe.Init());
+        if (!probe.BatchOffload(batch, AcceptOffload)) {
+            GTEST_SKIP() << "packed direct bucket writes are unavailable here";
+        }
+    }
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+
+    tl::expected<int64_t, ErrorCode> result;
+    {
+        FileSizeLimitForTest limit(128 * 1024);
+        result = backend.BatchOffload(batch, AcceptOffload);
+    }
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(CountDataFiles(config.storage_filepath), 0)
+        << "a failed io_uring bucket write left a partial file behind";
+    auto state = backend.GetStoreMetadata();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->total_size, 0);
+    EXPECT_EQ(state->total_keys, 0);
+
+    // The reservation was released: the same keys go through on retry.
+    ASSERT_TRUE(backend.BatchOffload(batch, AcceptOffload));
+    EXPECT_EQ(CountDataFiles(config.storage_filepath), 2);
+}
+#endif
 
 // A failed disk syscall reaches the disk-error observer with its errno and
 // name; a logical failure (no errno) does not.
