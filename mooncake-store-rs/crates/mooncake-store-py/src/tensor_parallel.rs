@@ -405,7 +405,10 @@ impl PyMooncakeDistributedStore {
                     shard_info.dtype as i32,
                     &global_shape,
                     &shard_info.shape,
-                    &[],
+                    &[
+                        ParallelAxisSpec::new(ParallelAxisKind::TP, wp.rank, wp.size)
+                            .with_split_dim(wp.split_dim),
+                    ],
                     shard_info.data_bytes as u64,
                 );
                 let status = self.put_tensor_object(
@@ -1133,7 +1136,8 @@ fn extract_tensor_info_from_buffer(
     let _ = pointer_from_usize(buffer_ptr)?;
     let data =
         unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, TensorMetadata::WIRE_SIZE) };
-    let parsed = TensorMetadata::parse(data)
+    let parsed = TensorMetadata::parse_prefix(data)
+        .filter(|parsed| parsed.metadata.validate(size))
         .ok_or_else(|| PyValueError::new_err("invalid tensor metadata in raw buffer"))?;
 
     let ndim = parsed.metadata.header.ndim as usize;
@@ -1143,15 +1147,19 @@ fn extract_tensor_info_from_buffer(
         PyValueError::new_err(format!("unsupported dtype in raw buffer: {dtype_i32}"))
     })?;
 
-    let required = TensorMetadata::WIRE_SIZE + parsed.data_bytes;
-    if size < required {
-        return Err(PyValueError::new_err(format!(
-            "buffer too small for tensor data: need {required} bytes, got {size}",
-        )));
+    let shape_bytes = shape.iter().try_fold(dtype.element_size(), |bytes, &dim| {
+        bytes.checked_mul(usize::try_from(dim).ok()?)
+    });
+    if shape_bytes != Some(parsed.data_bytes) {
+        return Err(PyValueError::new_err(
+            "raw tensor shape and dtype do not match data_bytes",
+        ));
     }
 
     let info = TensorInfo {
-        data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
+        data_ptr: buffer_ptr
+            .checked_add(parsed.data_offset)
+            .ok_or_else(|| PyValueError::new_err("tensor data pointer overflows usize"))?,
         data_bytes: parsed.data_bytes,
         shape,
         dtype,
@@ -1354,10 +1362,7 @@ impl PyMooncakeDistributedStore {
                     .ok_or_else(|| {
                         PyValueError::new_err("_from: failed to build shard write plan")
                     })?;
-                    let shard_data = extract_shard_data_from_buffer(
-                        buffer_ptr + TensorMetadata::WIRE_SIZE,
-                        &plan,
-                    );
+                    let shard_data = extract_shard_data_from_buffer(info.data_ptr, &plan);
                     let global = info.shape.clone();
                     return self.put_tensor_object_from_vec(
                         &get_parallelism_key_name(key, spec),
@@ -1447,8 +1452,7 @@ impl PyMooncakeDistributedStore {
                     PyValueError::new_err("_from: failed to build writer shard write plan")
                 })?;
 
-                let shard_data =
-                    extract_shard_data_from_buffer(buffer_ptr + TensorMetadata::WIRE_SIZE, &plan);
+                let shard_data = extract_shard_data_from_buffer(info.data_ptr, &plan);
 
                 let storage_key =
                     get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
@@ -1456,7 +1460,10 @@ impl PyMooncakeDistributedStore {
                     info.dtype as i32,
                     &global_shape,
                     &plan.shard_shape,
-                    &[],
+                    &[
+                        ParallelAxisSpec::new(ParallelAxisKind::TP, wp.rank, wp.size)
+                            .with_split_dim(wp.split_dim),
+                    ],
                     plan.shard_bytes as u64,
                 );
 
