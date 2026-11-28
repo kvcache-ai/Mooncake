@@ -21,6 +21,7 @@
 #endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -537,6 +538,52 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     return len - nbytes;
 }
 
+// Like readFully(), but the whole read must finish by `deadline`, however the
+// peer paces its bytes. readFully() relies on SO_RCVTIMEO, which restarts on
+// every byte, so a peer that sends a byte every few seconds can hold it for
+// minutes. This waits in poll() for the time left instead and never blocks
+// past the deadline.
+static inline ssize_t readFullyUntil(
+    int fd, void *buf, size_t len,
+    std::chrono::steady_clock::time_point deadline) {
+    char *pos = (char *)buf;
+    size_t nbytes = len;
+    while (nbytes) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            LOG(WARNING) << "Socket read timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        auto wait_ms =
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - now)
+                .count();
+        struct pollfd pfd = {fd, POLLIN, 0};
+        int ready = poll(&pfd, 1, wait_ms > 60000 ? 60000 : (int)wait_ms);
+        if (ready < 0 && errno != EINTR) {
+            PLOG(ERROR) << "Socket read failed";
+            return -1;
+        }
+        if (ready <= 0) continue;  // timed out or interrupted: check deadline
+        ssize_t rc = recv(fd, pos, nbytes, MSG_DONTWAIT);
+        if (rc < 0 &&
+            (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (rc < 0) {
+            PLOG(ERROR) << "Socket read failed";
+            return rc;
+        }
+        if (rc == 0) {
+            LOG(WARNING) << "Socket read incompleted: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        pos += rc;
+        nbytes -= rc;
+    }
+    return len;
+}
+
 static inline int writeString(int fd, const HandShakeRequestType type,
                               const std::string &str) {
     uint8_t byte = static_cast<uint8_t>(type);
@@ -622,12 +669,21 @@ static inline size_t getHandshakeMaxNotifyEntries() {
     return max_entries;
 }
 
-static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
+// Reads one handshake frame. With a `deadline`, the whole frame must arrive by
+// then (see readFullyUntil()); without one, each read is bounded only by the
+// socket's SO_RCVTIMEO.
+static inline std::pair<HandShakeRequestType, std::string> readString(
+    int fd, std::optional<std::chrono::steady_clock::time_point> deadline =
+                std::nullopt) {
+    auto read_fully = [fd, &deadline](void *buf, size_t len) {
+        return deadline ? readFullyUntil(fd, buf, len, *deadline)
+                        : readFully(fd, buf, len);
+    };
     HandShakeRequestType type = HandShakeRequestType::Invalid;
 
     const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
-    ssize_t n = readFully(fd, &length, sizeof(length));
+    ssize_t n = read_fully(&length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
         LOG(WARNING) << "readString: incomplete handshake length, got: " << n;
         return {type, ""};
@@ -645,7 +701,7 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
 
     std::string str;
     std::vector<char> buffer(length);
-    n = readFully(fd, buffer.data(), length);
+    n = read_fully(buffer.data(), length);
     if (n != (ssize_t)length) {
         LOG(ERROR) << "readString: unexpected length, got: " << n
                    << ", expected: " << length;
