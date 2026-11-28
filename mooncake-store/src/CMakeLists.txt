@@ -409,7 +409,7 @@ target_link_libraries(
   PUBLIC Mooncake::boost glog::glog yalantinglibs::yalantinglibs
          cachelib_memory_allocator mooncake_common)
 
-if(USE_NOF)
+if(USE_NOF AND USE_NOF_SPDK)
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -527,6 +527,20 @@ if(USE_NOF)
               "will remain unfixed: pure-NoF writes over RDMA will fail with "
               "'No translation for ptr' errors.")
   endif()
+endif()
+
+if(USE_NOF AND USE_NOF_LINUX)
+  add_library(
+    mooncake_nof_linux STATIC nof/linux_initiator.cpp nof/linux_device.cpp
+                              nof/linux_io_queue.cpp)
+  target_include_directories(
+    mooncake_nof_linux
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(
+    mooncake_nof_linux
+    PUBLIC mooncake_nof_core
+    PRIVATE Mooncake::liburing glog::glog)
 endif()
 
 # Resolve target-independent configuration before defining the Store targets.
@@ -745,11 +759,14 @@ endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE PkgConfig::KVCS)
 endif()
-if(USE_NOF)
+if(USE_NOF AND USE_NOF_SPDK)
   # The master-side NoF heartbeat probe path (master_service.cpp) goes through
   # the neutral interface in nof/nof_runtime.cpp (shared sources) into the
   # SPDK-backed initiator.
   target_link_libraries(mooncake_store_master PRIVATE mooncake_nof_spdk)
+endif()
+if(USE_NOF AND USE_NOF_LINUX)
+  target_link_libraries(mooncake_store_master PRIVATE mooncake_nof_linux)
 endif()
 
 # Complete public Store library.
@@ -775,13 +792,26 @@ target_link_libraries(
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
           OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
-if(USE_NOF)
+if(USE_NOF AND USE_NOF_SPDK)
   # SPDK/DPDK stay confined to mooncake_nof_spdk (PRIVATE) instead of
   # propagating to every mooncake_store consumer.
   target_link_libraries(mooncake_store PRIVATE mooncake_nof_spdk)
 endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCS)
+endif()
+if(USE_NOF AND USE_NOF_LINUX)
+  target_link_libraries(mooncake_store PRIVATE mooncake_nof_linux)
+endif()
+# Cargo and cgo assemble their own link lines for the static Store.
+if(TARGET mooncake_nof_linux AND NOT BUILD_SHARED_LIBS)
+  set(MOONCAKE_STORE_LINK_NOF_LINUX
+      TRUE
+      CACHE INTERNAL "Link the Linux NoF archive in native bindings")
+else()
+  set(MOONCAKE_STORE_LINK_NOF_LINUX
+      FALSE
+      CACHE INTERNAL "Link the Linux NoF archive in native bindings")
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)

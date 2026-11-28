@@ -46,7 +46,11 @@ CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lmooncake_local_ssd -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
+CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lmooncake_local_ssd -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common"
+if grep -qx 'MOONCAKE_STORE_LINK_NOF_LINUX:INTERNAL=TRUE' "${BUILD_DIR}/CMakeCache.txt"; then
+    CGO_LDFLAGS+=" -lmooncake_nof_linux"
+fi
+CGO_LDFLAGS+=" -Wl,--end-group"
 CGO_LDFLAGS+=" -lasio -lxxhash -lyaml-cpp"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
 

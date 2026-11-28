@@ -206,6 +206,8 @@ add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+endif()
+if(USE_NOF AND USE_NOF_SPDK)
   add_store_test(nof_env_reacquire_test nof_env_reacquire_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
@@ -684,3 +686,19 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+if(USE_NOF AND USE_NOF_LINUX)
+  add_store_test(nof_linux_initiator_test nof_linux_initiator_test.cpp)
+  target_include_directories(nof_linux_initiator_test PRIVATE ../src)
+  target_link_libraries(nof_linux_initiator_test PUBLIC mooncake_nof_linux)
+
+  add_executable(nof_linux_io_queue_test nof_linux_io_queue_test.cpp)
+  target_include_directories(nof_linux_io_queue_test PRIVATE ../src)
+  target_link_libraries(
+    nof_linux_io_queue_test PRIVATE mooncake_nof_linux Mooncake::liburing
+                                    gtest_main)
+  target_link_options(nof_linux_io_queue_test PRIVATE
+                      "-Wl,--wrap=io_uring_submit")
+  add_test(NAME nof_linux_io_queue_test COMMAND nof_linux_io_queue_test)
+  set_tests_properties(nof_linux_io_queue_test PROPERTIES TIMEOUT 30)
+endif()
