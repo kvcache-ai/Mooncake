@@ -516,7 +516,16 @@ int EfaTransport::registerLocalMemoryInternal(
             std::vector<int> ret_codes(assigned_nics.size(), 0);
             const int ar = access_rights;
 
-            for (size_t j = 0; j < assigned_nics.size(); ++j) {
+            // Register the first NIC on its own before fanning out. Its
+            // long-term pin migrates any pages the kernel cannot pin in place
+            // (e.g. pages in CMA pageblocks). If all NICs pin the same pages
+            // at once, the pins race: one NIC holds a page while the others
+            // try to migrate it, and every NIC but one fails with ENOMEM.
+            ret_codes[0] =
+                context_list_[assigned_nics[0]]->registerMemoryRegion(
+                    chunk_addr, chunk_len, ar);
+            for (size_t j = ret_codes[0] == 0 ? 1 : assigned_nics.size();
+                 j < assigned_nics.size(); ++j) {
                 size_t nic_idx = assigned_nics[j];
                 reg_threads.emplace_back([this, &ret_codes, j, nic_idx,
                                           chunk_addr, chunk_len, ar]() {
