@@ -9,8 +9,8 @@ pub use control::{
     serve_route_control_request, RouteControlRequest, RouteControlResponse, RouteControlTransport,
 };
 pub use mesh::{
-    is_readable_filter_active, route_has_readable_replicas, update_readable_filter,
-    LocalRouteAuthority,
+    is_readable_filter_active, route_has_readable_replicas, snapshot_route_gauges,
+    update_readable_filter, LocalRouteAuthority,
 };
 pub use metrics::{set_route_metrics_sink, RouteMetricsSink};
 pub use shim::{
@@ -18,3 +18,4 @@ pub use shim::{
     RouteHitReporter, RouteMembershipProvider, RouteOperations, RouteOwnerPage,
     RouteOwnerPageQuery, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
+pub use table::RouteGaugeSnapshot;

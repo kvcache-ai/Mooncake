@@ -4,8 +4,13 @@
 #include <string>
 
 #include "conductor/prefixindex/types.h"
+#include "conductor/zmq/event_type.h"
 
 namespace mooncake::conductor::kvevent {
+
+std::string NormalizeExternalHashes(
+    const std::vector<zmq::ExternalHash>& external_hashes,
+    std::vector<prefixindex::ProjectedPrefix>* output);
 
 struct ParsedSglangObjectKey {
     // The key prefix through the logical hash, excluding physical suffixes
