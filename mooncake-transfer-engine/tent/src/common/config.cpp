@@ -457,16 +457,17 @@ Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
     parsed.egm_enabled = config.get("transports/mnnvl/egm", false);
     if (parsed.require_fabric) {
         CHECK_STATUS(read_bool("transports/mnnvl/egm", parsed.egm_enabled));
-        bool enabled = true, force_tcp = false;
+        bool enabled = true, force_tcp = false, force_fabric = false;
         CHECK_STATUS(read_bool("transports/mnnvl/enable", enabled));
         CHECK_STATUS(read_bool("transports/force_tcp", force_tcp));
-        if (!enabled || force_tcp ||
+        CHECK_STATUS(read_bool("transports/force_fabric", force_fabric));
+        if (!enabled || force_tcp || force_fabric ||
             (configured("transports/nvlink/handle_type") &&
              config.get<json>("transports/nvlink/handle_type", json()) !=
                  json("fabric")))
             return Status::InvalidArgument(
                 "Strict MNNVL requires enabled MNNVL and FABRIC handles "
-                "without force_tcp");
+                "without force_tcp or force_fabric");
     }
     options = parsed;
     return Status::OK();

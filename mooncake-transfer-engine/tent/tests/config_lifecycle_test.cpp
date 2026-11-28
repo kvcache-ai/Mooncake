@@ -417,6 +417,8 @@ TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
              {"transports/mnnvl/enable", "true"},
              {"transports/force_tcp", true},
              {"transports/force_tcp", "false"},
+             {"transports/force_fabric", true},
+             {"transports/force_fabric", "false"},
              {"transports/nvlink/handle_type", "posix_fd"},
              {"transports/nvlink/handle_type", 0}}) {
         Config config;
