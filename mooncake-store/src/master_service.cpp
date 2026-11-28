@@ -385,7 +385,8 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  {&metrics, &log}, settings.worker_threads) {}
+                  {&metrics, &log}, settings.worker_threads,
+                  eviction::Evictor::kSkippedKeyBackoff) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -443,6 +444,9 @@ struct MasterService::KvcsDfsEviction {
         : policy(service, allow_soft_pinned,
                  MemoryEviction::ReplicaKind::kKvcsDfs),
           reclaimer(service),
+          // Postpones nothing: it walks the index memory eviction walks, and
+          // a memory-only key it skips (nothing to release for it) is one
+          // memory eviction may take.
           evictor(service.namespaces_, policy, reclaimer, {&metrics}) {}
 
     MemoryEviction::Policy policy;
@@ -9657,7 +9661,47 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // holds now.
     const auto keys = ns.InFlightKeys();
 
+    // A pass write-holds a key only once a look under a read lock finds work
+    // it acts on, and judges that work again under the write lock: the
+    // release of every write guard files its key in the eviction index again,
+    // which would undo, every round, the postponement (EvictionIndex::Postpone)
+    // of a key whose memory an offload in flight holds.
+    const auto acts_on = [&](const std::string& key, const auto& acts) {
+        const MetadataAccessorRO reader(this, tenant_id, key);
+        return reader.IsPublished() && acts(reader.Get(), reader.GetState());
+    };
+    const auto expired = [&](std::chrono::system_clock::time_point start) {
+        return start + put_start_release_timeout_sec_ <= now;
+    };
+    // A write that finished, or ran out of time before it did.
+    const auto processing_ended = [&](const ObjectMetadata& metadata,
+                                      const route::ObjectState& state) {
+        return state.is_processing &&
+               (!metadata.IsValid() ||
+                metadata.AllReplicas(&Replica::fn_is_completed) ||
+                metadata.put_start_time + put_start_release_timeout_sec_ < now);
+    };
+    const auto replication_expired = [&](const ObjectMetadata&,
+                                         const route::ObjectState& state) {
+        return state.replication_task &&
+               !state.replication_task->durable_cleanup_pending &&
+               expired(state.replication_task->start_time);
+    };
+    const auto offload_expired = [&](const ObjectMetadata&,
+                                     const route::ObjectState& state) {
+        return state.offloading_task &&
+               expired(state.offloading_task->start_time);
+    };
+    const auto promotion_expired = [&](const ObjectMetadata&,
+                                       const route::ObjectState& state) {
+        return state.promotion_task &&
+               expired(state.promotion_task->start_time);
+    };
+
     for (const auto& key : keys) {
+        if (!acts_on(key, processing_ended)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.InProcessing()) {
@@ -9731,6 +9775,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, replication_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.HasReplicationTask()) {
@@ -9822,6 +9869,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, offload_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.IsPublished()) {
@@ -9845,6 +9895,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
+        if (!acts_on(key, promotion_expired)) {
+            continue;
+        }
         MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
                                     MetadataAccessorRW::AsIs{});
         if (!accessor.IsPublished()) {

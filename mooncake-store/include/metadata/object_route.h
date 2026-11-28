@@ -91,6 +91,10 @@ struct ObjectRef {
 // on KeySlot so filing a key allocates no node of its own.
 struct SlotEvictionState {
     bool filed{false};
+    // True from EvictionIndex::Postpone until the release of the write guard
+    // it was called under, which leaves the key at the later rank. Sits in
+    // the padding after `filed`.
+    bool postponed{false};
     uint16_t shard{0};
     int64_t rank{0};
     uint64_t identity{0};

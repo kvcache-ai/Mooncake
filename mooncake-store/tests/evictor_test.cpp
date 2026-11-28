@@ -8,6 +8,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -65,7 +66,10 @@ class FakePolicy final : public eviction::EvictionPolicy {
 
 // Takes the planned replicas off on the spot and records what it did; fails
 // the `fail_at`-th Apply, counting from zero, as an OpLog write would. Runs
-// `on_apply` first, as a writer of another key would meanwhile.
+// `on_apply` first, as a writer of another key would meanwhile. From the
+// `exhaust_at`-th Apply on, it says nothing more can be taken
+// (Effect::exhausted); with `keep`, it keeps the object (Outcome::kKept)
+// instead, as an offload-on-evict run with every destination full does.
 class FakeReclaimer final : public eviction::Reclaimer {
    public:
     tl::expected<eviction::Effect, ErrorCode> Apply(
@@ -80,6 +84,12 @@ class FakeReclaimer final : public eviction::Reclaimer {
         applied.push_back(hold.key());
         ObjectMetadata& metadata = hold.metadata();
         eviction::Effect effect;
+        effect.exhausted =
+            exhaust_at >= 0 && static_cast<int>(applies) > exhaust_at;
+        if (keep) {
+            effect.outcome = Outcome::kKept;
+            return effect;
+        }
         effect.detached = metadata.PopReplicas(
             [&plan](const Replica& replica) { return InPlan(plan, replica); });
         effect.released_bytes = metadata.TotalLength() * effect.detached.size();
@@ -96,6 +106,8 @@ class FakeReclaimer final : public eviction::Reclaimer {
     }
 
     int fail_at = -1;
+    int exhaust_at = -1;
+    bool keep = false;
     std::function<void(metadata::Namespace&, const std::string&)> on_apply;
     size_t applies = 0;
     std::vector<std::string> applied;
@@ -176,13 +188,15 @@ class EvictorTest : public ::testing::Test {
 
     eviction::Report Run(const ObjectGoal& goal) {
         eviction::Evictor evictor(namespaces_, policy_, reclaimer_,
-                                  {&observer_});
+                                  {&observer_}, /*worker_threads=*/0,
+                                  postpone_skipped_);
         return evictor.Run(Scope::All(), goal);
     }
 
     eviction::Report Run(const ByteGoal& goal) {
         eviction::Evictor evictor(namespaces_, policy_, reclaimer_,
-                                  {&observer_});
+                                  {&observer_}, /*worker_threads=*/0,
+                                  postpone_skipped_);
         return evictor.Run(TenantId("a"), goal);
     }
 
@@ -196,6 +210,8 @@ class EvictorTest : public ::testing::Test {
     FakePolicy policy_;
     FakeReclaimer reclaimer_;
     RecordingObserver observer_;
+    // As memory eviction builds its evictor.
+    Clock::duration postpone_skipped_ = eviction::Evictor::kSkippedKeyBackoff;
 };
 
 // Each namespace gives up its own share first, however much older another
@@ -282,6 +298,73 @@ TEST_F(EvictorTest, ARunCutShortLeavesTheRestToTheNextRun) {
     EXPECT_NE(reclaimer_.applied.front()[0], first);
 }
 
+// A run whose reclaimer can take nothing more ends after that object, and
+// leaves the namespaces after it to the next run, which starts one namespace
+// further on: three runs that each end at their first object take one from
+// each of the three namespaces.
+TEST_F(EvictorTest, AnExhaustedRunLeavesTheRestToTheNextRun) {
+    for (const std::string tenant : {"a", "b", "c"}) {
+        Publish(tenant, tenant + "1", seconds(10));
+        Publish(tenant, tenant + "2", seconds(8));
+    }
+    reclaimer_.exhaust_at = 0;
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {});
+    const ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    std::set<char> taken_from;
+    for (int run = 0; run < 3; ++run) {
+        reclaimer_.applied.clear();
+        EXPECT_TRUE(evictor.Run(Scope::All(), all).exhausted);
+        ASSERT_EQ(reclaimer_.applied.size(), 1u);
+        EXPECT_EQ(reclaimer_.applied.front()[1], '1');
+        taken_from.insert(reclaimer_.applied.front()[0]);
+    }
+    EXPECT_EQ(taken_from, (std::set<char>{'a', 'b', 'c'}));
+}
+
+// An object kept because nothing more can be taken (every offload destination
+// full) ends the run though it released nothing, and keeps its rank: the next
+// run meets it first.
+TEST_F(EvictorTest, AKeptObjectThatExhaustsTheReclaimerEndsTheRun) {
+    Publish("a", "k1", seconds(10));
+    Publish("a", "k2", seconds(8));
+    Publish("a", "k3", seconds(6));
+    reclaimer_.keep = true;
+    reclaimer_.exhaust_at = 0;
+
+    auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_TRUE(report.exhausted);
+    EXPECT_EQ(report.Count(Outcome::kKept), 1u);
+    EXPECT_EQ(report.evicted_objects, 0u);
+    EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k1"});
+
+    reclaimer_.keep = false;
+    reclaimer_.exhaust_at = -1;
+    reclaimer_.applied.clear();
+    report = Run(ObjectGoal{.target_ratio = 0.3, .min_ratio = 0.3});
+    EXPECT_FALSE(report.exhausted);
+    EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k1"});
+}
+
+// Nor does an exhausted run go on to the fallback: what the policy deferred
+// stays, though the minimum is not met.
+TEST_F(EvictorTest, AnExhaustedRunSkipsTheFallback) {
+    Publish("a", "pinned", seconds(10));
+    Publish("a", "k1", seconds(8));
+    Publish("a", "k2", seconds(6));
+    policy_.soft_pinned = {"pinned"};
+    policy_.defer_soft_pinned = true;
+    reclaimer_.exhaust_at = 0;
+
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_TRUE(report.exhausted);
+    EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k1"});
+    ASSERT_FALSE(observer_.skipped.empty());
+    EXPECT_EQ(observer_.skipped.front(),
+              std::make_pair(std::string("pinned"), SkipReason::kDeferred));
+}
+
 // A ratio above 1 asks for every eligible object; one that is negative or not
 // a number asks for none.
 TEST_F(EvictorTest, ARatioOutsideZeroToOneIsClamped) {
@@ -341,6 +424,10 @@ TEST_F(EvictorTest, DeferredObjectsGoOnlyWhileShortOfTheMinimum) {
     reclaimer_.applied.clear();
     observer_.skipped.clear();
     policy_.defer_soft_pinned = true;
+    // Refile "pinned", which the first run postponed under the old policy.
+    ASSERT_TRUE(namespaces_.GetOrCreate(TenantId("a"))
+                    .objects.Write("pinned")
+                    .has_value());
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
     EXPECT_EQ(reclaimer_.applied,
               (std::vector<std::string>{"plain", "pinned"}));
@@ -531,6 +618,122 @@ TEST_F(EvictorTest, AKeyWhoseLeaseWasExtendedIsRefiledNotEvicted) {
     EXPECT_FALSE(ns.eviction_index().Scan(Clock::now())->Next().has_value());
 }
 
+TEST_F(EvictorTest, ASkippedKeyWaitsOutTheBackoffUnlessWritten) {
+    Publish("a", "pinned", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    const ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    Run(all);
+    ASSERT_EQ(observer_.skipped.size(), 1u);
+    observer_.skipped.clear();
+    Run(all);
+    EXPECT_TRUE(observer_.skipped.empty());
+    const auto cursor = ns.eviction_index().Scan(
+        Clock::now() + eviction::Evictor::kSkippedKeyBackoff +
+        metadata::LeaseEvictionIndex::kBucketWidth);
+    const auto entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->keys.front(), "pinned");
+
+    // A write files it by its lease again.
+    ASSERT_TRUE(ns.objects.Write("pinned").has_value());
+    Run(all);
+    EXPECT_EQ(observer_.skipped.size(), 1u);
+
+    // Torn down while postponed, it leaves nothing filed.
+    {
+        auto hold = ns.objects.Write("pinned");
+        ASSERT_TRUE(hold.has_value());
+        hold->TearDown();
+    }
+    EXPECT_FALSE(ns.eviction_index()
+                     .Scan(Clock::now() + std::chrono::hours(1))
+                     ->Next()
+                     .has_value());
+}
+
+TEST_F(EvictorTest, AKeyWithNothingToReleaseWaitsOutTheBackoff) {
+    Publish("a", "held", seconds(10));
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto hold = ns.objects.Write("held");
+        ASSERT_TRUE(hold.has_value());
+        hold->metadata()
+            .GetReplicaByID(hold->metadata().GetAllReplicas()[0].id())
+            ->inc_refcnt();
+    }
+    const ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    Run(all);
+    ASSERT_EQ(observer_.skipped.size(), 1u);
+    EXPECT_EQ(observer_.skipped[0].second, SkipReason::kNothingToRelease);
+    observer_.skipped.clear();
+    Run(all);
+    EXPECT_TRUE(observer_.skipped.empty());
+}
+
+TEST_F(EvictorTest, ADeferredKeyIsNotPostponed) {
+    Publish("a", "pinned", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    policy_.defer_soft_pinned = true;
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 0});
+        EXPECT_EQ(observer_.skipped,
+                  (std::vector<std::pair<std::string, SkipReason>>{
+                      {"pinned", SkipReason::kDeferred}}));
+    }
+}
+
+TEST_F(EvictorTest, AGroupIsNotPostponed) {
+    Publish("a", "m1", seconds(10), "g");
+    Publish("a", "m2", seconds(10), "g");
+    policy_.soft_pinned = {"m1", "m2"};
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+        EXPECT_EQ(observer_.skipped.size(), 2u);
+    }
+}
+
+// An evictor that does not postpone (the KVCS DFS evictor, which walks memory
+// eviction's index) leaves the keys it skips filed where they were: the next
+// run meets them again, and so would memory eviction.
+TEST_F(EvictorTest, AnEvictorThatDoesNotPostponeLeavesSkippedKeysFiled) {
+    Publish("a", "pinned", seconds(10));
+    Publish("a", "held", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto hold = ns.objects.Write("held");
+        ASSERT_TRUE(hold.has_value());
+        hold->metadata()
+            .GetReplicaByID(hold->metadata().GetAllReplicas()[0].id())
+            ->inc_refcnt();
+    }
+    postpone_skipped_ = Clock::duration::zero();
+    using Skips = std::set<std::pair<std::string, SkipReason>>;
+    const Skips skips{{"pinned", SkipReason::kSoftPinned},
+                      {"held", SkipReason::kNothingToRelease}};
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+        EXPECT_EQ(Skips(observer_.skipped.begin(), observer_.skipped.end()),
+                  skips)
+            << run;
+    }
+    size_t due = 0;
+    const auto cursor = ns.eviction_index().Scan(Clock::now());
+    while (cursor->Next().has_value()) {
+        ++due;
+    }
+    EXPECT_EQ(due, 2u);
+}
+
 TEST_F(EvictorTest, ObserversHearOfEachObjectAndTheRun) {
     Publish("a", "k1", seconds(10));
     Publish("b", "k2", seconds(8));
@@ -698,6 +901,98 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
     EXPECT_EQ(effect->outcome, Outcome::kDropped);
     EXPECT_EQ(effect->reason, eviction::DropReason::kOffloadCap);
     EXPECT_TRUE(queue_.pushed.empty());
+}
+
+// --- Counting queued offloads ------------------------------------------------
+
+// Runs the evictor over an OffloadingReclaimer that queues into queue_ and
+// releases through inner_.
+class QueuedOffloadTest : public OffloadingReclaimerTest {
+   protected:
+    template <typename Goal>
+    eviction::Report RunOffloading(
+        const Goal& goal, eviction::OffloadingReclaimer::Options options = {}) {
+        eviction::OffloadingReclaimer reclaimer(inner_, queue_, options);
+        eviction::Evictor evictor(namespaces_, policy_, reclaimer,
+                                  {&observer_});
+        if constexpr (std::is_same_v<Goal, ByteGoal>) {
+            return evictor.Run(TenantId("a"), goal);
+        } else {
+            return evictor.Run(Scope::All(), goal);
+        }
+    }
+
+    void PublishFour() {
+        for (int i = 0; i < 4; ++i) {
+            Publish("a", "k" + std::to_string(i), seconds(10 - i));
+        }
+    }
+};
+
+// A queued single-replica object releases nothing until its copy lands, so a
+// run that does not count it walks on past its share and queues everything.
+TEST_F(QueuedOffloadTest, AQueuedObjectCountsOnlyWhenAsked) {
+    PublishFour();
+    auto report = RunOffloading(ObjectGoal{.target_ratio = 0.5});
+    EXPECT_EQ(queue_.pushed.size(), 4u);
+    EXPECT_EQ(report.Count(Outcome::kOffloadQueued), 4u);
+    EXPECT_EQ(report.evicted_objects, 0u);
+}
+
+TEST_F(QueuedOffloadTest, ACountedRunQueuesItsShareOldestFirst) {
+    PublishFour();
+    auto report =
+        RunOffloading(ObjectGoal{.target_ratio = 0.5, .count_queued = true});
+    EXPECT_EQ(queue_.pushed, (std::vector<std::string>{"k0", "k1"}));
+    EXPECT_EQ(report.Count(Outcome::kOffloadQueued), 2u);
+    // Queued objects count toward the goal, not toward evicted_objects.
+    EXPECT_EQ(report.evicted_objects, 0u);
+}
+
+// An object that queues one replica and releases another counts once.
+TEST_F(QueuedOffloadTest, AnObjectThatQueuesAndReleasesCountsOnce) {
+    for (int i = 0; i < 4; ++i) {
+        Publish("a", "k" + std::to_string(i), seconds(10 - i), {},
+                /*replicas=*/2);
+    }
+    auto report =
+        RunOffloading(ObjectGoal{.target_ratio = 0.5, .count_queued = true});
+    EXPECT_EQ(queue_.pushed, (std::vector<std::string>{"k0", "k1"}));
+    EXPECT_EQ(report.evicted_objects, 2u);
+}
+
+TEST_F(QueuedOffloadTest, AByteGoalCountsOffloadBytesOnlyWhenAsked) {
+    PublishFour();
+    RunOffloading(ByteGoal{.target_bytes = 256});
+    EXPECT_EQ(queue_.pushed.size(), 4u);
+
+    queue_.pushed.clear();
+    for (int i = 0; i < 4; ++i) {
+        Publish("b", "k" + std::to_string(i), seconds(10 - i));
+    }
+    eviction::OffloadingReclaimer reclaimer(inner_, queue_, {});
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer, {&observer_});
+    const auto report = evictor.Run(
+        TenantId("b"), ByteGoal{.target_bytes = 256, .count_queued = true});
+    EXPECT_EQ(queue_.pushed, (std::vector<std::string>{"k0", "k1"}));
+    EXPECT_EQ(report.offload_bytes, 256u);
+}
+
+// A key kept because its destination is full keeps its rank: the next run
+// meets it first again, ahead of anything newer.
+TEST_F(QueuedOffloadTest, AKeptKeyKeepsItsRank) {
+    Publish("a", "old", seconds(20));
+    queue_.capacity = 0;
+    const ObjectGoal counted{.target_ratio = 1.0, .count_queued = true};
+
+    const auto first = RunOffloading(counted);
+    EXPECT_EQ(first.Count(Outcome::kKept), 1u);
+    Publish("a", "new", seconds(10));
+    observer_.applied.clear();
+    queue_.capacity = 1;
+    RunOffloading(ObjectGoal{.target_ratio = 0.5, .count_queued = true});
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"old"});
+    EXPECT_EQ(observer_.applied, std::vector<std::string>{"old"});
 }
 
 // --- Report observers --------------------------------------------------------

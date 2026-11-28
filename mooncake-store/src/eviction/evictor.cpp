@@ -31,6 +31,13 @@ double Sanitized(const char* name, double ratio) {
     return std::min(ratio, 1.0);
 }
 
+// A lease that has not run out ends on its own, and a deferred key must stay
+// visible to the fallback, so only these two are worth postponing.
+bool Lasts(SkipReason reason) {
+    return reason == SkipReason::kSoftPinned ||
+           reason == SkipReason::kNothingToRelease;
+}
+
 uint32_t ChooseWorkerCount(uint32_t configured_workers, uint64_t filed_keys) {
     if (configured_workers > 0) {
         return configured_workers;
@@ -79,6 +86,9 @@ struct Evictor::Aim {
     double target_ratio = 0;
     double min_ratio = 0;
     uint64_t target_bytes = 0;
+    // Objects queued for offload count as evicted, their pinned bytes as
+    // released.
+    bool count_queued = false;
 };
 
 struct Evictor::NamespaceScan {
@@ -105,16 +115,19 @@ class Evictor::Pass {
           filed_(cursor_.Total()),
           evicted_before_(report.evicted_objects),
           released_before_(report.released_bytes),
+          offload_before_(report.offload_bytes),
           aim_(aim),
           report_(report),
           now_(now) {}
 
     // Walks the cursor serially until the namespace's share of the target is
     // met, then visits the objects the policy deferred until its share of the
-    // minimum is met; each also ends when an OpLog write fails or nothing is
-    // left.
+    // minimum is met; each also ends when an OpLog write fails, the reclaimer
+    // can take nothing more, or nothing is left. A group's members come in one
+    // entry and go together, one key lock at a time, in the walk and in the
+    // fallback alike.
     void RunSerial() {
-        while (!report_.stopped && !Met(/*fallback=*/false)) {
+        while (!Ended() && !Met(/*fallback=*/false)) {
             std::optional<Entry> entry = cursor_.Next();
             if (!entry) {
                 break;
@@ -138,25 +151,24 @@ class Evictor::Pass {
                                        local_reports[i], now_);
         }
 
+        // Progress is counted as Met() counts it, queued offloads included
+        // with count_queued, so the executor's goal and the fallback agree.
         auto visit_entry = [&](uint32_t worker, const Entry& entry,
                                RangeStop& stop) -> uint64_t {
-            Report& local = local_reports[worker];
-            const uint64_t before =
-                aim_.in_bytes ? local.released_bytes : local.evicted_objects;
-            worker_passes[worker].RunEntry(entry, /*nonblocking=*/true);
-            if (local.stopped) {
+            Pass& pass = worker_passes[worker];
+            const uint64_t before = pass.Progress();
+            pass.RunEntry(entry, /*nonblocking=*/true);
+            if (pass.Ended()) {
                 stop.Stop();
             }
-            const uint64_t after =
-                aim_.in_bytes ? local.released_bytes : local.evicted_objects;
-            return after - before;
+            return pass.Progress() - before;
         };
 
         const RangeResult result =
             RunRanges(ranges, workers, goal, visit_entry, ranges.GrainSize());
         for (uint32_t i = 0; i < worker_count; ++i) {
             report_.Merge(local_reports[i]);
-            TakeDeferred(worker_passes[i]);
+            TakeFrom(worker_passes[i]);
         }
         report_.scanned_slots += ranges.Examined();
         report_.scan_waves += result.waves;
@@ -169,7 +181,7 @@ class Evictor::Pass {
     void RunEntry(const Entry& entry, bool nonblocking) {
         deferred_.emplace_back();
         for (const std::string_view key : entry.keys) {
-            if (report_.stopped) {
+            if (Ended()) {
                 break;
             }
             auto hold = nonblocking ? ns_.objects.TryWrite(key)
@@ -184,20 +196,23 @@ class Evictor::Pass {
         }
     }
 
-    void TakeDeferred(Pass& other) {
+    // Takes over what a worker's pass left for the fallback, and the objects
+    // it queued without releasing memory, which its report does not tell.
+    void TakeFrom(Pass& other) {
         for (auto& refs : other.deferred_) {
             deferred_.push_back(std::move(refs));
         }
         other.deferred_.clear();
+        queued_only_ += std::exchange(other.queued_only_, 0);
     }
 
     void RunFallback() {
         for (const std::vector<route::ObjectRef>& refs : deferred_) {
-            if (report_.stopped || Met(/*fallback=*/true)) {
+            if (Ended() || Met(/*fallback=*/true)) {
                 break;
             }
             for (const route::ObjectRef& ref : refs) {
-                if (report_.stopped) {
+                if (Ended()) {
                     break;
                 }
                 // Only the publication the policy deferred: a replacement was
@@ -207,9 +222,35 @@ class Evictor::Pass {
         }
     }
 
+    // An OpLog write failed, or the reclaimer can take nothing more.
+    [[nodiscard]] bool Ended() const {
+        return report_.stopped || report_.exhausted;
+    }
+
+    // Objects given up by this pass and bytes released by it, each counting
+    // what was queued for offload when the aim says so.
+    [[nodiscard]] uint64_t Evicted() const {
+        uint64_t evicted = report_.evicted_objects - evicted_before_;
+        if (aim_.count_queued) {
+            evicted += queued_only_;
+        }
+        return evicted;
+    }
+    [[nodiscard]] uint64_t Released() const {
+        uint64_t released = report_.released_bytes - released_before_;
+        if (aim_.count_queued) {
+            released += report_.offload_bytes - offload_before_;
+        }
+        return released;
+    }
+
+    // This pass's progress toward the aim, in the aim's unit.
+    [[nodiscard]] uint64_t Progress() const {
+        return aim_.in_bytes ? Released() : Evicted();
+    }
+
     [[nodiscard]] bool Met(bool fallback) const {
-        return aim_.Met(filed_, report_.evicted_objects - evicted_before_,
-                        report_.released_bytes - released_before_, fallback);
+        return aim_.Met(filed_, Evicted(), Released(), fallback);
     }
 
     // Reclaims the object `hold` holds, met on the walk in `entry` or, with
@@ -237,6 +278,11 @@ class Evictor::Pass {
         }
         auto plan = Judge(hold, /*fallback=*/entry == nullptr);
         if (!plan) {
+            if (evictor_.postpone_skipped_ > Clock::duration::zero() &&
+                Lasts(plan.error())) {
+                ns_.eviction_index().Postpone(
+                    hold, now_ + evictor_.postpone_skipped_);
+            }
             return {};
         }
         auto effect = evictor_.reclaimer_.Apply(ns_, hold, *plan, report_);
@@ -245,6 +291,11 @@ class Evictor::Pass {
             return {};
         }
         report_.Add(*effect);
+        // One that also released memory is in evicted_objects already.
+        if (effect->outcome == Outcome::kOffloadQueued &&
+            effect->released_bytes == 0) {
+            ++queued_only_;
+        }
         const ObjectView view{ns_.id(), hold.key(), hold.metadata()};
         for (EvictionObserver* observer : evictor_.observers_) {
             observer->OnApplied(view, *effect);
@@ -302,6 +353,9 @@ class Evictor::Pass {
     const uint64_t filed_;
     const uint64_t evicted_before_;
     const uint64_t released_before_;
+    const uint64_t offload_before_;
+    // Objects this pass queued for offload without releasing any memory.
+    uint64_t queued_only_ = 0;
     const Aim& aim_;
     Report& report_;
     const Clock::time_point now_;
@@ -312,13 +366,14 @@ class Evictor::Pass {
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
                  const EvictionPolicy& policy, Reclaimer& reclaimer,
                  std::vector<EvictionObserver*> observers,
-                 uint32_t worker_threads)
+                 uint32_t worker_threads, Clock::duration postpone_skipped)
     : namespaces_(namespaces),
       policy_(policy),
       reclaimer_(reclaimer),
       observers_(std::move(observers)),
       parallel_safe_(CanRunInParallel(policy_, reclaimer_, observers_)),
-      worker_threads_(worker_threads) {
+      worker_threads_(worker_threads),
+      postpone_skipped_(postpone_skipped) {
     if (worker_threads > kMaxEvictionWorkers) {
         throw std::invalid_argument("eviction workers must be in [0, 64]");
     }
@@ -328,7 +383,8 @@ Evictor::~Evictor() = default;
 
 Report Evictor::Run(const Scope& scope, const ObjectGoal& goal) {
     Aim aim{.target_ratio = Sanitized("evict_ratio_target", goal.target_ratio),
-            .min_ratio = Sanitized("evict_ratio_lowerbound", goal.min_ratio)};
+            .min_ratio = Sanitized("evict_ratio_lowerbound", goal.min_ratio),
+            .count_queued = goal.count_queued};
     if (aim.min_ratio > aim.target_ratio) {
         LOG(ERROR) << "evict_ratio_target=" << aim.target_ratio
                    << ", evict_ratio_lowerbound=" << aim.min_ratio
@@ -339,8 +395,9 @@ Report Evictor::Run(const Scope& scope, const ObjectGoal& goal) {
 }
 
 Report Evictor::Run(const TenantId& tenant_id, const ByteGoal& goal) {
-    return RunFor(Scope::Of(tenant_id),
-                  Aim{.in_bytes = true, .target_bytes = goal.target_bytes});
+    return RunFor(Scope::Of(tenant_id), Aim{.in_bytes = true,
+                                            .target_bytes = goal.target_bytes,
+                                            .count_queued = goal.count_queued});
 }
 
 std::vector<metadata::Namespace*> Evictor::CollectNamespaces(
@@ -393,11 +450,20 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     scans.reserve(namespaces.size());
     for (metadata::Namespace* ns : namespaces) {
         NamespaceScan scan;
-        // Byte goals have no key-count estimate: 0 visits all due ranks.
-        scan.ranges =
-            ns->eviction_index().ScanRanges(now, [&](size_t filed) -> size_t {
-                return aim.in_bytes ? 0 : aim.NamespaceGoal(filed);
-            });
+        // A run whose callbacks all support concurrency takes the range
+        // cursor, which schedules the due buckets before the walk starts, on
+        // one worker or several. A serial run (a policy, reclaimer or
+        // observer that cannot run concurrently: an OpLog, offload-on-evict
+        // or KVCS DFS run) walks the serial cursor, which reads the index as
+        // the walk goes, so a run that meets its goal early pays for what it
+        // read.
+        if (parallel_safe_) {
+            // Byte goals have no key-count estimate: 0 visits all due ranks.
+            scan.ranges = ns->eviction_index().ScanRanges(
+                now, [&](size_t filed) -> size_t {
+                    return aim.in_bytes ? 0 : aim.NamespaceGoal(filed);
+                });
+        }
         if (!scan.ranges) {
             scan.serial = ns->eviction_index().Scan(now);
         }
@@ -407,12 +473,16 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
         scans.push_back(std::move(scan));
     }
 
+    // A run an OpLog write or a full set of offload destinations cuts short
+    // leaves the namespaces after that one to the next run, which starts one
+    // namespace further on.
     const size_t start = next_start_.fetch_add(1, std::memory_order_relaxed);
-    for (size_t n = 0; n < namespaces.size() && !report.stopped; ++n) {
+    for (size_t n = 0;
+         n < namespaces.size() && !report.stopped && !report.exhausted; ++n) {
         const size_t i = (start + n) % namespaces.size();
         metadata::Namespace& ns = *namespaces[i];
         NamespaceScan& scan = scans[i];
-        if (!scan.ranges || !parallel_safe_) {
+        if (!scan.ranges) {
             Pass(*this, ns, scan.Cursor(), aim, report, now).RunSerial();
             continue;
         }
