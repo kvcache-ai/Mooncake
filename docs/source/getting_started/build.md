@@ -504,6 +504,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
+| `-DUSE_NDS=ON/OFF` | `OFF` | Build the TENT NPU Direct Storage transport. Requires `-DUSE_TENT=ON` and an external SDK providing `ascend_nds.h` and `libascend_nds.so`. Set `-DNDS_ROOT=<prefix>` or explicit `-DNDS_INCLUDE_DIR=<dir>` and `-DNDS_LIBRARY=<path>`. Enable at runtime with `transports/nds/enable`. Ascend memory detection requires an Ascend platform build, such as `-DUSE_ASCEND_DIRECT=ON`. See [NDS Transport](../design/transfer-engine/transport/nds_transport.md). |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
 | `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |

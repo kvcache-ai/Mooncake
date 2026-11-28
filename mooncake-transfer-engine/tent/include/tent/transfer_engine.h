@@ -128,6 +128,7 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_FABRIC (16)
 #define TRANSPORT_MLU (17)
 #define TRANSPORT_MEMFABRIC (18)
+#define TRANSPORT_NDS (19)
 
 struct tent_memory_options {
     char location[64];

@@ -106,6 +106,7 @@ jobs:
             - 'dependencies.sh'
             - 'scripts/ci/cmake_lld.cmake'
             - 'scripts/ci/run_tent_cpu_profile.sh'
+            - 'scripts/ci/run_tent_nds_cpu.py'
             - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
             - 'scripts/ci/services.sh'
             - '.github/actions/**'
@@ -885,6 +886,13 @@ jobs:
         junit-report: build-tent-ub-mock/test-results/ctest.xml
         failed-tests-log: build-tent-ub-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
         last-test-log: build-tent-ub-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Build & test TENT (nds-mock ON/OFF)
+      if: matrix.name == 'cpu-variants'
+      run: |
+        python3 scripts/ci/run_tent_nds_cpu.py --mode on --build-root "$RUNNER_TEMP/nds-on" --jobs 2
+        python3 scripts/ci/run_tent_nds_cpu.py --mode off --build-root "$RUNNER_TEMP/nds-off" --jobs 2
+      shell: bash
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}

@@ -126,6 +126,9 @@
         },
         "memfabric": {
             "enable": false
+        },
+        "nds": {
+            "enable": false
         }
     },
     "policy": [
@@ -138,7 +141,7 @@
         {
             "name": "file_storage",
             "segment_type": "file",
-            "transports": ["gds", "io_uring", "rdma"]
+            "transports": ["gds", "nds", "io_uring", "rdma"]
         }
     ]
 }

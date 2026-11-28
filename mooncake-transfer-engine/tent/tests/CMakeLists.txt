@@ -14,6 +14,24 @@ add_test(NAME tent_cli_test
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py
                  $<TARGET_FILE:tent_cli>)
 
+if(USE_NDS)
+  add_executable(
+    tent_nds_transport_test nds_transport_test.cpp nds_test_backend.cpp
+                            nds_test_platform.cpp)
+  target_link_options(
+    tent_nds_transport_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake4tent8Platform9getLoaderESt10shared_ptrINS0_6ConfigEE"
+  )
+  target_include_directories(tent_nds_transport_test PRIVATE ${NDS_INCLUDE_DIR})
+  target_link_libraries(tent_nds_transport_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_nds_transport_test PRIVATE asio_shared)
+  endif()
+  add_test(NAME tent_nds_transport_test COMMAND tent_nds_transport_test)
+endif()
+
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
 # asio_shared must be linked explicitly for executables:
