@@ -514,4 +514,56 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
     }
 }
 
+std::vector<std::pair<UUID, ClientSessionSharedPtr>>
+ClientSessionRegistry::SnapshotSuspected() const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::pair<UUID, ClientSessionSharedPtr>> suspected;
+    suspected.reserve(slots_.size());
+    for (const auto& [client_id, slot] : slots_) {
+        if (slot->liveness->state() == ClientLivenessState::SUSPECTED) {
+            suspected.emplace_back(client_id, slot->liveness);
+        }
+    }
+    return suspected;
+}
+
+bool ClientSessionRegistry::ForceRetireSuspected(const UUID& client_id) {
+    // The probe path is driven by the same admission predicate as expiry.
+    if (admits_expiry_ && !admits_expiry_()) {
+        return false;
+    }
+    // Restore/reset freeze retirement, exactly like the expiry pass.
+    std::shared_lock lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
+    if (!lifecycle_lock.owns_lock()) {
+        return false;
+    }
+    const auto slot = FindSlot(client_id);
+    if (!slot || slot->liveness->state() != ClientLivenessState::SUSPECTED) {
+        return false;
+    }
+    // The operation excludes expiry, registration and removal for this
+    // incarnation; revalidate under it before forcing the transition.
+    auto operation = slot->AcquireExclusive();
+    if (!operation) {
+        return false;
+    }
+    if (slot->liveness->state() != ClientLivenessState::SUSPECTED) {
+        return false;
+    }
+    // The registry's own readiness and host state for the terminal
+    // incarnation drop under the registry lock, exactly like the TTL path;
+    // the OFFLINE transition the listeners receive is what runs the
+    // resource cleanup, so no retirement reservation is needed here.
+    if (!slot->liveness->RetireSuspected([] {})) {
+        return false;
+    }
+    {
+        std::unique_lock lock(mutex_);
+        ClearSlotStateLocked(slot);
+    }
+    PublishTransition(client_id, slot, ClientLivenessState::SUSPECTED,
+                      ClientLivenessState::OFFLINE);
+    return true;
+}
+
 }  // namespace mooncake

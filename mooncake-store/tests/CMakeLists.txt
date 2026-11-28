@@ -87,6 +87,7 @@ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
+add_store_test(client_death_probe_test client_death_probe_test.cpp)
 add_store_test(client_session_registry_test client_session_registry_test.cpp)
 add_store_test(client_session_event_dispatcher_test
                client_session_event_dispatcher_test.cpp)
