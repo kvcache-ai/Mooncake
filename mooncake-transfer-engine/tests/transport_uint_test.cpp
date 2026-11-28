@@ -389,29 +389,78 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
 }
 
 #if !defined(USE_UBSHMEM) && !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-TEST(TransferEngineDeviceFilterTest,
-     CustomTopoJsonRejectsEmptyDeviceFilterIntersection) {
-    char path[] = "/tmp/mc_custom_topo_XXXXXX";
-    int fd = mkstemp(path);
-    ASSERT_NE(fd, -1);
-    const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
-    const ssize_t written = write(fd, json.data(), json.size());
-    close(fd);
-    ASSERT_EQ(written, static_cast<ssize_t>(json.size()));
+class TransferEngineDeviceFilterTest : public ::testing::Test {
+   protected:
+    std::string path = "/tmp/mc_custom_topo_XXXXXX";
+    ScopedEnvVar force_tcp{"MC_FORCE_TCP", nullptr};
+    ScopedEnvVar force_shm{"MC_FORCE_SHM", nullptr};
+    ScopedEnvVar force_hca{"MC_FORCE_HCA", nullptr};
 
-    {
-        ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path);
-        ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
-        ScopedEnvVar force_shm("MC_FORCE_SHM", nullptr);
-        ScopedEnvVar force_hca("MC_FORCE_HCA", nullptr);
-        TransferEngineImpl engine(true, {"mlx5_absent"});
-        EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"),
-                  ERR_DEVICE_NOT_FOUND);
-        EXPECT_TRUE(engine.getLocalTopology()->getHcaList().empty());
+    void SetUp() override {
+        int fd = mkstemp(path.data());
+        ASSERT_NE(fd, -1);
+        const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
+        const ssize_t written = write(fd, json.data(), json.size());
+        close(fd);
+        ASSERT_EQ(written, static_cast<ssize_t>(json.size()));
     }
-    unlink(path);
+
+    void TearDown() override { unlink(path.c_str()); }
+};
+
+TEST_F(TransferEngineDeviceFilterTest,
+       CustomTopoJsonRejectsEmptyDeviceFilterIntersection) {
+    ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path.c_str());
+    TransferEngineImpl engine(true, {"mlx5_absent"});
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), ERR_DEVICE_NOT_FOUND);
+    EXPECT_TRUE(engine.getLocalTopology()->getHcaList().empty());
+}
+
+#if defined(USE_TCP) && !defined(USE_UB) &&                     \
+    !defined(USE_ASCEND_HETEROGENEOUS) && !defined(USE_MACA) && \
+    !defined(USE_SUNRISE)
+TEST_F(TransferEngineDeviceFilterTest, UnusableHcaFallsBackOnlyForTcpHint) {
+    ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path.c_str());
+    ScopedEnvVar force_intra("MC_INTRANODE_NVLINK", nullptr);
+    ScopedEnvVar force_mnnvl("MC_FORCE_MNNVL", nullptr);
+    ScopedEnvVar force_musa("MC_FORCE_MUSA", nullptr);
+    ScopedEnvVar barex("USE_BAREX", nullptr);
+    auto check = [](const char* protocol, bool expect_tcp) {
+        SCOPED_TRACE(protocol);
+        TransferEngineImpl engine(true);
+        engine.applyProtocolHint(protocol);
+        EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"),
+                  expect_tcp ? 0 : -1);
+        EXPECT_EQ(engine.getTransport("tcp") != nullptr, expect_tcp);
+        EXPECT_EQ(engine.getTransport("rdma"), nullptr);
+        EXPECT_EQ(engine.getTransport("rdma_twosided"), nullptr);
+    };
+    check("tcp", true);
+    check("rdma", false);
+    check("", false);
+    ScopedEnvVar require_hca("MC_FORCE_HCA", "1");
+    check("tcp", false);
 }
 #endif
+#endif
+
+TEST(TransferEngineAutoDiscoverTest, FailedRdmaInstallKeepsLocalSegment) {
+    std::string name = "127.0.0.1:0";
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = name;
+    desc->protocol = "tcp";
+    ASSERT_EQ(
+        metadata->addLocalSegment(LOCAL_SEGMENT_ID, name, std::move(desc)), 0);
+
+    MultiTransport transport(metadata, name);
+    auto topology = std::make_shared<Topology>();
+    ASSERT_EQ(topology->parse(R"({"cpu:0": [["mc_fake_0"], []]})"), 0);
+    EXPECT_EQ(transport.installTransport("rdma", topology), nullptr);
+    auto retained = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(retained, nullptr);
+    EXPECT_EQ(retained->protocol, "tcp");
+}
 
 TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)

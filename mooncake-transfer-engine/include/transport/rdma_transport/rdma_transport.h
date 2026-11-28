@@ -231,6 +231,7 @@ class RdmaTransport : public Transport {
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
+    bool local_segment_registered_ = false;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL

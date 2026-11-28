@@ -536,6 +536,8 @@ class TransferEngineImpl {
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
 
+    bool installDiscoveredTransport(const std::string& protocol);
+
     std::string autoDiscoverTransport() const {
         if (use_barex_) {
             return "barex";
