@@ -250,6 +250,115 @@ TEST_F(ShardedLeaseIndexTest, ASerialWalkDoesNotMeetAWrittenPostponedKeyTwice) {
     EXPECT_EQ(next->keys.front(), "pinned");
 }
 
+// #4962 on the sharded index: Postpone refiles a lone key at a later bucket of
+// the shard it is filed in, the release of the guard it ran under leaves it
+// there, serial and range walks pass it over until it is due again, and the
+// next write files it by its lease.
+TEST_F(ShardedLeaseIndexTest, PostponeRefilesWithinTheShardUntilTheNextWrite) {
+    Publish("a");
+    Publish("b");
+    const Clock::time_point later = now_ + std::chrono::seconds(1);
+    uint16_t shard = 0;
+    {
+        auto guard = ns_.objects.Write("a");
+        ASSERT_TRUE(guard);
+        const route::SlotEvictionState& state = guard->owner_state().eviction;
+        shard = state.shard;
+        const int64_t rank = state.rank;
+        ns_.eviction_index().Postpone(*guard, later);
+        EXPECT_TRUE(state.postponed);
+        EXPECT_EQ(state.shard, shard);
+        EXPECT_GT(state.rank, rank);
+    }
+    auto due = [&](Clock::time_point at, bool serial) {
+        std::set<std::string> keys;
+        auto cursor = ns_.eviction_index().ScanRanges(at, 0);
+        if (serial) {
+            while (auto entry = cursor->Next()) {
+                keys.emplace(entry->keys.front());
+            }
+            return keys;
+        }
+        do {
+            cursor->VisitRange(0, cursor->Limit(), [&](const auto& entry) {
+                keys.emplace(entry.keys.front());
+                return true;
+            });
+        } while (cursor->Widen());
+        return keys;
+    };
+    for (const bool serial : {true, false}) {
+        EXPECT_EQ(due(now_, serial), (std::set<std::string>{"b"})) << serial;
+        EXPECT_EQ(due(later, serial), (std::set<std::string>{"a", "b"}))
+            << serial;
+    }
+    {
+        auto guard = ns_.objects.Write("a");
+        ASSERT_TRUE(guard);
+        EXPECT_FALSE(guard->owner_state().eviction.postponed);
+        EXPECT_EQ(guard->owner_state().eviction.shard, shard);
+    }
+    for (const bool serial : {true, false}) {
+        EXPECT_EQ(due(now_, serial), (std::set<std::string>{"a", "b"}))
+            << serial;
+    }
+
+    // A group stays where its shared lease files it.
+    Publish("m1", "g");
+    {
+        auto guard = ns_.objects.Write("m1");
+        ASSERT_TRUE(guard);
+        ns_.eviction_index().Postpone(*guard, later);
+        EXPECT_FALSE(guard->owner_state().eviction.postponed);
+    }
+    EXPECT_EQ(due(now_, /*serial=*/false),
+              (std::set<std::string>{"a", "b", "m1"}));
+}
+
+// On the range cursor, keys refiled into buckets a wave already read are
+// revisited by one more wave at most once every due rank is scheduled, so a
+// writer that keeps filing a postponed key by its lease cannot keep the walk
+// going.
+TEST_F(ShardedLeaseIndexTest, RangeWalkRevisitsRefiledKeysInOneWaveAtMost) {
+    for (const bool serial : {false, true}) {
+        const std::string key = serial ? "serial" : "range";
+        Publish(key);
+        auto cursor = ns_.eviction_index().ScanRanges(now_, 0);
+        size_t visits = 0;
+        auto visit = [&](const auto& entry) {
+            if (entry.keys.front() != key) {
+                return true;
+            }
+            ++visits;
+            {
+                auto guard = ns_.objects.Write(key);
+                EXPECT_TRUE(cursor->StillAt(*guard, entry));
+                ns_.eviction_index().Postpone(*guard,
+                                              now_ + std::chrono::seconds(1));
+            }
+            // A writer changes nothing: the key is filed by its lease again.
+            EXPECT_TRUE(ns_.objects.Write(key).has_value());
+            return true;
+        };
+        size_t waves = 0;
+        if (serial) {
+            while (auto entry = cursor->Next()) {
+                visit(*entry);
+                ASSERT_LT(visits, 10u);
+            }
+        } else {
+            do {
+                ++waves;
+                cursor->VisitRange(0, cursor->Limit(), visit);
+            } while (waves < 10 && cursor->Widen());
+            EXPECT_EQ(waves, 2u);
+        }
+        EXPECT_EQ(visits, 2u) << key;
+        auto guard = ns_.objects.Write(key);
+        guard->TearDown();
+    }
+}
+
 TEST_F(ShardedLeaseIndexTest,
        NegativeEpochCutoffRoundsTowardEarlierBucketAndExcludesFutureRanks) {
     const Clock::time_point before_epoch{std::chrono::milliseconds(-250)};
@@ -690,6 +799,10 @@ class ParallelPolicy final : public eviction::EvictionPolicy {
         if (c.key.starts_with("soft") && !c.fallback) {
             return tl::make_unexpected(eviction::SkipReason::kDeferred);
         }
+        // Soft pinned while soft pins may not go: a skip likely to last.
+        if (c.key.starts_with("pin")) {
+            return tl::make_unexpected(eviction::SkipReason::kSoftPinned);
+        }
         eviction::Plan plan;
         for (const auto& replica : c.metadata.GetAllReplicas()) {
             plan.release.push_back(replica.id());
@@ -994,6 +1107,151 @@ TEST_F(ParallelEvictorNativeTest,
     EXPECT_EQ(report.visited, 0u);
     EXPECT_EQ(report.evicted_objects, 0u);
     EXPECT_LE(report.scan_waves, 1u);
+}
+
+// A writer that keeps taking and letting go of postponed keys, changing
+// nothing, files each by its lease again, in a due bucket a walk has read.
+// A walk still ends. On the range cursor, whose first wave takes every due
+// rank for a tenant's byte goal, a walk revisits refiled keys in one more
+// wave at most, on one worker or several. A serial walk (a reclaimer that
+// cannot run concurrently) reads the index as it goes, only moves forward and
+// meets each key once.
+TEST_F(ParallelEvictorNativeTest, WritesToPostponedKeysDoNotHoldTheWalk) {
+    constexpr int kPinned = 2000;
+    struct Case {
+        const char* name;
+        bool parallel_safe;
+        // 0 sizes the run by its filed keys: one worker here.
+        uint32_t workers;
+    };
+    for (const Case& c :
+         {Case{"serial", false, 4}, Case{"serial, automatic workers", false, 0},
+          Case{"one worker", true, 1}, Case{"automatic workers", true, 0},
+          Case{"four workers", true, 4}}) {
+        SCOPED_TRACE(c.name);
+        const TenantId tenant(std::string("t-") + c.name);
+        auto& ns = namespaces_.GetOrCreate(tenant);
+        for (int i = 0; i < kPinned; ++i) {
+            const std::string key = "pin" + std::to_string(i);
+            auto guard = ns.objects.WriteKey(key);
+            std::vector<Replica> replicas;
+            replicas.emplace_back(allocator_->allocate(128),
+                                  ReplicaStatus::COMPLETE);
+            (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                                std::move(replicas), std::nullopt, false,
+                                ObjectDataType::UNKNOWN, "", tenant, key);
+            SpinLocker locker(&guard.metadata().lock);
+            guard.metadata().lease_->SetDeadline(
+                Clock::now() - std::chrono::milliseconds(100 * (i % 50)));
+        }
+        reclaimer_.parallel_safe = c.parallel_safe;
+        eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {},
+                                  c.workers,
+                                  eviction::Evictor::kSkippedKeyBackoff);
+
+        std::atomic<bool> done{false};
+        std::thread writer([&] {
+            // Bounded, so a walk that keeps meeting the keys ends too.
+            const auto until =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            for (int i = 0; !done.load(std::memory_order_relaxed) &&
+                            std::chrono::steady_clock::now() < until;
+                 i = (i + 1) % kPinned) {
+                (void)ns.objects.Write("pin" + std::to_string(i));
+            }
+        });
+        // More than the keys hold: the walk goes through them all.
+        const auto report = evictor.Run(
+            tenant, eviction::ByteGoal{.target_bytes = 2 * kPinned * 128});
+        done = true;
+        writer.join();
+
+        EXPECT_EQ(report.evicted_objects, 0u);
+        if (!c.parallel_safe) {
+            // The serial cursor, with key locks that wait for the writer.
+            EXPECT_EQ(report.workers, 1u);
+            EXPECT_EQ(report.scan_waves, 0u);
+            EXPECT_EQ(report.busy, 0u);
+            EXPECT_EQ(report.visited, static_cast<uint64_t>(kPinned));
+            continue;
+        }
+        // The first wave, and one that revisits what was refiled.
+        EXPECT_EQ(report.workers, std::max(c.workers, 1u));
+        EXPECT_GE(report.scan_waves, 1u);
+        EXPECT_LE(report.scan_waves, 2u);
+        // A worker's key lock does not wait: a key the writer holds is busy
+        // instead of visited, and, not postponed, is not refiled for the
+        // second wave either. So each key is visited or found busy once or
+        // twice.
+        EXPECT_GT(report.visited, 0u);
+        EXPECT_GE(report.visited + report.busy, static_cast<uint64_t>(kPinned));
+        EXPECT_LE(report.visited + report.busy, 2u * kPinned);
+    }
+}
+
+// #4962 on the range walk: a key a worker skips for a reason likely to last is
+// postponed within its shard, so the next run's workers do not lock it again;
+// a write files it by its lease again.
+TEST_F(ParallelEvictorNativeTest, ALastingSkipIsPostponedOnTheRangeWalk) {
+    struct PinnedSkips final : eviction::EvictionObserver {
+        bool SupportsParallel() const override { return true; }
+        void OnSkipped(const eviction::ObjectView& view,
+                       eviction::SkipReason reason) override {
+            if (reason == eviction::SkipReason::kSoftPinned) {
+                std::lock_guard lock(mutex);
+                keys.emplace_back(view.key);
+            }
+        }
+        std::vector<std::string> Take() {
+            std::lock_guard lock(mutex);
+            return std::exchange(keys, {});
+        }
+        std::mutex mutex;
+        std::vector<std::string> keys;
+    } pinned;
+    constexpr size_t kPinned = 200;
+    for (int i = 0; i < 2000; ++i) {
+        Publish(std::to_string(i));
+    }
+    for (size_t i = 0; i < kPinned; ++i) {
+        Publish("pin" + std::to_string(i));
+    }
+    // Longer than the runs can take, however slow (a sanitizer build): the
+    // keys postponed by the first run are not due again before the last.
+    constexpr Clock::duration kBackoff = std::chrono::hours(1);
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&pinned}, 4,
+                              kBackoff);
+    const eviction::ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    auto report = evictor.Run(eviction::Scope::All(), all);
+    EXPECT_EQ(report.workers, 4u);
+    EXPECT_GE(report.scan_waves, 1u);
+    EXPECT_EQ(report.evicted_objects, 2000u);
+    const auto skipped = pinned.Take();
+    EXPECT_EQ(skipped.size(), kPinned);
+    EXPECT_EQ(std::set<std::string>(skipped.begin(), skipped.end()).size(),
+              kPinned);
+
+    // Filed a backoff later, so the next run's workers meet nothing.
+    report = evictor.Run(eviction::Scope::All(), all);
+    EXPECT_EQ(report.visited, 0u);
+    EXPECT_TRUE(pinned.Take().empty());
+    auto& ns = namespaces_.GetOrCreate(TenantId{});
+    auto later = ns.eviction_index().ScanRanges(
+        Clock::now() + kBackoff + metadata::LeaseEvictionIndex::kBucketWidth,
+        0);
+    size_t filed_later = 0;
+    later->VisitRange(0, later->Limit(), [&](const auto&) {
+        ++filed_later;
+        return true;
+    });
+    EXPECT_EQ(filed_later, kPinned);
+
+    // A write files a key by its lease again: the next run meets it.
+    ASSERT_TRUE(ns.objects.Write("pin0").has_value());
+    report = evictor.Run(eviction::Scope::All(), all);
+    EXPECT_EQ(report.visited, 1u);
+    EXPECT_EQ(pinned.Take(), std::vector<std::string>{"pin0"});
 }
 
 TEST_F(ParallelEvictorNativeTest, ReclaimFailureCancelsWorkers) {

@@ -45,6 +45,12 @@ constexpr uint64_t kFibonacciMultiplier = 11400714819323198485ULL;
 // Sampled age-band cutoff activates only above this population size.
 constexpr size_t kBandThresholdKeys = 262'144;
 constexpr size_t kSampleShards = 4;
+// Waves a walk on the range cursor takes, once every due rank is scheduled,
+// only to revisit entries refiled into buckets it already read. One meets a
+// read renewal found at its stale rank again; writes that keep refiling keys
+// into due buckets (a written postponed key goes back to its lease's rank)
+// would hold a walk without a bound.
+constexpr uint32_t kMaxRevisitWaves = 1;
 
 // Encodes and checks `Entry::identity` values so bit layout stays in one place:
 // - Bit 63 == 0: standalone publication (`KeySlot::generation` masked to 63b).
@@ -535,7 +541,8 @@ struct LeaseEvictionIndex::LockedShard {
 // Next() or across parallel workers via VisitRange(). The initial wave schedule
 // is built eagerly at construction, from every bucket of every shard, which a
 // walk on workers needs and a serial one does not (SerialCursor);
-// Widen() runs only after workers join.
+// Widen() runs only after workers join, and once every due rank is scheduled
+// it revisits refiled entries kMaxRevisitWaves times at most.
 class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
    public:
     ShardedCursor(const LeaseEvictionIndex& index, Rank last_rank,
@@ -599,6 +606,12 @@ class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
     bool Widen() override {
         if (total_ == 0) {
             return false;
+        }
+        if (band_rank_ == last_rank_) {
+            if (revisit_waves_ >= kMaxRevisitWaves) {
+                return false;
+            }
+            ++revisit_waves_;
         }
 
         // Record the shard sequence each visited bucket observed so only
@@ -800,6 +813,8 @@ class LeaseEvictionIndex::ShardedCursor final : public RangeCursor {
     std::array<uint64_t, kShards> born_cutoff_{};
     std::array<uint64_t, kShards> wave_seq_{};
     Rank band_rank_ = 0;
+    // Waves taken only to revisit refiled entries (kMaxRevisitWaves).
+    uint32_t revisit_waves_ = 0;
     std::vector<WorkUnit> schedule_;
     size_t unit_idx_ = 0;
     CopiedBucket serial_copy_;
