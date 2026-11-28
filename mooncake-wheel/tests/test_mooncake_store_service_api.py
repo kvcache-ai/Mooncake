@@ -2,12 +2,15 @@
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import tempfile
 import time
 import types
 import unittest
+
+import mooncake as _mooncake_pkg
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -177,6 +180,105 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+
+    async def test_ascend_protocol_enables_agent_mode(self):
+        """protocol='ascend' opts the standalone service into agent mode so
+        the store client self-manages its ACL device context."""
+        calls = []
+        fake_cpp_store = types.ModuleType("mooncake._store")
+        fake_cpp_store.set_ascend_agent_mode = lambda enabled: calls.append(enabled)
+        fake_store = FakeStore()
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1024,
+            local_buffer_size=2048,
+            protocol="ascend",
+            device_name="",
+            master_server_address="127.0.0.1:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="tenant-a",
+            enable_client_http_server=False,
+            client_http_port=9300,
+        )
+
+        with mock.patch.object(_mooncake_pkg, "_store", fake_cpp_store, create=True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop("MC_ASCEND_AGENT_MODE", None)
+                os.environ.pop("ASCEND_AGENT_MODE", None)
+                with patch(
+                    "mooncake.mooncake_store_service.MooncakeDistributedStore",
+                    return_value=fake_store,
+                ):
+                    result = await self.service.start_store_service(max_wait_time=1)
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [True])
+
+    async def test_agent_mode_env_setting_wins_over_auto_enable(self):
+        """An explicit MC_ASCEND_AGENT_MODE value is authoritative: the
+        service must not override it (e.g. env=0 keeps agent mode off)."""
+        calls = []
+        fake_cpp_store = types.ModuleType("mooncake._store")
+        fake_cpp_store.set_ascend_agent_mode = lambda enabled: calls.append(enabled)
+        fake_store = FakeStore()
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1024,
+            local_buffer_size=2048,
+            protocol="ascend",
+            device_name="",
+            master_server_address="127.0.0.1:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="tenant-a",
+            enable_client_http_server=False,
+            client_http_port=9300,
+        )
+
+        with mock.patch.object(_mooncake_pkg, "_store", fake_cpp_store, create=True):
+            with mock.patch.dict(os.environ):
+                os.environ["MC_ASCEND_AGENT_MODE"] = "0"
+                with patch(
+                    "mooncake.mooncake_store_service.MooncakeDistributedStore",
+                    return_value=fake_store,
+                ):
+                    result = await self.service.start_store_service(max_wait_time=1)
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+
+    def test_agent_mode_missing_setter_warns_and_continues(self):
+        """An older wheel without set_ascend_agent_mode degrades to a warning
+        instead of failing startup."""
+        fake_cpp_store = types.ModuleType("mooncake._store")  # no setter attr
+        self.service.config = SimpleNamespace(protocol="ascend")
+
+        with mock.patch.object(
+            _mooncake_pkg, "_store", fake_cpp_store, create=True
+        ):
+            # Must not raise; startup proceeds with the transport as-is.
+            self.service._prepare_ascend_transport()
+
+    def test_agent_mode_import_error_is_swallowed(self):
+        """A non-CPP backend (no mooncake._store importable) only logs a
+        warning; it must not abort store startup."""
+        self.service.config = SimpleNamespace(protocol="ascend")
+        real_store = getattr(_mooncake_pkg, "_store", None)
+        # sys.modules["mooncake._store"] = None makes the submodule import
+        # raise ImportError, the same failure a rs-backend wheel produces.
+        with mock.patch.dict(sys.modules, {"mooncake._store": None}):
+            had_attr = hasattr(_mooncake_pkg, "_store")
+            if had_attr:
+                del _mooncake_pkg._store
+            try:
+                # Must not raise.
+                self.service._prepare_ascend_transport()
+            finally:
+                if had_attr:
+                    _mooncake_pkg._store = real_store
 
     async def test_cli_config_can_override_tenant_id(self):
         config = {

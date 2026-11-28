@@ -97,6 +97,36 @@ TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
     unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
 }
 
+TEST(AscendAgentModeConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+    unsetenv("MC_ASCEND_AGENT_MODE");
+    unsetenv("ASCEND_AGENT_MODE");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_FALSE(defaults.ascend_agent_mode);
+    for (const char* value : {"1", "true", "0", "false", "invalid"}) {
+        setenv("ASCEND_AGENT_MODE", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ascend_agent_mode,
+                  std::string(value) == "1" || std::string(value) == "true");
+    }
+    setenv("ASCEND_AGENT_MODE", "0", 1);
+    setenv("MC_ASCEND_AGENT_MODE", "1", 1);
+    GlobalConfig mc_override;
+    loadGlobalConfig(mc_override);
+    EXPECT_TRUE(mc_override.ascend_agent_mode);
+
+    setenv("ASCEND_AGENT_MODE", "1", 1);
+    setenv("MC_ASCEND_AGENT_MODE", "0", 1);
+    GlobalConfig mc_disable;
+    mc_disable.ascend_agent_mode = true;
+    loadGlobalConfig(mc_disable);
+    EXPECT_FALSE(mc_disable.ascend_agent_mode);
+
+    unsetenv("MC_ASCEND_AGENT_MODE");
+    unsetenv("ASCEND_AGENT_MODE");
+}
+
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 
 class PkeyIndexEnvTest : public ::testing::Test {

@@ -31,6 +31,7 @@
 #include "buffer_pool.h"
 #include "python_buffer.h"
 #include "store_py_internal.h"
+#include "config.h"
 
 namespace py = nanobind;
 
@@ -2233,6 +2234,19 @@ NB_MODULE(_store, m) {
           "Return the serialized Mooncake tensor metadata size.");
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
+    m.def(
+        "set_ascend_agent_mode",
+        [](bool enabled) {
+            // Unsynchronized by design: callers must set this before the
+            // store client spawns its worker threads (i.e. before setup()).
+            mooncake::globalConfig().ascend_agent_mode = enabled;
+        },
+        "Enable Ascend agent mode for this process: store clients self-manage "
+        "the ACL device context and split mounted capacity across local NPUs. "
+        "Only takes effect when the protocol is 'ascend'; call before store "
+        "setup() so no client thread observes the flag mid-flight. Intended "
+        "for standalone store services, not engines that already own a "
+        "runtime context (e.g. torch.npu workers).");
 
     py::class_<RangedReadSnapshotPy>(
         m, "RangedReadSnapshot",
