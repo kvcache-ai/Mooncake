@@ -227,6 +227,7 @@ struct MasterConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_removal_batch_timeout_us = 100;
 };
 
 class MasterServiceSupervisorConfig {
@@ -337,6 +338,7 @@ class MasterServiceSupervisorConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_removal_batch_timeout_us = 100;
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -402,6 +404,8 @@ class MasterServiceSupervisorConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        kv_events_removal_batch_timeout_us =
+            config.kv_events_removal_batch_timeout_us;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -605,6 +609,7 @@ class WrappedMasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_removal_batch_timeout_us = 100;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     uint32_t ha_redis_expected_replicas_per_shard = 0;
@@ -707,6 +712,8 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        kv_events_removal_batch_timeout_us =
+            config.kv_events_removal_batch_timeout_us;
         ha_backend_type = config.ha_backend_type;
         ha_redis_expected_replicas_per_shard =
             config.ha_redis_expected_replicas_per_shard;
@@ -841,6 +848,8 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        kv_events_removal_batch_timeout_us =
+            config.kv_events_removal_batch_timeout_us;
         ha_backend_type = config.ha_backend_type;
         ha_redis_expected_replicas_per_shard =
             config.ha_redis_expected_replicas_per_shard;
@@ -1335,6 +1344,7 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_removal_batch_timeout_us = 100;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     uint32_t ha_redis_expected_replicas_per_shard = 0;
@@ -1435,6 +1445,8 @@ class MasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        kv_events_removal_batch_timeout_us =
+            config.kv_events_removal_batch_timeout_us;
         ha_backend_type = config.ha_backend_type;
         ha_redis_expected_replicas_per_shard =
             config.ha_redis_expected_replicas_per_shard;

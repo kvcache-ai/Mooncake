@@ -40,5 +40,6 @@
   "kv_events_dp_rank": 0,
   "kv_events_emit_object_key": true,
   "kv_events_emit_legacy_compat": true,
-  "kv_events_queue_capacity": 65536
+  "kv_events_queue_capacity": 65536,
+  "kv_events_removal_batch_timeout_us": 100
 }
