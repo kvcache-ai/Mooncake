@@ -140,3 +140,7 @@ failover
 
 testing
 :::
+
+## NPU Direct Storage
+
+See [NDS Transport](../transfer-engine/transport/nds_transport.md) for local Ascend HBM to storage transfers through the standard UBSIO facade.

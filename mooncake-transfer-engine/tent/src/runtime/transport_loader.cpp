@@ -34,6 +34,10 @@
 #include "tent/transport/gds/gds_transport.h"
 #endif
 
+#ifdef USE_NDS
+#include "tent/transport/nds/nds_transport.h"
+#endif
+
 #ifdef USE_URING
 #include "tent/transport/io_uring/io_uring_transport.h"
 #endif
@@ -177,6 +181,11 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_MEMFABRIC
     if (conf_->get("transports/memfabric/enable", false))
         transport_list_[MEMFABRIC] = std::make_shared<MemFabricTransport>();
+#endif
+
+#ifdef USE_NDS
+    if (conf_->get("transports/nds/enable", false))
+        transport_list_[NDS] = std::make_shared<NdsTransport>();
 #endif
 
     return Status::OK();

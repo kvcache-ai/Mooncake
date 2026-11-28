@@ -87,18 +87,18 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
         {
             "file_storage",
             SegmentType::File,
-            std::nullopt,    // same_machine doesn't matter for file
-            std::nullopt,    // local_memory_pattern
-            std::nullopt,    // remote_memory_pattern
-            std::nullopt,    // min_size
-            std::nullopt,    // max_size
-            std::nullopt,    // priority
-            {},              // devices (empty = all devices)
-            {GDS, IOURING},  // File priority (original: GDS -> IOURING)
-            std::nullopt,    // service_level
-            std::nullopt,    // traffic_class
-            std::nullopt,    // qp_pool
-            std::nullopt     // intent_type
+            std::nullopt,         // same_machine doesn't matter for file
+            std::nullopt,         // local_memory_pattern
+            std::nullopt,         // remote_memory_pattern
+            std::nullopt,         // min_size
+            std::nullopt,         // max_size
+            std::nullopt,         // priority
+            {},                   // devices (empty = all devices)
+            {GDS, NDS, IOURING},  // File transport priority
+            std::nullopt,         // service_level
+            std::nullopt,         // traffic_class
+            std::nullopt,         // qp_pool
+            std::nullopt          // intent_type
         },
         {
             "memory_default",

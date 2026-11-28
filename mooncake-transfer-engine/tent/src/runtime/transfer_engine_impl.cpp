@@ -1112,6 +1112,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[HYLINK]) result.push_back(HYLINK);
     if (transport_list_[MEMFABRIC]) result.push_back(MEMFABRIC);
+    if (transport_list_[NDS]) result.push_back(NDS);
     return result;
 }
 
@@ -2064,6 +2065,8 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         if (desc->type == SegmentType::File) {
             if (checkAvailability(transport_list_[GDS], local_mtype))
                 raw.push_back(GDS);
+            if (checkAvailability(transport_list_[NDS], local_mtype))
+                raw.push_back(NDS);
             if (checkAvailability(transport_list_[IOURING], local_mtype))
                 raw.push_back(IOURING);
         } else {

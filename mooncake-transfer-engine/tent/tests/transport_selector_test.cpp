@@ -117,12 +117,14 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
+    transports[NDS] = std::make_shared<FakeTransport>(NDS);
     transports[IOURING] = std::make_shared<FakeTransport>(IOURING);
 
     // Set capabilities for GPU
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
     auto* iouring = static_cast<FakeTransport*>(transports[IOURING].get());
     gds->setGpuToFile(true);
+    static_cast<FakeTransport*>(transports[NDS].get())->setGpuToFile(true);
     iouring->setGpuToFile(true);
 
     // File segment with GPU memory
@@ -138,6 +140,12 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, GDS)
         << "File segment with GPU should prefer GDS first";
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, NDS);
+    EXPECT_EQ(selector.select(ctx, transports, 2).transport, IOURING);
+    transports[GDS].reset();
+    EXPECT_EQ(selector.select(ctx, transports).transport, NDS);
+    transports[NDS].reset();
+    EXPECT_EQ(selector.select(ctx, transports).transport, IOURING);
 }
 
 TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
@@ -327,7 +335,11 @@ TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(FABRIC), 16);
     EXPECT_EQ(static_cast<int>(MLU), 17);
     EXPECT_EQ(static_cast<int>(MEMFABRIC), 18);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 19);
+    EXPECT_EQ(static_cast<int>(NDS), 19);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 20);
+    EXPECT_EQ(TRANSPORT_NDS, static_cast<int>(NDS));
+    EXPECT_EQ(parseTransportType("nds"), NDS);
+    EXPECT_STREQ(transportTypeName(NDS), "nds");
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is
