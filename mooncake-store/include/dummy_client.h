@@ -397,6 +397,16 @@ class DummyClient : public PyClient {
 
     void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
                                size_t bytes, uint64_t latency_us, bool batch);
+
+    template <typename Receipt>
+    std::vector<Receipt> RecordReadItemResults(const char *op_name,
+                                               std::vector<Receipt> results) {
+        if (metrics_) {
+            metrics_->transfer_operation_metric.ObserveReadItemResults(
+                op_name, results, toInt(ErrorCode::OBJECT_NOT_FOUND));
+        }
+        return results;
+    }
 };
 
 }  // namespace mooncake

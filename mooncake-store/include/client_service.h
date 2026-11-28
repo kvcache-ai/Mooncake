@@ -832,6 +832,15 @@ class Client {
         }
     }
 
+    template <typename Receipt>
+    void ObserveReadItemResults(const std::string& op_name,
+                                const std::vector<Receipt>& results) {
+        if (metrics_ != nullptr) {
+            metrics_->transfer_operation_metric.ObserveReadItemResults(
+                op_name, results, toInt(ErrorCode::OBJECT_NOT_FOUND));
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

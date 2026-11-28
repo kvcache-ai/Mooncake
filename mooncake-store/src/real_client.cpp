@@ -6539,6 +6539,9 @@ std::vector<int64_t> RealClient::batch_get_into(
         results.push_back(to_py_ret(result));
     }
 
+    if (client_) {
+        client_->ObserveReadItemResults("batch_get_into", results);
+    }
     return results;
 }
 
@@ -8767,6 +8770,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 
     for (const auto &result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+    if (client_) {
+        client_->ObserveReadItemResults("batch_get_into_multi_buffers",
+                                        results);
     }
     return results;
 }

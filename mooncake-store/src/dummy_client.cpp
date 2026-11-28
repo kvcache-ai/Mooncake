@@ -1826,8 +1826,10 @@ std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-        return std::vector<int64_t>(keys.size(),
-                                    toInt(ErrorCode::INVALID_PARAMS));
+        return RecordReadItemResults(
+            "batch_get_into",
+            std::vector<int64_t>(keys.size(),
+                                 toInt(ErrorCode::INVALID_PARAMS)));
     }
     // Keep the CUDA IPC fast path subject to the same registration and range
     // checks as the staging path below.
@@ -1862,8 +1864,10 @@ std::vector<int64_t> DummyClient::batch_get_into(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto item = prepare_buffer(buffer_ptrs[i], sizes[i], false, true);
         if (!item) {
-            return std::vector<int64_t>(keys.size(),
-                                        toInt(ErrorCode::INVALID_PARAMS));
+            return RecordReadItemResults(
+                "batch_get_into",
+                std::vector<int64_t>(keys.size(),
+                                     toInt(ErrorCode::INVALID_PARAMS)));
         }
         buffers.push_back(reinterpret_cast<uint64_t>(item->dummy));
         prepared.push_back(std::move(*item));
@@ -1887,7 +1891,7 @@ std::vector<int64_t> DummyClient::batch_get_into(
                               total_bytes, elapsed_us_since(start_time), true);
     }
 
-    return results;
+    return RecordReadItemResults("batch_get_into", std::move(results));
 }
 
 std::vector<int64_t> DummyClient::batch_get_into_cuda_ipc(
@@ -1905,7 +1909,7 @@ std::vector<int64_t> DummyClient::batch_get_into_cuda_ipc(
                               elapsed_us_since(start_time), true);
     }
 
-    return results;
+    return RecordReadItemResults("batch_get_into_cuda_ipc", std::move(results));
 }
 
 int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
@@ -2027,12 +2031,16 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     bool prefer_alloc_in_same_node) {
     if (keys.size() != all_buffer_ptrs.size() ||
         keys.size() != all_sizes.size()) {
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+        return RecordReadItemResults(
+            "batch_get_into_multi_buffers",
+            std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS)));
     }
     auto prepared =
         prepare_multi_buffers(all_buffer_ptrs, all_sizes, false, true);
     if (!prepared) {
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+        return RecordReadItemResults(
+            "batch_get_into_multi_buffers",
+            std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS)));
     }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
@@ -2050,7 +2058,9 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
         LOG(ERROR) << "batch_get_into_multi_buffers response size mismatch: "
                    << "expected " << all_sizes.size() << ", got "
                    << internal_results.size();
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INTERNAL_ERROR));
+        return RecordReadItemResults(
+            "batch_get_into_multi_buffers",
+            std::vector<int>(keys.size(), toInt(ErrorCode::INTERNAL_ERROR)));
     }
 
     size_t prepared_index = 0;
@@ -2083,7 +2093,8 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
                               "batch_get_into_multi_buffers", total_bytes,
                               elapsed_us_since(start_time), true);
     }
-    return results;
+    return RecordReadItemResults("batch_get_into_multi_buffers",
+                                 std::move(results));
 }
 
 std::map<std::string, std::vector<Replica::Descriptor>>
