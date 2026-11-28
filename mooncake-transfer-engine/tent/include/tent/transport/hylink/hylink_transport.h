@@ -127,15 +127,13 @@ class HylinkTransport : public Transport {
     // classic hip transport's stream pool: every task runs on the device
     // of its source buffer).
     hipStream_t acquireStream(int device_id);
-    // Issues the task's copy and records its completion event. Must be
-    // called with task.device_id as the current device.
+    // Returns an error only when no copy was accepted. Post-copy failures
+    // are recorded in the task so the caller never rolls back accepted work.
     Status submitTaskCopy(HylinkTask& task);
-    // Handles one request end to end under the source buffer's device
-    // context: validate, open the remote handle, submit the copy. Mirrors
-    // the classic hip transport's startAsyncTransfer.
-    Status startAsyncTransfer(const Request& request,
-                              const SegmentDescRef& local_segment,
-                              HylinkTask& task);
+    // Validates and resolves one request without dispatching any work.
+    Status prepareAsyncTransfer(const Request& request,
+                                const SegmentDescRef& local_segment,
+                                HylinkTask& task);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
                                        uint64_t target_id,
