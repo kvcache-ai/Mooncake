@@ -2795,6 +2795,66 @@ mod owner_page_contract_tests {
         }
     }
 
+    struct RemoteFilteredConfirmationClient {
+        inner: RecordingConfirmationClient,
+    }
+
+    impl RouteAuthorityClient for RemoteFilteredConfirmationClient {
+        fn batch_get_routes(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
+        ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
+            self.inner
+                .batch_get_routes(lease, namespace, authority, keys)
+        }
+
+        fn batch_contains_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            keys: &[ObjectKey],
+        ) -> Result<Vec<Result<bool>>> {
+            Ok(keys.iter().map(|_| Ok(false)).collect())
+        }
+
+        fn batch_compare_and_swap_routes(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<CasResult>>> {
+            self.inner
+                .batch_compare_and_swap_routes(lease, namespace, authority, requests)
+        }
+
+        fn batch_replace_routes(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<()>>> {
+            self.inner
+                .batch_replace_routes(lease, namespace, authority, requests)
+        }
+
+        fn list_routes_by_replica_owner_page(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            query: &RouteOwnerPageQuery,
+        ) -> Result<RouteOwnerPage> {
+            self.inner
+                .list_routes_by_replica_owner_page(lease, namespace, authority, query)
+        }
+    }
+
     struct PresenceConfirmationClient {
         inner: RecordingConfirmationClient,
         presence_queries: Arc<Mutex<Vec<String>>>,
@@ -4037,6 +4097,46 @@ mod owner_page_contract_tests {
                 .unwrap(),
             vec![false; keys.len()]
         );
+    }
+
+    #[test]
+    fn contains_honors_remote_readable_filter_when_observer_filter_is_inactive() {
+        let observer = test_lease("contains-remote-filter-observer");
+        let candidates = vec![
+            test_lease("contains-remote-filter-a"),
+            test_lease("contains-remote-filter-b"),
+        ];
+        let key = ObjectKey::new("contains-remote-filter-key");
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RemoteFilteredConfirmationClient {
+                inner: RecordingConfirmationClient {
+                    routes: ranked
+                        .iter()
+                        .map(|authority| {
+                            (
+                                authority.runtime.stable_id.0.clone(),
+                                Some(test_route(&key.0, &observer.runtime)),
+                            )
+                        })
+                        .collect(),
+                    delete_versions: BTreeMap::new(),
+                    read_failures: BTreeSet::new(),
+                    queried_authorities: Arc::new(Mutex::new(Vec::new())),
+                },
+            }),
+            Arc::new(TestMembership {
+                leases: candidates.clone(),
+            }),
+        );
+        assert!(!crate::is_readable_filter_active(&directory.namespace));
+
+        assert!(!directory.contains_object_route(&observer, &key).unwrap());
     }
 
     #[test]
