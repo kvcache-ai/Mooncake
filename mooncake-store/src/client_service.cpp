@@ -65,9 +65,6 @@ std::optional<size_t> GetTransportRegistrationLimit(
     if (protocol == "efa" || protocol == "cxi") {
         return globalConfig().max_mr_size;
     }
-    if (protocol == "ub") {
-        return globalConfig().max_seg_size;
-    }
     return std::nullopt;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -359,6 +360,27 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
+    // Each pass records stored keys the master no longer has; the next tick
+    // deletes buckets whose keys are all dead. Heartbeat thread only.
+    void ReclaimRemovedObjects();
+
+    // True unless a metadata rescan is running or still owed to a master
+    // that lost our LOCAL_DISK segment.
+    bool MasterKnowsOurObjects() const;
+
+    // Adds the keys the master no longer has (or, for offload_targets, has
+    // without our LOCAL_DISK replica). False if any key went unanswered.
+    bool FindDeadKeys(
+        const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
+        bool offload_targets,
+        std::unordered_map<int64_t, std::vector<std::string>>& dead_keys);
+
+    // Unmaps stale local copies of offload targets, so a removed key that
+    // was put again is offloaded afresh instead of skipped (#4487).
+    void DropStaleCopiesOfOffloadTargets(
+        BucketStorageBackend& backend,
+        const std::unordered_map<std::string, int64_t>& storage_object_sizes);
+
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
     void OnDiskError(int err, const char* op);
@@ -492,6 +514,10 @@ class FileStorage {
     // unwinds, the destroyed promise reports a broken promise instead of
     // parking the waiters forever.
     ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
+    // Tests that assert coalescing set this to the number of followers that
+    // must join before the leader reads. Production leaves it at zero, so a
+    // fast read is never delayed.
+    std::atomic<int> cold_read_waiters_required_for_test_{0};
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
@@ -530,6 +556,18 @@ class FileStorage {
     std::function<int(bool sync_first)> test_filesystem_check_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
+
+    // Reclaim state, touched by the heartbeat thread only.
+    std::unordered_map<int64_t, std::vector<std::string>> reclaim_dead_keys_;
+    int64_t reclaim_cursor_ = -1;
+    // Bumped each time the master reports our segment lost; a rescan that
+    // started at epoch E and succeeded publishes E. Reclaim needs them equal.
+    std::atomic<uint64_t> segment_lost_epoch_{0};
+    std::atomic<uint64_t> rescanned_epoch_{0};
+    bool reclaim_disabled_ = false;
+    uint32_t reclaim_passes_left_ = 0;
+    size_t reclaim_keys_per_pass_ = 0;
+    std::chrono::steady_clock::time_point next_reclaim_at_{};
 };
 
 }  // namespace mooncake
