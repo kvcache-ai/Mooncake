@@ -108,6 +108,13 @@ When this variable is set, the `mooncake::TransferEngine` class internally deleg
 
 Passing a NIC priority matrix through `installTransport(..., args)` is **not** supported under TENT. Configure custom topology via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON` instead (see below).
 
+For automatic discovery, `topology/rdma_whitelist` and
+`topology/rdma_blacklist` apply to each engine independently, including when
+several engines share a process. A nonempty whitelist takes precedence over
+the blacklist. The TE-compatible constructor's device filters (including
+Python `device_name`) populate the whitelist. Custom topology files and
+priority matrices specify their own NICs and bypass automatic filtering.
+
 ### TCP Worker Configuration
 
 For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
