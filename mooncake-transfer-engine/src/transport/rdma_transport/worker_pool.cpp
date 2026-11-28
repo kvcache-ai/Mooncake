@@ -1371,11 +1371,6 @@ void WorkerPool::performPostSend(int thread_id) {
             const size_t admitted_count =
                 adaptive_congestion_control_.gate(entry.second);
             if (admitted_count != 0) {
-                auto auto_gid_token = endpoint->autoGidCompletionToken();
-                for (size_t i = 0; i < admitted_count; ++i) {
-                    entry.second[i]->rdma.endpoint = endpoint.get();
-                    entry.second[i]->rdma.auto_gid_token = auto_gid_token;
-                }
                 const size_t failed_before = failed_slice_list.size();
                 const size_t queued_before = entry.second.size();
                 endpoint->submitPostSendLimited(entry.second, failed_slice_list,
@@ -1392,11 +1387,6 @@ void WorkerPool::performPostSend(int thread_id) {
             }
         } else {
 #endif
-            auto auto_gid_token = endpoint->autoGidCompletionToken();
-            for (auto *slice : entry.second) {
-                slice->rdma.endpoint = endpoint.get();
-                slice->rdma.auto_gid_token = auto_gid_token;
-            }
             endpoint->submitPostSend(entry.second, failed_slice_list);
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         }

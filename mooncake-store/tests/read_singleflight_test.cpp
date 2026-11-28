@@ -84,5 +84,20 @@ TEST(ReadSingleFlightTest, MovingProducerTicketsPreservesOwnership) {
     }
 }
 
+TEST(ReadSingleFlightTest, CountsWaitersThatJoinBeforeRetirement) {
+    ReadSingleFlight<std::string, int> reads;
+    auto leader = reads.Acquire("key");
+    ASSERT_TRUE(leader.IsLeader());
+    EXPECT_EQ(leader.WaiterCount(), 0);
+    auto first = reads.Acquire("key");
+    auto second = reads.Acquire("key");
+    EXPECT_FALSE(first.IsLeader());
+    EXPECT_FALSE(second.IsLeader());
+    EXPECT_EQ(leader.WaiterCount(), 2);
+    leader.Publish(7);
+    EXPECT_EQ(first.Result().get(), 7);
+    EXPECT_EQ(second.Result().get(), 7);
+}
+
 }  // namespace
 }  // namespace mooncake

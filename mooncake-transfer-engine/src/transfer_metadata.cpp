@@ -821,6 +821,16 @@ int TransferMetadata::publishSegmentDesc(const std::string &segment_name,
     return 0;
 }
 
+int TransferMetadata::invalidateRemoteSegmentCache(const std::string &name) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto it = segment_name_to_id_map_.find(name);
+    if (it == segment_name_to_id_map_.end()) return 0;
+    if (it->second == LOCAL_SEGMENT_ID) return -1;
+    segment_id_to_desc_map_.erase(it->second);
+    segment_name_to_id_map_.erase(it);
+    return 0;
+}
+
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1486,6 +1496,16 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    return syncSegmentCacheImpl(segment_name, false);
+}
+
+int TransferMetadata::refreshCachedSegment(const std::string &segment_name) {
+    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
+    return syncSegmentCacheImpl(segment_name, true);
+}
+
+int TransferMetadata::syncSegmentCacheImpl(const std::string &segment_name,
+                                           bool strict) {
     const auto sync_start = std::chrono::steady_clock::now();
 
     // Collect segment names to sync first, then release lock before network I/O
@@ -1670,6 +1690,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", skipped=" << skipped_count
               << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
+    if (strict && (updated_count + unchanged_count == 0 || failed_count != 0 ||
+                   unavailable_count != 0 || skipped_count != 0)) {
+        return ERR_METADATA;
+    }
     return 0;
 }
 

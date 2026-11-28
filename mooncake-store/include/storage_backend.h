@@ -336,6 +336,11 @@ struct FileStorageConfig {
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
 
+    // Interval between reclaim passes (bucket backend only); 0 disables them.
+    uint32_t reclaim_interval_seconds = 10;
+    // Time in which the passes check every stored key against the master.
+    uint32_t reclaim_cycle_seconds = 120;
+
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
@@ -1103,6 +1108,26 @@ class BucketStorageBackend : public StorageBackendInterface {
      *         - BUCKET_NOT_FOUND if bucket doesn't exist
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
+
+    // Buckets after after_bucket_id (wrapping, at most one lap) with their
+    // mapped keys, up to max_keys keys.
+    std::vector<std::pair<int64_t, std::vector<std::string>>>
+    GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys) const;
+
+    // The given keys that are mapped, each with its bucket, in one lookup.
+    std::vector<std::pair<int64_t, std::string>> GetMappedBuckets(
+        const std::unordered_map<std::string, int64_t>& keys) const;
+
+    // Deletes each given bucket whose keys are all listed for it or no
+    // longer mapped to it; returns the number deleted.
+    size_t RemoveDeadBuckets(
+        const std::unordered_map<int64_t, std::vector<std::string>>&
+            dead_keys_by_bucket);
+
+    // Unmaps the keys still mapped to the given bucket, so they can be
+    // offloaded again; their bytes stay until the bucket is deleted.
+    void UnmapKeys(const std::unordered_map<int64_t, std::vector<std::string>>&
+                       keys_by_bucket);
 
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,

@@ -239,14 +239,6 @@ impl RouteMetricsSink for ClientRouteMetricsSink {
         registry::record_route_cas(outcome);
     }
 
-    fn record_route(&self, route: &ObjectRoute) {
-        registry::record_route(route);
-    }
-
-    fn remove_route(&self, key: &ObjectKey) {
-        registry::remove_route(key);
-    }
-
     fn record_delete_marker_state(&self, entries: u64, bytes: u64, budget_bytes: u64) {
         registry::record_delete_marker_state(entries, bytes, budget_bytes);
     }

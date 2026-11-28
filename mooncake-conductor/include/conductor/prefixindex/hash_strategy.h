@@ -12,6 +12,9 @@
 
 namespace mooncake::conductor::prefixindex {
 
+// Producer hash namespaces are independent of the cache recovery policy.
+enum class HashDomain { kRaw, kSglangStorage, kSglangEvent, kSglangDynamo };
+
 struct HashBlock {
     std::array<uint8_t, 32> digest{};
     ProjectedPrefix projected;
@@ -71,8 +74,12 @@ std::string ValidateHashProfile(const HashProfile& profile);
 
 // Returns nullptr and sets error when the resolved profile shape is invalid or
 // unsupported. This consumes the derived root without hashing the seed again.
-std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
-                                                 std::string* error);
+// The default preserves native hashes. SGLang storage/event namespaces select
+// their producer's root/projection rules; they do not depend on cache layout.
+std::unique_ptr<HashStrategy> CreateHashStrategy(
+    const HashProfile& profile, std::string* error,
+    HashDomain domain = HashDomain::kRaw,
+    std::optional<std::string> extra_key = std::nullopt);
 
 std::string DigestToHex(const std::array<uint8_t, 32>& digest);
 

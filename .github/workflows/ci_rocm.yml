@@ -27,6 +27,7 @@ on:
 jobs:
   build-wheel-rocm:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     # Pinned to match the upstream vllm/vllm-openai-rocm and sglang ROCm images
     # (ROCm 7.2). The wheel excludes the ROCm runtime and binds it at load time,
     # so it also loads on the ROCm 7.0 image variants.
@@ -133,12 +134,14 @@ jobs:
       run: |
         set -eo pipefail
         export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
+        # Keep the default linker so pybind11's GCC LTO objects link correctly.
         rm -rf build && mkdir build && cd build
         cmake -G Ninja .. \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
           -DENABLE_MULTI_PROTOCOL=ON \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
-          -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
+          -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
+          -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 
