@@ -33,20 +33,25 @@ constexpr char kPciA[] = "0000:11:00.0";
 constexpr char kPciB[] = "0000:22:00.0";
 }  // namespace
 
-extern "C" cnrtRet_t __real_cnrtDeviceGetByPCIBusId(int*, const char*);
-extern "C" cnrtRet_t __wrap_cnrtDeviceGetByPCIBusId(int* device,
-                                                    const char* pci) {
-    if (!stub_pci_lookup) return __real_cnrtDeviceGetByPCIBusId(device, pci);
+extern "C" cnrtRet_t __real_cnrtGetDeviceCount(unsigned int*);
+extern "C" cnrtRet_t __wrap_cnrtGetDeviceCount(unsigned int* count) {
+    if (!stub_pci_lookup) return __real_cnrtGetDeviceCount(count);
+    *count = 2;
+    return cnrtSuccess;
+}
+
+extern "C" cnrtRet_t __real_cnrtDeviceGetPCIBusId(char*, int, int);
+extern "C" cnrtRet_t __wrap_cnrtDeviceGetPCIBusId(char* pci, int len,
+                                                  int device) {
+    if (!stub_pci_lookup) return __real_cnrtDeviceGetPCIBusId(pci, len, device);
     ++pci_lookup_calls;
-    // Model a runtime that writes an output even when reporting failure.
-    *device = 99;
-    if (fail_next_pci_lookup.exchange(false)) return cnrtErrorCndrvFuncCall;
-    if (std::strcmp(pci, kPciA) == 0)
-        *device = 3;
-    else if (std::strcmp(pci, kPciB) == 0)
-        *device = 7;
-    else
-        return cnrtErrorDeviceInvalid;
+    if (device == 1 && fail_next_pci_lookup.exchange(false))
+        return cnrtErrorCndrvFuncCall;
+    if (device < 0 || device > 1) return cnrtErrorDeviceInvalid;
+    const char* identity = device == 0 ? kPciA : kPciB;
+    if (len <= static_cast<int>(std::strlen(identity)))
+        return cnrtErrorArgsInvalid;
+    std::strcpy(pci, identity);
     return cnrtSuccess;
 }
 
@@ -86,35 +91,34 @@ TEST_F(MluPciCacheTest, CachesEachIdentityWithinPlatformLifetime) {
     for (int repeat = 0; repeat < 3; ++repeat) {
         int device = -1;
         ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
-        EXPECT_EQ(device, 3);
+        EXPECT_EQ(device, 0);
         ASSERT_TRUE(platform_.deviceByPciBusId(kPciB, device).ok());
-        EXPECT_EQ(device, 7);
+        EXPECT_EQ(device, 1);
     }
     EXPECT_EQ(pci_lookup_calls.load(), 2);
     MluPlatform another(std::make_shared<Config>());
     int device = -1;
     ASSERT_TRUE(another.deviceByPciBusId(kPciA, device).ok());
-    EXPECT_EQ(device, 3);
-    EXPECT_EQ(pci_lookup_calls.load(), 3);
+    EXPECT_EQ(device, 0);
+    EXPECT_EQ(pci_lookup_calls.load(), 4);
 }
 
-TEST_F(MluPciCacheTest, RejectsInvalidIdentityAndRetriesFailedLookup) {
+TEST_F(MluPciCacheTest, RejectsMissingDevicesAndRetriesFailedEnumeration) {
     int device = 42;
     EXPECT_TRUE(platform_.deviceByPciBusId("", device).IsInvalidArgument());
     EXPECT_EQ(device, -1);
     EXPECT_EQ(pci_lookup_calls.load(), 0);
+    fail_next_pci_lookup = true;
+    EXPECT_FALSE(platform_.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(device, -1);
+    ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(device, 0);
+    EXPECT_EQ(pci_lookup_calls.load(), 4);
     for (int repeat = 0; repeat < 2; ++repeat) {
         device = 42;
         EXPECT_FALSE(platform_.deviceByPciBusId("missing", device).ok());
         EXPECT_EQ(device, -1);
     }
-    EXPECT_EQ(pci_lookup_calls.load(), 2);
-    fail_next_pci_lookup = true;
-    EXPECT_FALSE(platform_.deviceByPciBusId(kPciA, device).ok());
-    EXPECT_EQ(device, -1);
-    ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
-    EXPECT_EQ(device, 3);
-    ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
     EXPECT_EQ(pci_lookup_calls.load(), 4);
 }
 
@@ -127,13 +131,13 @@ TEST_F(MluPciCacheTest, ConcurrentFirstLookupsShareSuccessfulResult) {
             for (int repeat = 0; repeat < 100; ++repeat) {
                 int device = -1;
                 EXPECT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
-                EXPECT_EQ(device, 3);
+                EXPECT_EQ(device, 0);
             }
         });
     }
     start = true;
     for (auto& worker : workers) worker.join();
-    EXPECT_EQ(pci_lookup_calls.load(), 1);
+    EXPECT_EQ(pci_lookup_calls.load(), 2);
 }
 
 TEST_F(MluPlatformTest, PciIdentityRoundTripPreservesCurrentDeviceAndContext) {
