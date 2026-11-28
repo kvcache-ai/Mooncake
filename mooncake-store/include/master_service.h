@@ -2155,10 +2155,23 @@ class MasterService {
     // Task manager
     ClientTaskManager task_manager_;
 
+    // Drains move objects read since they were written first, most recently
+    // read first, then the rest, most recently written first. PutEnd grants
+    // a zero lease and a read or lookup extends it to now + TTL, so a deadline
+    // at or past put_start_time + TTL means the object was used after the put.
+    struct DrainPriority {
+        bool read_since_written{false};
+        std::chrono::system_clock::time_point last_use{};
+
+        auto operator<=>(const DrainPriority&) const = default;
+    };
+
     struct DrainCandidate {
         TenantId tenant_id;
         route::ObjectRef object;
         size_t source_index;
+        // Set by the walk that finds it; that walk sorts ready by it.
+        DrainPriority priority{};
         uint32_t failed_attempts{0};
         std::chrono::steady_clock::time_point retry_at{};
         bool blocked{false};
@@ -2249,6 +2262,7 @@ class MasterService {
     std::vector<bool> ScanDrainSources(
         DrainJob& job, const std::vector<size_t>& source_indices);
     bool MaybeCompleteDrainJob(DrainJob& job);
+    DrainPriority GetDrainPriority(const ObjectMetadata& metadata) const;
     tl::expected<DrainMove, ErrorCode> PlanDrainMove(
         DrainCandidate& candidate, const CreateDrainJobRequest& request);
     std::optional<std::string> SelectDrainTargetForKey(
