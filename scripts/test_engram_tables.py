@@ -98,7 +98,12 @@ def test_auto_and_manual_config_have_distinct_placement_contracts():
 
 @pytest.mark.parametrize("nic_filter", [None, "=mlx5_0", "=mlx5_0,mlx5_1"])
 def test_remote_connection_preserves_nccl_nic_configuration(monkeypatch, nic_filter):
-    from mooncake._engram.remote.deepep_rdma import backend, jit, local_share
+    # Wheel assembly installs this source package as mooncake._engram.
+    # CPU contracts run from the checkout without an installed native wheel.
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[1] / "mooncake-store" / "src")
+    )
+    from engram.remote.deepep_rdma import backend, jit, local_share
 
     if nic_filter is None:
         monkeypatch.delenv("NCCL_IB_HCA", raising=False)
