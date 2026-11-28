@@ -9,6 +9,7 @@ Usage:
 
   2) Query one key from HTTP metadata server:
      python mc_meta_cli.py --query-key <key> --metadata-server http://127.0.0.1:8080/metadata
+     Set MC_METADATA_HTTP_TOKEN when the server requires bearer authentication.
 
   3) Delete one key via RPC (default protocol: rpc_only):
      python mc_meta_cli.py --delete-key <key> --force
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -66,12 +68,21 @@ def metadata_hint(metadata_server: str) -> str:
 def query_key_by_http(metadata_server: str, key: str, timeout: float) -> bool:
     url = build_metadata_url(metadata_server, key)
     req = urllib.request.Request(url, method="GET")
+    token = os.environ.get("MC_METADATA_HTTP_TOKEN", "")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout):
             return True
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            exc.close()
             return False
+        exc.close()
+        if exc.code == 401:
+            raise RuntimeError(
+                f"HTTP error 401 for {url}. Check MC_METADATA_HTTP_TOKEN."
+            ) from exc
         raise RuntimeError(f"HTTP error {exc.code} for {url}") from exc
     except http.client.RemoteDisconnected as exc:
         raise RuntimeError(
