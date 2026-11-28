@@ -32,12 +32,6 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-// Regression test for the CUDA IPC handle-sharing bug: a caching allocator
-// (e.g. PyTorch) sub-allocates multiple logical buffers inside one cudaMalloc
-// segment. Registering the second buffer used to drop the segment's IPC
-// handle (empty shm_path) while still tagging the buffer NVLink-capable, so
-// cross-process NVLink submission for it failed. Every BufferDesc covering
-// the same cudaMalloc segment must receive the SAME serialized IPC handle.
 TEST(NVLinkIpcHandleSharingTest, TwoRangesInOneCudaMallocSegmentShareHandle) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
@@ -56,38 +50,47 @@ TEST(NVLinkIpcHandleSharingTest, TwoRangesInOneCudaMallocSegmentShareHandle) {
     void* base = nullptr;
     ASSERT_EQ(cudaMalloc(&base, kSegmentSize), cudaSuccess);
 
+    const uint64_t base_addr = reinterpret_cast<uint64_t>(base);
+    const uint64_t first_addr = base_addr + 4096;
+    constexpr uint64_t first_length = 64 * 1024;
+    const uint64_t second_addr = base_addr + 1024 * 1024;
+    constexpr uint64_t second_length = 128 * 1024;
+
     // Two logical buffers sub-allocated inside the one cudaMalloc segment,
     // as a caching allocator would produce.
     MemoryOptions options;
     BufferDesc first;
-    first.addr = reinterpret_cast<uint64_t>(base) + 4096;
-    first.length = 64 * 1024;
+    first.addr = first_addr;
+    first.length = first_length;
     first.location = "cuda:0";
     ASSERT_TRUE(transport.addMemoryBuffer(first, options).ok());
 
     // Some environments back cudaMalloc with VMM allocations, which are not
     // CUDA-IPC exportable and are skipped by design; nothing to test then.
-    if (first.shm_path.empty()) {
+    auto first_attr_it = first.transport_attrs.find(TransportType::NVLINK);
+    if (first_attr_it == first.transport_attrs.end() ||
+        first_attr_it->second.empty()) {
         cudaFree(base);
         transport.uninstall();
         GTEST_SKIP() << "cudaMalloc allocation is VMM-backed; no IPC export";
     }
 
     BufferDesc second;
-    second.addr = reinterpret_cast<uint64_t>(base) + 1024 * 1024;
-    second.length = 128 * 1024;
+    second.addr = second_addr;
+    second.length = second_length;
     second.location = "cuda:0";
     ASSERT_TRUE(transport.addMemoryBuffer(second, options).ok());
 
-    // Both descs carry the same, non-empty serialized IPC handle.
-    EXPECT_FALSE(second.shm_path.empty());
-    EXPECT_EQ(first.shm_path, second.shm_path);
+    EXPECT_EQ(first.addr, first_addr);
+    EXPECT_EQ(first.length, first_length);
+    EXPECT_EQ(second.addr, second_addr);
+    EXPECT_EQ(second.length, second_length);
+    EXPECT_TRUE(first.shm_path.empty());
+    EXPECT_TRUE(second.shm_path.empty());
 
-    // Both are expanded to the full cudaMalloc segment.
-    EXPECT_EQ(first.addr, reinterpret_cast<uint64_t>(base));
-    EXPECT_EQ(second.addr, reinterpret_cast<uint64_t>(base));
-    EXPECT_EQ(first.length, kSegmentSize);
-    EXPECT_EQ(second.length, kSegmentSize);
+    auto second_attr_it = second.transport_attrs.find(TransportType::NVLINK);
+    ASSERT_NE(second_attr_it, second.transport_attrs.end());
+    EXPECT_EQ(first_attr_it->second, second_attr_it->second);
 
     // Both are tagged NVLink-capable.
     EXPECT_NE(std::find(first.transports.begin(), first.transports.end(),
@@ -97,10 +100,15 @@ TEST(NVLinkIpcHandleSharingTest, TwoRangesInOneCudaMallocSegmentShareHandle) {
                         TransportType::NVLINK),
               second.transports.end());
 
-    // The shared handle equals a freshly exported one for the same segment.
     cudaIpcMemHandle_t fresh;
     ASSERT_EQ(cudaIpcGetMemHandle(&fresh, base), cudaSuccess);
-    EXPECT_EQ(first.shm_path,
+    json parsed = json::parse(first_attr_it->second);
+    ASSERT_TRUE(parsed.is_object());
+    EXPECT_EQ(parsed.at("version").get<uint64_t>(), 1u);
+    EXPECT_EQ(parsed.at("kind").get<std::string>(), "ipc");
+    EXPECT_EQ(parsed.at("base_ptr").get<uint64_t>(), base_addr);
+    EXPECT_EQ(parsed.at("alloc_size").get<uint64_t>(), kSegmentSize);
+    EXPECT_EQ(parsed.at("handle").get<std::string>(),
               serializeBinaryData(&fresh, sizeof(cudaIpcMemHandle_t)));
 
     cudaFree(base);

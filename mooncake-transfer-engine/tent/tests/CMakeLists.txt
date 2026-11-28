@@ -970,6 +970,34 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
+if(USE_CUDA
+   AND UNIX
+   AND NOT APPLE)
+  add_executable(tent_nvlink_ipc_attr_test nvlink_ipc_attr_test.cpp)
+  target_link_libraries(tent_nvlink_ipc_attr_test PRIVATE gtest gtest_main
+                                                          tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_nvlink_ipc_attr_test PRIVATE asio_shared)
+  endif()
+  target_include_directories(tent_nvlink_ipc_attr_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_options(
+    tent_nvlink_ipc_attr_test
+    PRIVATE
+    "-Wl,--wrap=cudaGetDevice"
+    "-Wl,--wrap=cudaSetDevice"
+    "-Wl,--wrap=cudaGetDeviceCount"
+    "-Wl,--wrap=cudaDeviceCanAccessPeer"
+    "-Wl,--wrap=cudaDeviceEnablePeerAccess"
+    "-Wl,--wrap=cuMemRetainAllocationHandle"
+    "-Wl,--wrap=cuMemRelease"
+    "-Wl,--wrap=cuMemGetAddressRange_v2"
+    "-Wl,--wrap=cudaIpcGetMemHandle"
+    "-Wl,--wrap=cudaIpcOpenMemHandle"
+    "-Wl,--wrap=cudaIpcCloseMemHandle")
+  add_test(NAME tent_nvlink_ipc_attr_test COMMAND tent_nvlink_ipc_attr_test)
+endif()
+
 # A peer restart invalidates every connection pooled for it; one failed call
 # must flush the whole pool. Loopback only, no NIC required.
 add_executable(tent_rpc_reconnect_test rpc_reconnect_test.cpp)
