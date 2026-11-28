@@ -75,6 +75,107 @@ def test_host_lookup_and_reopen(tmp_path, width, head_major):
         np.testing.assert_array_equal(output[0, 0], output[0, 1])
 
 
+@pytest.mark.parametrize("head_major", [False, True])
+def test_full_host_lookup_does_not_gather(tmp_path, head_major, monkeypatch):
+    rows = np.arange(256 * 17, dtype=np.uint8).reshape(256, 17)
+    store = EngramStore(
+        tables={"a": {"num_rows": 256, "row_bytes": 17}},
+        namespace="test/v1",
+        local_dir=tmp_path,
+    )
+    store.populate("a", rows)
+
+    class SliceOnlyTable(np.ndarray):
+        def __getitem__(self, item):
+            if not isinstance(item, slice):
+                raise AssertionError("full lookup allocated an index gather")
+            return super().__getitem__(item)
+
+    monkeypatch.setattr(store, "_open", lambda _: rows.view(SliceOnlyTable))
+    ids = np.arange(3, 131, dtype=np.int64).reshape(-1, 1)
+    ids[[0, 1]] = ids[[1, 0]]
+    output = np.full(
+        (1, len(ids), 17) if head_major else (len(ids), 1, 17), 221, np.uint8
+    )
+    if head_major:
+        output = output.transpose(1, 0, 2)
+    store.lookup(["a"], ids, output, offsets=[3])
+    np.testing.assert_array_equal(output[:, 0, :], rows[ids[:, 0] - 3])
+
+
+@pytest.mark.parametrize("head_major", [False, True])
+def test_large_owned_output_bounds_take_buffer(tmp_path, monkeypatch, head_major):
+    width, tokens, rows = 4096, 257, 512
+    data = np.random.default_rng(19).integers(0, 256, (rows, width), dtype=np.uint8)
+    store = EngramStore(
+        tables={"a": {"num_rows": rows, "row_bytes": width}},
+        namespace="scratch/v1",
+        local_dir=tmp_path,
+    )
+    store.populate("a", data)
+    ids = np.random.default_rng(23).integers(0, rows, (tokens, 2), dtype=np.int64)
+    output = np.empty(
+        (2, tokens, width) if head_major else (tokens, 2, width), np.uint8
+    )
+    if head_major:
+        output = output.transpose(1, 0, 2)
+    original_take = np.take
+    requests = []
+
+    def take(array, indices, *args, **kwargs):
+        target = kwargs["out"]
+        # NumPy buffers raise-mode output and noncontiguous clip-mode output.
+        buffered = (
+            kwargs.get("mode", "raise") == "raise" or not target.flags.c_contiguous
+        )
+        requests.append(
+            (buffered, len(indices) * width, np.shares_memory(target, output))
+        )
+        return original_take(array, indices, *args, **kwargs)
+
+    monkeypatch.setattr(np, "take", take)
+    try:
+        store.lookup(["a", "a"], ids, output)
+        for k in range(2):
+            np.testing.assert_array_equal(output[:, k, :], data[ids[:, k]])
+        assert requests
+        assert all(
+            size <= 1024 * 1024
+            for buffered, size, shares_output in requests
+            if buffered or not shares_output
+        )
+    finally:
+        store.close()
+
+
+def test_large_mapped_output_preserves_copy_snapshot(tmp_path):
+    width, rows = 4096, 257
+    data = np.random.default_rng(29).integers(0, 256, (rows, width), dtype=np.uint8)
+    store = EngramStore(
+        tables={"a": {"num_rows": rows, "row_bytes": width}},
+        namespace="scratch/v1",
+        local_dir=tmp_path,
+    )
+    store.populate("a", data)
+    output = np.memmap(
+        store._path("a") / "rows", dtype=np.uint8, mode="r+", shape=(rows, 1, width)
+    )
+    ids = np.arange(rows - 1, -1, -1, dtype=np.int64).reshape(-1, 1)
+    try:
+        store.lookup(["a"], ids, output)
+        np.testing.assert_array_equal(output[:, 0, :], data[::-1])
+    finally:
+        store.close()
+        output._mmap.close()
+
+
+def test_noncontiguous_output_preserves_gather_semantics(tmp_path):
+    store, rows, _ = make_store(tmp_path)
+    output = np.full((4, 2, 17), 221, np.uint8)[:, ::2, :]
+    store.lookup(["a"], np.array([[3], [4], [5], [6]], np.int64), output, offsets=[3])
+    np.testing.assert_array_equal(output[:, 0, :], rows[:4])
+
+
 def test_validation_is_before_writes(tmp_path):
     store, _, _ = make_store(tmp_path)
     output = np.full((1, 2, 17), 201, np.uint8)
