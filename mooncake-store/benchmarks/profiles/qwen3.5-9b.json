@@ -1,0 +1,49 @@
+{
+  "format": "mooncake-master-profile-v1",
+  "model": "qwen3.5-9b",
+  "source": "sglang_hicache_offline_capture",
+  "desensitized": true,
+  "model_config": {
+    "layers": 32,
+    "full_attention_layers": 8,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "dtype": "bfloat16",
+    "page_tokens": 64,
+    "page_bytes": 2097152
+  },
+  "key_bytes": 64,
+  "object_bytes": 24576,
+  "keys_per_clone": 1073077,
+  "amplify_for_100m": 94,
+  "read_hit_ratio": 0.05,
+  "prefix_probe_ratio": 0.06,
+  "prefix_probe_hit_ratio": 0.85,
+  "hot_key_fraction": 0.15,
+  "hot_access_prob": 0.8,
+  "put_batch_pmf": [
+    { "size": 256, "weight": 914 },
+    { "size": 2, "weight": 44 },
+    { "size": 116, "weight": 18 },
+    { "size": 114, "weight": 9 },
+    { "size": 192, "weight": 8 },
+    { "size": 244, "weight": 7 }
+  ],
+  "get_batch_pmf": [
+    { "size": 256, "weight": 935 },
+    { "size": 2, "weight": 32 },
+    { "size": 128, "weight": 20 },
+    { "size": 88, "weight": 13 }
+  ],
+  "prefix_probe_pmf": [
+    { "size": 7582, "weight": 63 },
+    { "size": 7586, "weight": 30 },
+    { "size": 7578, "weight": 7 }
+  ],
+  "arrival_us": {
+    "intra_burst_p50": 2000,
+    "intra_burst_p99": 15000,
+    "burst_gap_prob": 0.015,
+    "burst_gap_us": 663000
+  }
+}
