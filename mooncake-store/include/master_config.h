@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include "config/metrics_bootstrap_config.h"
+#include "config/offload_config.h"
 #include "config_helper.h"
 #include "ha/oplog/oplog_batch_config.h"
 #include "types.h"
@@ -547,6 +548,15 @@ class MasterServiceSupervisorConfig {
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
         }
+        OffloadConfig{
+            .enable_offload =
+                enable_offload.IsSet() ? bool(enable_offload) : false,
+            .offload_on_evict = offload_on_evict,
+            .offload_force_evict = offload_force_evict,
+            .offloading_queue_limit = offloading_queue_limit,
+            .offload_cap_ratio = offload_cap_ratio,
+        }
+            .Validate();
     }
 };
 
@@ -1310,11 +1320,7 @@ class MasterServiceConfig {
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
-    bool enable_offload = false;
-    bool offload_on_evict = false;
-    bool offload_force_evict = false;
-    size_t offloading_queue_limit = 50000;
-    double offload_cap_ratio = 0.5;
+    OffloadConfig offload_config;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -1407,11 +1413,11 @@ class MasterServiceConfig {
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
-        enable_offload = config.enable_offload;
-        offload_on_evict = config.offload_on_evict;
-        offload_force_evict = config.offload_force_evict;
-        offloading_queue_limit = config.offloading_queue_limit;
-        offload_cap_ratio = config.offload_cap_ratio;
+        offload_config.enable_offload = config.enable_offload;
+        offload_config.offload_on_evict = config.offload_on_evict;
+        offload_config.offload_force_evict = config.offload_force_evict;
+        offload_config.offloading_queue_limit = config.offloading_queue_limit;
+        offload_config.offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1485,6 +1491,8 @@ class MasterServiceConfig {
         enable_cxl = config.enable_cxl;
     }
 
+    void Validate() const { offload_config.Validate(); }
+
     // Static factory method to create a builder
     static MasterServiceConfigBuilder builder();
 };
@@ -1518,7 +1526,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
-    config.enable_offload = enable_offload_;
+    config.offload_config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.ha_redis_expected_replicas_per_shard =

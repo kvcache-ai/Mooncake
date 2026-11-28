@@ -164,7 +164,7 @@ class PrefetchTaskMasterTest : public ::testing::Test {
 
 TEST_F(PrefetchTaskMasterTest, RegisterSuccessThenDuplicateSkips) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -197,7 +197,7 @@ TEST_F(PrefetchTaskMasterTest, RegisterSuccessThenDuplicateSkips) {
 
 TEST_F(PrefetchTaskMasterTest, MissingKeyNotFound) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_2");
@@ -211,7 +211,7 @@ TEST_F(PrefetchTaskMasterTest, MissingKeyNotFound) {
 
 TEST_F(PrefetchTaskMasterTest, NonHolderRejected) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_3");
@@ -230,7 +230,7 @@ TEST_F(PrefetchTaskMasterTest, NonHolderRejected) {
 
 TEST_F(PrefetchTaskMasterTest, MemoryReplicaPresentSkips) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_4");
@@ -246,7 +246,7 @@ TEST_F(PrefetchTaskMasterTest, MemoryReplicaPresentSkips) {
 
 TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;  // ms
     auto service = std::make_unique<MasterService>(config);
 
@@ -289,7 +289,7 @@ TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
 
 TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_leak");
@@ -314,7 +314,7 @@ TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
 
 TEST_F(PrefetchTaskMasterTest, RegisterPropagatesCandidateFailureCount) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_prop");

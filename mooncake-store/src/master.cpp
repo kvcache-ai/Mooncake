@@ -3,6 +3,7 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
@@ -17,6 +18,7 @@
 
 #include "allocator_status.h"
 #include "config/metrics_bootstrap_config_loader.h"
+#include "config/offload_config.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -271,17 +273,17 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
                                             uint64_t value) {
     // Zero would cause PushOffloadingQueue to always return
     // KEYS_ULTRA_LIMIT, disabling offload entirely. The upper
-    // bound (1e8) keeps `offloading_queue_limit_ *
-    // offload_cap_ratio_` well within signed long range to
-    // avoid overflow when computing offload_cap in
-    // BatchEvict / EvictNamespaceMemory.
+    // bound keeps `offloading_queue_limit * offload_cap_ratio`
+    // well within signed long range to avoid overflow when
+    // computing offload_cap in BatchEvict / EvictNamespaceMemory.
     if (value == 0) {
         LOG(FATAL) << "offloading_queue_limit must be greater than 0";
         return false;
     }
-    if (value > 100'000'000ULL) {
+    if (value > mooncake::OffloadConfig::kMaxOffloadingQueueLimit) {
         LOG(FATAL) << "offloading_queue_limit must be <= "
-                      "100000000 to avoid overflow";
+                   << mooncake::OffloadConfig::kMaxOffloadingQueueLimit
+                   << " to avoid overflow";
         return false;
     }
     return true;
@@ -291,7 +293,7 @@ DEFINE_double(offload_cap_ratio, 0.5,
               "Controls how many objects can be queued for offload in a single "
               "eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
-    if (value < 0.0 || value > 1.0) {
+    if (std::isnan(value) || value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
         return false;
     }

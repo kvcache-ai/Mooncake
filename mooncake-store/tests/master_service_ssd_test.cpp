@@ -42,7 +42,7 @@ class MasterServiceSSDTest : public ::testing::Test {
 
 std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
     config.allocation_strategy_type =
         AllocationStrategyType::SSD_FREE_RATIO_FIRST;
@@ -354,7 +354,7 @@ TEST_F(MasterServiceSSDTest,
         [&](AllocationStrategyType strategy, bool with_ssd, size_t base_start,
             const std::string& tag) -> std::unique_ptr<MasterService> {
         MasterServiceConfig config;
-        config.enable_offload = with_ssd;
+        config.offload_config.enable_offload = with_ssd;
         config.default_kv_lease_ttl = 10000;
         config.allocation_strategy_type = strategy;
         auto svc = std::make_unique<MasterService>(config);
