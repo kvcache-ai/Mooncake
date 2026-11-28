@@ -23001,3 +23001,4 @@ mod pinned_reconcile_review_tests;
 mod public_placement_rollback_tests;
 mod publication_failure_tests;
 mod readable_filter_baseline_tests;
+mod write_scratch_lifetime_tests;
