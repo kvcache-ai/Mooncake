@@ -3384,10 +3384,44 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     return markQueuedOwnerSubmitted(owner_id);
 }
 
+void TransferEngineImpl::linkBoundedWait(BoundedWait& wait) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (wait.linked || !isBatchAlive(wait.batch_id)) return;
+    wait.next = bounded_waits_;
+    bounded_waits_ = &wait;
+    wait.linked = true;
+}
+
+void TransferEngineImpl::unlinkBoundedWait(BoundedWait& wait) {
+    // The owning thread is the only writer of `linked`. Skip the global lock
+    // when this wait never armed, which is every wait with the queue off.
+    if (!wait.linked) return;
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!wait.linked) return;
+    BoundedWait** link = &bounded_waits_;
+    while (*link != nullptr) {
+        if (*link == &wait) {
+            *link = wait.next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    wait.next = nullptr;
+    wait.linked = false;
+}
+
 Status TransferEngineImpl::refillDispatchWindow() {
     // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (bounded_waits_ != nullptr) {
+        const auto now = std::chrono::steady_clock::now();
+        for (BoundedWait* wait = bounded_waits_; wait != nullptr;
+             wait = wait->next) {
+            if (now < wait->deadline || !isBatchAlive(wait->batch_id)) continue;
+            CHECK_STATUS(cancelQueuedOwners(wait->batch_id));
+        }
+    }
     if (dispatch_inflight_owners_ >=
             runtime_queue_config_.max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
@@ -4390,6 +4424,22 @@ Status TransferEngineImpl::waitTransfer(
     const auto timed_out = [&] {
         return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
     };
+    // A poll can outlast this deadline and complete the in-window request
+    // before the loop below notices. Link the deadline first so the refill
+    // that follows that completion cancels owners still in the queue.
+    BoundedWait bounded_wait;
+    struct WaitDeadlineGuard {
+        TransferEngineImpl& engine;
+        BoundedWait& wait;
+        ~WaitDeadlineGuard() { engine.unlinkBoundedWait(wait); }
+    };
+    if (runtime_queue_config_.enabled && timeout_ms != 0 &&
+        deadline != std::chrono::steady_clock::time_point::max()) {
+        bounded_wait.batch_id = batch_id;
+        bounded_wait.deadline = deadline;
+        linkBoundedWait(bounded_wait);
+    }
+    [[maybe_unused]] WaitDeadlineGuard deadline_guard{*this, bounded_wait};
 
     TransferStatus overall_status{};
     for (uint64_t poll_count = 0;; ++poll_count) {
@@ -4416,10 +4466,14 @@ Status TransferEngineImpl::waitTransfer(
     }
 
     if (status_list) return getTransferStatus(batch_id, *status_list);
-    return overall_status.s == COMPLETED
-               ? Status::OK()
-               : Status::InternalError(
-                     "Transfer via stage buffer failed" LOC_MARK);
+    if (overall_status.s == COMPLETED) return Status::OK();
+    // progressBatch can finish the in-window request after the deadline and
+    // refill then cancels the last queued owner. overall_status leaves
+    // PENDING there, so the loop never reaches the timed_out() branch
+    // above. Keep TimedOut for callers that did not ask for a status list.
+    if (timeout_ms != 0 && timed_out())
+        return Status::TimedOut("waitTransfer timed out" LOC_MARK);
+    return Status::InternalError("Transfer via stage buffer failed" LOC_MARK);
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {

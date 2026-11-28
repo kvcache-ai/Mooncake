@@ -565,6 +565,23 @@ class TransferEngineImpl {
     // flight.
     Status cancelQueuedOwners(BatchID batch_id);
 
+    // One node per bounded waitTransfer, living on that call's stack. Refill
+    // walks bounded_waits_ instead of every queued owner. The node stays
+    // linked until its own wait returns.
+    struct BoundedWait {
+        BoundedWait* next = nullptr;
+        BatchID batch_id = 0;
+        std::chrono::steady_clock::time_point deadline{};
+        bool linked = false;
+
+        BoundedWait() = default;
+        BoundedWait(const BoundedWait&) = delete;
+        BoundedWait& operator=(const BoundedWait&) = delete;
+    };
+
+    void linkBoundedWait(BoundedWait& wait);
+    void unlinkBoundedWait(BoundedWait& wait);
+
     Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
@@ -726,6 +743,10 @@ class TransferEngineImpl {
     // freelist, and ProgressWorker. Recursive because freeBatch ->
     // lazyFreeBatch -> getTransferStatus can re-enter. See issue #2116.
     std::recursive_mutex progress_mutex_;
+    // Stack nodes of in-flight bounded waits. Guarded by progress_mutex_.
+    // Null unless some waitTransfer has a finite deadline, so refill skips
+    // the expiry check on the poll hot path.
+    BoundedWait* bounded_waits_ = nullptr;
     // Guarded by progress_mutex_. Emptied (abandoned on purpose) at the end of
     // deconstruct(), after the transports have been destroyed.
     DeferredStageTeardown deferred_stage_teardown_;
@@ -736,8 +757,8 @@ class TransferEngineImpl {
     // independent batches do not serialize.
     //
     // Exception: enable_runtime_queue=true keeps those paths on
-    // progress_mutex_ because queued_owners_ / dispatch window are
-    // engine-global. The runtime queue is off by default.
+    // progress_mutex_ because queued_owners_ / dispatch window /
+    // bounded_waits_ are engine-global. The runtime queue is off by default.
     //
     // The batch registry (alive / active membership) lives INSIDE the same
     // shard: membership changes and lookups are O(1) set ops taken while
