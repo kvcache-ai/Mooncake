@@ -476,56 +476,61 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     return 0;
 }
 
+namespace {
+TransferMetadata::BufferDesc makeTcpBufferDesc(void* addr, size_t length,
+                                               const std::string& server_name) {
+    TransferMetadata::BufferDesc desc;
+    desc.name = server_name;
+    desc.addr = reinterpret_cast<uint64_t>(addr);
+    desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.protocol = "tcp";
+#endif
+    return desc;
+}
+
+bool isOwnTcpDesc(const TransferMetadata::BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol == "tcp";
+#else
+    return desc.shm_name.empty();
+#endif
+}
+}  // namespace
+
 int TcpTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& location,
                                       bool remote_accessible,
                                       bool update_metadata) {
-    (void)remote_accessible;
-    BufferDesc buffer_desc;
-    buffer_desc.name = local_server_name_;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
-#ifdef ENABLE_MULTI_PROTOCOL
-    buffer_desc.protocol = "tcp";
-#endif
-    return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    return metadata_->addLocalMemoryBuffer(
+        makeTcpBufferDesc(addr, length, local_server_name_), update_metadata);
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    // Remove only the descs this transport published. Under multi-protocol
-    // the protocol field is authoritative; otherwise ours are the entries
-    // without a serialized IPC handle.
-    static const std::function<bool(const BufferDesc&)> own_desc =
-        [](const BufferDesc& desc) {
-#ifdef ENABLE_MULTI_PROTOCOL
-            return desc.protocol == "tcp";
-#else
-            return desc.shm_name.empty();
-#endif
-        };
-    return metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, isOwnTcpDesc,
+                                              update_metadata);
 }
 
 int TcpTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
-    for (auto& buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
-        if (ret) return ret;
+    std::vector<BufferDesc> descs;
+    descs.reserve(buffer_list.size());
+    for (const auto& buffer : buffer_list) {
+        descs.push_back(
+            makeTcpBufferDesc(buffer.addr, buffer.length, local_server_name_));
     }
+    int ret = metadata_->addLocalMemoryBuffers(descs, false);
+    if (ret) return ret;
     return metadata_->updateLocalSegmentDesc();
 }
 
 int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = 0;
-    for (auto& addr : addr_list) {
-        int ret = unregisterLocalMemory(addr, false);
-        if (ret && !first_error) first_error = ret;
-    }
+    int rc =
+        metadata_->removeLocalMemoryBuffers(addr_list, isOwnTcpDesc, false);
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    return rc ? rc : metadata_ret;
 }
 
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,

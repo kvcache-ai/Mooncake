@@ -51,6 +51,7 @@ class Transport {
     friend class TransferEngine;
     friend class TransferEngineImpl;
     friend class MultiTransport;
+    friend class MultiTransportBatchTestPeer;
 
    public:
     using SegmentID = uint64_t;

@@ -1860,13 +1860,35 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
     return 0;
 }
 
+#ifdef USE_CXL
+static bool isCxlBuffer(const TransferMetadata::SegmentDesc &segment_desc,
+                        const TransferMetadata::BufferDesc &buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!buffer.protocol.empty()) return buffer.protocol == "cxl";
+#endif
+    return segment_desc.cxl_base_addr != 0 && buffer.addr == 0;
+}
+#endif
+
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
+    return addLocalMemoryBuffers({&buffer_desc, 1}, update_metadata);
+}
+
+int TransferMetadata::addLocalMemoryBuffers(std::span<const BufferDesc> buffers,
+                                            bool update_metadata) {
+    if (buffers.empty()) return 0;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
-        new_segment_desc->buffers.push_back(buffer_desc);
+        new_segment_desc->buffers.insert(new_segment_desc->buffers.end(),
+                                         buffers.begin(), buffers.end());
         new_segment_desc->rebuildBufferRangeIndex();
         segment_desc = new_segment_desc;
     }
@@ -1886,16 +1908,22 @@ int TransferMetadata::removeLocalMemoryBuffer(
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
             if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                        (uint64_t)addr
+                 || (isCxlBuffer(*new_segment_desc, *iter) &&
+                     (iter->offset + new_segment_desc->cxl_base_addr) ==
+                         (uint64_t)addr)
 #endif
-                 ) &&
+                     ) &&
                 pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
@@ -1910,6 +1938,86 @@ int TransferMetadata::removeLocalMemoryBuffer(
         return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int TransferMetadata::removeLocalMemoryBuffers(std::span<void *const> addrs,
+                                               bool update_metadata) {
+    return removeLocalMemoryBuffers(
+        addrs, [](const BufferDesc &) { return true; }, update_metadata);
+}
+
+int TransferMetadata::removeLocalMemoryBuffers(
+    std::span<void *const> addrs,
+    const std::function<bool(const BufferDesc &)> &pred, bool update_metadata,
+    std::vector<int> *results) {
+    if (results) results->assign(addrs.size(), ERR_ADDRESS_NOT_REGISTERED);
+    if (addrs.empty()) return 0;
+
+    std::unordered_map<uint64_t, std::vector<size_t>> candidates;
+    candidates.reserve(addrs.size());
+    for (auto *addr : addrs) {
+        candidates.try_emplace(reinterpret_cast<uint64_t>(addr));
+    }
+
+    size_t removed_count = 0;
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
+        const auto &buffers = segment_desc->buffers;
+        // Collect indices in reverse order so each request can pop the
+        // earliest matching entry, including repeated addresses.
+        for (size_t i = buffers.size(); i > 0; --i) {
+            const auto &buffer = buffers[i - 1];
+            auto match = candidates.find(buffer.addr);
+#ifdef USE_CXL
+            auto alias = candidates.end();
+            if (isCxlBuffer(*segment_desc, buffer)) {
+                alias = candidates.find(buffer.offset +
+                                        segment_desc->cxl_base_addr);
+            }
+            if (match == candidates.end() && alias == candidates.end())
+                continue;
+#else
+            if (match == candidates.end()) continue;
+#endif
+            if (!pred(buffer)) continue;
+            if (match != candidates.end()) match->second.push_back(i - 1);
+#ifdef USE_CXL
+            if (alias != candidates.end() && alias != match)
+                alias->second.push_back(i - 1);
+#endif
+        }
+
+        std::vector<bool> erase(buffers.size(), false);
+        for (size_t i = 0; i < addrs.size(); ++i) {
+            auto &indices = candidates.at(reinterpret_cast<uint64_t>(addrs[i]));
+            // A CXL entry may already have been consumed via its other key.
+            while (!indices.empty() && erase[indices.back()])
+                indices.pop_back();
+            if (indices.empty()) continue;
+            erase[indices.back()] = true;
+            indices.pop_back();
+            ++removed_count;
+            if (results) (*results)[i] = 0;
+        }
+
+        if (!removed_count) return ERR_ADDRESS_NOT_REGISTERED;
+        auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        const auto *first = new_segment_desc->buffers.data();
+        std::erase_if(new_segment_desc->buffers, [&](const BufferDesc &buffer) {
+            return erase[&buffer - first];
+        });
+        new_segment_desc->rebuildBufferRangeIndex();
+        segment_desc = std::move(new_segment_desc);
+    }
+
+    const int rc = update_metadata ? updateLocalSegmentDesc() : 0;
+    return removed_count == addrs.size() ? rc : ERR_ADDRESS_NOT_REGISTERED;
 }
 
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,

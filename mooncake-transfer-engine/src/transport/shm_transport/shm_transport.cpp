@@ -508,7 +508,15 @@ int ShmTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& location,
                                       bool remote_accessible,
                                       bool update_metadata) {
-    (void)remote_accessible;
+    BufferDesc desc;
+    int rc = describeLocalMemory(addr, length, location, desc);
+    if (rc || desc.shm_name.empty()) return rc;
+    return metadata_->addLocalMemoryBuffer(desc, update_metadata);
+}
+
+int ShmTransport::describeLocalMemory(void* addr, size_t length,
+                                      const std::string& location,
+                                      BufferDesc& desc) {
     std::string shm_name;
     size_t alloc_length = 0;
     bool exact_base = false;
@@ -548,7 +556,6 @@ int ShmTransport::registerLocalMemory(void* addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
 
-    TransferMetadata::BufferDesc desc;
     desc.addr = reinterpret_cast<uint64_t>(addr);
     desc.length = length;
     desc.name = location.empty() ? local_server_name_ : location;
@@ -556,7 +563,7 @@ int ShmTransport::registerLocalMemory(void* addr, size_t length,
 #ifdef ENABLE_MULTI_PROTOCOL
     desc.protocol = "shm";
 #endif
-    return metadata_->addLocalMemoryBuffer(desc, update_metadata);
+    return 0;
 }
 
 int ShmTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
@@ -568,32 +575,30 @@ int ShmTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int ShmTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
-    bool exported = false;
+    std::vector<BufferDesc> descs;
+    int rc = 0;
     for (const auto& buffer : buffer_list) {
-        std::string name;
-        const bool owned = getShmName(buffer.addr, &name);
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
-        if (ret) return ret;
-        if (owned) exported = true;
+        BufferDesc desc;
+        rc = describeLocalMemory(buffer.addr, buffer.length, location, desc);
+        if (rc) break;
+        if (!desc.shm_name.empty()) descs.push_back(std::move(desc));
     }
-    if (!exported) return 0;
+    metadata_->addLocalMemoryBuffers(descs, false);
+    if (rc || descs.empty()) return rc;
     return metadata_->updateLocalSegmentDesc();
 }
 
 int ShmTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = 0;
-    bool owned_any = false;
+    std::vector<void*> owned;
     for (auto* addr : addr_list) {
         std::string name;
-        if (getShmName(addr, &name)) owned_any = true;
-        int ret = unregisterLocalMemory(addr, false);
-        if (ret && !first_error) first_error = ret;
+        if (getShmName(addr, &name)) owned.push_back(addr);
     }
-    if (!owned_any) return first_error;
+    if (owned.empty()) return 0;
+    int rc = metadata_->removeLocalMemoryBuffers(owned, false);
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    return rc ? rc : metadata_ret;
 }
 
 bool ShmTransport::tryResolve(const RelocateMap& relocate_map,
