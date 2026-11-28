@@ -36,6 +36,8 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     bool SupportsFdReopen() const override { return true; }
 
+    bool SupportsConcurrentReadAt() const override { return true; }
+
     // Buffered preadv(): no alignment or registration requirements.
     bool SupportsArbitraryHostReadBuffers() const override { return true; }
 
