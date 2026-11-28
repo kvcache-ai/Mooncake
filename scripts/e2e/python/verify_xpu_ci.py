@@ -315,7 +315,7 @@ PLATFORM = case_names(
     HostPointerIsNotExportable DeviceAllocationExportsAsDmabuf SeparateAllocationsExportDistinctDmabufs
     DeviceToDeviceCopyOnSameDevice DeviceToDeviceCopyAcrossDevices CopyRejectsRangePastAllocationEnd
     IpcImportOnSameDevice IpcImportOnPeerDevice HostPointerIsNotIpcExportable ImportRejectsBadArguments
-    ConcurrentHostDeviceCopiesKeepTheirData""",
+    ConcurrentHostDeviceCopiesKeepTheirData SubmitCopiesReportsAndCompletesEachCopy""",
 )
 
 
@@ -323,7 +323,8 @@ TRANSPORT = case_names(
     "XpuTransportTest",
     """LocalStageCopiesFromInteriorDeviceOffset RemoteStageCopiesToInteriorDeviceOffset
     ReadStageCopiesHostToDevice FailsWhenNeitherSideIsDeviceMemory CopiesDeviceToDevice
-    RejectsUnmappedNonLocalTarget ReRegistrationPublishesDistinctIpcAttribute""",
+    RejectsUnmappedNonLocalTarget ReRegistrationPublishesDistinctIpcAttribute
+    BatchedSubmitCompletesEveryTask FreeSubBatchWaitsForPendingCopies""",
 )
 
 

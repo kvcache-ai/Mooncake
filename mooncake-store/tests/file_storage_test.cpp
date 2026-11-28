@@ -1040,6 +1040,19 @@ class FileStorageTest : public ::testing::Test {
         return backend;
     }
 
+    // Keeps the first reader inside the flight until the other readers of the
+    // same batch have joined. A start barrier is not enough: a small object
+    // can finish before those threads are scheduled into BatchGet.
+    static void RequireColdReadWaiters(FileStorage& storage, int waiters) {
+        storage.cold_read_waiters_required_for_test_.store(
+            waiters, std::memory_order_release);
+    }
+
+    static void ClearColdReadWaiters(FileStorage& storage) {
+        storage.cold_read_waiters_required_for_test_.store(
+            0, std::memory_order_release);
+    }
+
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
         FileStorage& fileStorage,
         std::unordered_map<std::string, Slice>& batch_object) {
@@ -3204,6 +3217,7 @@ TEST_F(FileStorageTest, BatchGetLocalSharesOwnerAndPreservesPointerOrder) {
     sizes.resize(3);
 
     constexpr size_t kReaders = 8;
+    RequireColdReadWaiters(storage, static_cast<int>(kReaders - 1));
     std::barrier start(static_cast<std::ptrdiff_t>(kReaders));
     std::vector<std::optional<FileStorage::LocalBatchResult>> results(kReaders);
     std::vector<std::thread> readers;
@@ -3223,6 +3237,9 @@ TEST_F(FileStorageTest, BatchGetLocalSharesOwnerAndPreservesPointerOrder) {
     }
     for (auto& reader : readers) reader.join();
 
+    // The follow-up read is a single reader. Clear the rendezvous first so
+    // its leader does not wait for waiters that will never arrive.
+    ClearColdReadWaiters(storage);
     EXPECT_EQ(backend->loads.load(), 1u);
     ASSERT_TRUE(results[0]);
     for (size_t reader = 0; reader < kReaders; ++reader) {
@@ -3314,6 +3331,7 @@ TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
     keys.resize(3);
     sizes.resize(3);
     constexpr int kConcurrency = 16;
+    RequireColdReadWaiters(fileStorage, kConcurrency - 1);
     std::atomic<int> started{0};
     std::atomic<int> success_count{0};
     std::vector<uint64_t> first_key_pointers(kConcurrency, 0);
@@ -3387,6 +3405,7 @@ TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
     const int64_t target_size = sizes.front();
     const std::string& expected_data = batch_data.at(target_key);
     constexpr int kConcurrency = 16;
+    RequireColdReadWaiters(fileStorage, kConcurrency - 1);
 
     std::atomic<int> success_count{0};
     std::atomic<int> started{0};

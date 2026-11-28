@@ -379,10 +379,8 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
     def test_unified_trigger_and_matching_artifact_handoff(self):
         jobs = E2E_WORKFLOW["jobs"]
         event = E2E_WORKFLOW.get("on", E2E_WORKFLOW.get(True))
-        self.assertEqual(event["pull_request_target"]["types"], ["labeled"])
-        self.assertNotIn("synchronize", event["pull_request_target"]["types"])
+        self.assertEqual(set(event), {"workflow_dispatch"})
         self.assertNotIn("xpu-authorize", jobs)
-        self.assertIn("run-e2e-ci", jobs["build-wheel-xpu"]["if"])
         self.assertIn("workflow_dispatch", jobs["build-wheel-xpu"]["if"])
         self.assertTrue(E2E_WORKFLOW["concurrency"]["cancel-in-progress"])
         self.assertFalse((ROOT / ".github/workflows/xpu-core.yml").exists())
@@ -450,7 +448,7 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
         self.assertIn("always()", jobs["e2e-gate"]["if"])
         self.assertNotIn("permissions", jobs["e2e-gate"])
         self.assertNotIn("continue-on-error", jobs["e2e-gate"]["steps"][0])
-        self.assertEqual(jobs["cleanup-label"]["needs"], ["e2e-gate"])
+        self.assertNotIn("cleanup-label", jobs)
         integration = yaml.safe_load(
             (ROOT / ".github/workflows/integration-test-xpu.yml").read_text()
         )
@@ -492,8 +490,8 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
                 )
                 self.assertEqual(
                     result.returncode == 0,
-                    status in ("success", "skipped"),
-                    result.stderr,
+                    status == "success",
+                    result.stdout + result.stderr,
                 )
 
 
@@ -1020,7 +1018,13 @@ class ReportTest(unittest.TestCase):
                                 self.assertTrue(call.kwargs["require_gtest_status"])
                                 self.assertTrue(call.args[1])
                             result = json.loads((root / "result.json").read_text())
-                            self.assertEqual(result["cpp_cases"], 152)
+                            self.assertEqual(
+                                result["cpp_cases"],
+                                sum(
+                                    len(selected)
+                                    for _, selected in VERIFY.SUITES.values()
+                                ),
+                            )
                             self.assertEqual(result["ep_rounds"], 8)
                         else:
                             with self.assertRaises((RuntimeError, FileNotFoundError)):
@@ -1073,7 +1077,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(len(VERIFY.IPC), 10)
         self.assertEqual(len(VERIFY.INAPPLICABLE), 10)
         self.assertEqual(
-            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 152
+            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 155
         )
         selected_engine = VERIFY.SUITES["tent_xpu_engine_test"][1]
         self.assertFalse(selected_engine & VERIFY.RDMA)

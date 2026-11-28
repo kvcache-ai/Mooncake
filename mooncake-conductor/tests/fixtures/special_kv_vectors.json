@@ -1,0 +1,1008 @@
+{
+  "sglang_commit": "56005a53a50038c9e2aee9ae81530478f0c8945d",
+  "vllm_commit": "613fa94e3d185b6bdc9057d5ff8fdc37c63fc294",
+  "tokens": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "block_size": 2,
+  "hash_cases": [
+    {
+      "bigram": false,
+      "domain": "sglang_storage",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "3817746824117602890",
+        "14230042624842341274",
+        "16284303886627976166"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_event",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "3817746824117602890",
+        "14230042624842341274",
+        "16284303886627976166"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_dynamo",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "3817746824117602890",
+        "14230042624842341274",
+        "16284303886627976166"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_storage",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "4939036313332276405",
+        "1472193160093441855",
+        "17127314799975708935"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_event",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "4745578328758250706",
+        "18334989450208684982",
+        "4612353062696710900"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_dynamo",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "16825194582935897658",
+        "8681910949262397951",
+        "8250586996828928945"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_storage",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "5291957927089214631",
+        "672622940909507427",
+        "15379611667388582695"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_event",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "10954830454997156952",
+        "15523852530979713146",
+        "6085668497242255060"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_dynamo",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "2997295891685930909",
+        "4028828543588485712",
+        "15985472164153372700"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_storage",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "8098538612683941452",
+        "15895779456837262196",
+        "18073386418176792883"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_event",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "5369175452611708719",
+        "14295050078312737627",
+        "8536299092811692960"
+      ]
+    },
+    {
+      "bigram": false,
+      "domain": "sglang_dynamo",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "17320852994706108744",
+        "6417030790421038259",
+        "16214813660386813973"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_storage",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "17143214930767900925",
+        "7461429976246528554"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_event",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "17143214930767900925",
+        "7461429976246528554"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_dynamo",
+      "salt": null,
+      "extra_key": null,
+      "hashes": [
+        "17143214930767900925",
+        "7461429976246528554"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_storage",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "3637506642853732315",
+        "6079880135920297561"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_event",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "13189543707417870838",
+        "15733533248650171822"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_dynamo",
+      "salt": "",
+      "extra_key": null,
+      "hashes": [
+        "15550805711797061803",
+        "11131662279180685148"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_storage",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "6254720347384330231",
+        "7406729258692355371"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_event",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "5681462527252063825",
+        "3323848309316432275"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_dynamo",
+      "salt": "tenant-A",
+      "extra_key": null,
+      "hashes": [
+        "16875386370146959256",
+        "14174471422193048998"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_storage",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "15427204154351654666",
+        "5278212913350375087"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_event",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "18055089428338891654",
+        "4648240714241815251"
+      ]
+    },
+    {
+      "bigram": true,
+      "domain": "sglang_dynamo",
+      "salt": "tenant-A",
+      "extra_key": "adapter-load-id",
+      "hashes": [
+        "2877162287628371697",
+        "13026217337048786106"
+      ]
+    }
+  ],
+  "matcher_cases": [
+    {
+      "policy": "checkpoint",
+      "present": [],
+      "expected": 0
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        48
+      ],
+      "expected": 48
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        48,
+        64
+      ],
+      "expected": 64
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        48,
+        80
+      ],
+      "expected": 80
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        48,
+        64,
+        80
+      ],
+      "expected": 80
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        64,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        64,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        48,
+        64,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        48,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        48,
+        64,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        48,
+        80,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        64,
+        80,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        64,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        48,
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        48,
+        64,
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        48,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        48,
+        64,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        80,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        64,
+        80,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        96,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        64,
+        96,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        48,
+        64,
+        96,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        48,
+        80,
+        96,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        48,
+        64,
+        80,
+        96,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        48,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        64,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        80,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        64,
+        80,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        32,
+        48,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        32,
+        48,
+        64,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        16,
+        48,
+        80,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "checkpoint",
+      "present": [
+        48,
+        64,
+        80,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [],
+      "expected": 0
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        48
+      ],
+      "expected": 48
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        48,
+        64
+      ],
+      "expected": 64
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        48,
+        80
+      ],
+      "expected": 16
+    },
+    {
+      "policy": "window",
+      "present": [
+        48,
+        64,
+        80
+      ],
+      "expected": 80
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        96
+      ],
+      "expected": 32
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        64,
+        96
+      ],
+      "expected": 0
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "window",
+      "present": [
+        64,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        48,
+        64,
+        80,
+        96
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        48,
+        112
+      ],
+      "expected": 48
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        48,
+        64,
+        112
+      ],
+      "expected": 64
+    },
+    {
+      "policy": "window",
+      "present": [
+        48,
+        80,
+        112
+      ],
+      "expected": 0
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        64,
+        80,
+        112
+      ],
+      "expected": 80
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        64,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "window",
+      "present": [
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        48,
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        48,
+        64,
+        80,
+        96,
+        112
+      ],
+      "expected": 112
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        48,
+        128
+      ],
+      "expected": 16
+    },
+    {
+      "policy": "window",
+      "present": [
+        48,
+        64,
+        128
+      ],
+      "expected": 64
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        80,
+        128
+      ],
+      "expected": 32
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        64,
+        80,
+        128
+      ],
+      "expected": 80
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        96,
+        128
+      ],
+      "expected": 16
+    },
+    {
+      "policy": "window",
+      "present": [
+        64,
+        96,
+        128
+      ],
+      "expected": 0
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        48,
+        64,
+        96,
+        128
+      ],
+      "expected": 64
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        48,
+        80,
+        96,
+        128
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        48,
+        64,
+        80,
+        96,
+        128
+      ],
+      "expected": 96
+    },
+    {
+      "policy": "window",
+      "present": [
+        48,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        64,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        80,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        64,
+        80,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        32,
+        48,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        32,
+        48,
+        64,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        16,
+        48,
+        80,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    },
+    {
+      "policy": "window",
+      "present": [
+        48,
+        64,
+        80,
+        96,
+        112,
+        128
+      ],
+      "expected": 128
+    }
+  ],
+  "vllm_checkpoint_msgpack": "93cb3ff000000000000091de000aa474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573917bb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647390aa626c6f636b5f73697a6540a76c6f72615f6964c0a66d656469756da3475055a96c6f72615f6e616d65c0a967726f75705f69647801b26b765f63616368655f737065635f6b696e64a56d616d626100",
+  "sglang_page_msgpack": "93cb3ff00000000000009188a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391ffb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920102aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da3677075aa63616368655f73616c74a874656e616e742d4100"
+}

@@ -10,10 +10,8 @@ use mooncake_store_core::{
 };
 
 use crate::metrics::record_cas_outcome;
-use crate::metrics::{
-    record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state,
-};
-use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore};
+use crate::metrics::{record_delete_marker_event, record_delete_marker_state};
+use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore, RouteGaugeSnapshot};
 use crate::{RouteAuthorityPresence, RouteAuthorityRecord};
 use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
@@ -33,6 +31,7 @@ pub(crate) struct LocalRouteTable {
     scope_index: HashMap<NamespaceScope, HashSet<String>>,
     reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
     delete_markers: DeleteMarkerStore,
+    gauges: RouteGaugeSnapshot,
 }
 
 /// The reverse index intentionally omits length and generation. Any route at
@@ -65,6 +64,10 @@ impl From<&ReplicaRoute> for AllocationRouteStart {
 }
 
 impl LocalRouteTable {
+    pub(crate) fn gauge_snapshot(&self) -> &RouteGaugeSnapshot {
+        &self.gauges
+    }
+
     pub(crate) fn with_delete_marker_budget(budget_bytes: usize) -> Self {
         Self {
             delete_markers: DeleteMarkerStore::new(budget_bytes),
@@ -462,6 +465,7 @@ impl LocalRouteTable {
         let old = self.routes.get(&key.0).cloned();
         let next_live =
             next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone);
+        self.gauges.update(key, old.as_ref(), next_live);
         self.bump_owner_epochs(old.as_ref(), next_live);
         if let Some(route) = old.as_ref() {
             self.remove_indexes(key, route);
@@ -470,7 +474,6 @@ impl LocalRouteTable {
             Some(route) if route.state == mooncake_store_core::RouteState::Tombstone => {
                 self.routes.remove(&key.0);
                 self.record_delete_marker(key, route.version);
-                record_authoritative_route_update(None, key);
                 return Some(route.version);
             }
             Some(route) => {
@@ -491,12 +494,10 @@ impl LocalRouteTable {
                     .max()
                 {
                     self.record_delete_marker(key, version);
-                    record_authoritative_route_update(None, key);
                     return Some(version);
                 }
             }
         }
-        record_authoritative_route_update(next_live, key);
         None
     }
 
@@ -637,7 +638,6 @@ mod tests {
     #[derive(Default)]
     struct RecordingRouteMetricsSink {
         cas_outcomes: Mutex<Vec<&'static str>>,
-        routes: Mutex<HashMap<String, ObjectRoute>>,
         delete_marker_events: Mutex<Vec<(&'static str, u64)>>,
     }
 
@@ -648,16 +648,6 @@ mod tests {
             self.cas_outcomes.lock().unwrap().push(outcome);
         }
 
-        fn record_route(&self, route: &ObjectRoute) {
-            self.routes
-                .lock()
-                .unwrap()
-                .insert(route.key.0.clone(), route.clone());
-        }
-
-        fn remove_route(&self, key: &ObjectKey) {
-            self.routes.lock().unwrap().remove(&key.0);
-        }
         fn record_delete_marker_state(&self, _entries: u64, _bytes: u64, _budget_bytes: u64) {}
 
         fn record_delete_marker_event(&self, event: &'static str, count: u64) {
@@ -696,15 +686,13 @@ mod tests {
     }
 
     #[test]
-    fn logical_cas_metrics_do_not_change_authoritative_route_gauges() {
+    fn cas_outcomes_are_reported_to_the_event_sink() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         let sink = Arc::new(RecordingRouteMetricsSink::default());
         set_route_metrics_sink(sink.clone());
-        let key = ObjectKey::new("observed-route".to_string());
-        let route = test_route(&key, 1);
         let result = CasResult {
             applied: true,
-            current: Some(route.clone()),
+            current: None,
             delete_version: None,
             version_floor: None,
         };
@@ -712,26 +700,187 @@ mod tests {
         record_cas_outcome(&result);
 
         assert!(sink.cas_outcomes.lock().unwrap().contains(&"ok"));
-        assert!(
-            sink.routes.lock().unwrap().get(&key.0).is_none(),
-            "a logical CAS caller must not add observed routes to authority gauges"
-        );
     }
 
     #[test]
     fn local_route_table_mutations_own_route_gauge_updates() {
-        let _guard = METRICS_TEST_LOCK.lock().unwrap();
-        let sink = Arc::new(RecordingRouteMetricsSink::default());
-        set_route_metrics_sink(sink.clone());
-        let key = ObjectKey::new("authority-route".to_string());
+        let key = ObjectKey::new("tenant-a::authority-route");
         let route = test_route(&key, 1);
         let mut table = LocalRouteTable::default();
 
         table.replace(&key, Some(&route));
-        assert_eq!(sink.routes.lock().unwrap().get(&key.0), Some(&route));
+        assert_eq!(table.gauge_snapshot().objects_by_tenant["tenant-a"], 1);
+        assert_eq!(
+            table.gauge_snapshot().replicas_by_runtime[&route.replicas[0].owner]["dram"],
+            1
+        );
 
         table.replace(&key, None);
-        assert!(sink.routes.lock().unwrap().get(&key.0).is_none());
+        assert_eq!(table.gauge_snapshot(), &RouteGaugeSnapshot::default());
+    }
+
+    fn assert_gauges_match_routes(table: &LocalRouteTable) {
+        let mut expected = RouteGaugeSnapshot::default();
+        for (key, route) in &table.routes {
+            let tenant = key
+                .split_once("::")
+                .or_else(|| key.split_once('/'))
+                .map_or("default", |(tenant, _)| tenant);
+            *expected
+                .objects_by_tenant
+                .entry(tenant.to_owned())
+                .or_default() += 1;
+            for replica in &route.replicas {
+                let tier = match replica.tier {
+                    mooncake_store_core::ReplicaTier::Dram => "dram",
+                    mooncake_store_core::ReplicaTier::Nvme => "nvme",
+                    mooncake_store_core::ReplicaTier::File => "file",
+                    mooncake_store_core::ReplicaTier::Unknown => "unknown",
+                };
+                *expected
+                    .replicas_by_runtime
+                    .entry(replica.owner.clone())
+                    .or_default()
+                    .entry(tier)
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(table.gauge_snapshot(), &expected);
+    }
+
+    #[test]
+    fn route_gauges_handle_replays_conflicts_and_delete_markers() {
+        let key = ObjectKey::new("tenant-a::replayed");
+        let mut route = test_route(&key, 1);
+        route.replicas.push(route.replicas[0].clone());
+        let mut table = LocalRouteTable::default();
+        table.replace(&key, Some(&route));
+        table.replace(&key, Some(&route));
+        assert_gauges_match_routes(&table);
+        assert_eq!(table.gauge_snapshot().objects_by_tenant["tenant-a"], 1);
+        assert_eq!(
+            table.gauge_snapshot().replicas_by_runtime[&route.replicas[0].owner]["dram"],
+            2
+        );
+
+        let before = table.gauge_snapshot().clone();
+        assert!(
+            !table
+                .compare_and_swap(&key, Some(RouteVersion(99)), None)
+                .applied
+        );
+        assert_eq!(table.gauge_snapshot(), &before);
+
+        route.version = RouteVersion(2);
+        route.state = RouteState::Deleting;
+        route.replicas.reverse();
+        table.replace(&key, Some(&route));
+        assert_gauges_match_routes(&table);
+        route.version = RouteVersion(3);
+        route.replicas.clear();
+        table.replace(&key, Some(&route));
+        assert_eq!(table.gauge_snapshot().objects_by_tenant["tenant-a"], 1);
+        assert!(table.gauge_snapshot().replicas_by_runtime.is_empty());
+
+        route.version = RouteVersion(4);
+        route.state = RouteState::Tombstone;
+        table.replace(&key, Some(&route));
+        table.replace(&key, Some(&route));
+        assert_eq!(table.gauge_snapshot(), &RouteGaugeSnapshot::default());
+        route.state = RouteState::Active;
+        route.version = RouteVersion(3);
+        table.replace(&key, Some(&route));
+        assert_eq!(table.gauge_snapshot(), &RouteGaugeSnapshot::default());
+
+        route.version = RouteVersion(5);
+        assert!(table.compare_and_swap(&key, None, Some(&route)).applied);
+        assert_gauges_match_routes(&table);
+        table.evict_unreadable_routes(std::slice::from_ref(&key), &BTreeSet::new());
+        table.replace(&key, None);
+        table.replace(&key, None);
+        assert_eq!(table.gauge_snapshot(), &RouteGaugeSnapshot::default());
+    }
+
+    #[test]
+    fn route_gauges_match_full_recount_after_mixed_mutations() {
+        use mooncake_store_core::{ClientEpoch, ReplicaTier};
+
+        let mut table = LocalRouteTable::default();
+        let mut seed = 0x5eed_u64;
+        for version in 1..=512 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let index = (seed >> 32) % 24;
+            let key = ObjectKey::new(match index % 3 {
+                0 => format!("tenant-a::key-{index}"),
+                1 => format!("tenant-b/key-{index}"),
+                _ => format!("unscoped-{index}"),
+            });
+            let mut route = test_route(&key, version);
+            let replica_template = route.replicas[0].clone();
+            route.replicas.clear();
+            for replica_index in 0..(seed >> 16) % 4 {
+                let mut replica = replica_template.clone();
+                replica.owner = ClientRuntimeId::new(
+                    format!("owner-{}", (seed >> 8) % 3),
+                    ClientEpoch(1 + replica_index % 2),
+                );
+                replica.tier = match (seed >> 24) % 4 {
+                    0 => ReplicaTier::Dram,
+                    1 => ReplicaTier::Nvme,
+                    2 => ReplicaTier::File,
+                    _ => ReplicaTier::Unknown,
+                };
+                route.replicas.push(replica);
+            }
+            match seed % 8 {
+                0 => table.replace(&key, Some(&route)),
+                1 => {
+                    let expected = table.routes.get(&key.0).map(|old| old.version);
+                    assert!(table.compare_and_swap(&key, expected, Some(&route)).applied);
+                }
+                2 => {
+                    assert!(
+                        !table
+                            .compare_and_swap(&key, Some(RouteVersion(u64::MAX)), Some(&route))
+                            .applied
+                    );
+                }
+                3 => table.replace(&key, None),
+                4 => {
+                    route.state = RouteState::Tombstone;
+                    table.replace(&key, Some(&route));
+                }
+                5 => {
+                    route.version = RouteVersion(0);
+                    table.replace(&key, Some(&route));
+                }
+                6 => {
+                    route.state = RouteState::Deleting;
+                    table.replace(&key, Some(&route));
+                }
+                _ => table.evict_unreadable_routes(&[key], &BTreeSet::new()),
+            }
+            assert_gauges_match_routes(&table);
+        }
+    }
+
+    #[test]
+    fn route_gauge_cardinality_depends_on_labels_and_cleans_up_at_zero() {
+        let mut table = LocalRouteTable::default();
+        for index in 0..1024 {
+            let key = ObjectKey::new(format!("tenant-a::key-{index}"));
+            table.replace(&key, Some(&test_route(&key, 1)));
+        }
+        let gauges = table.gauge_snapshot();
+        assert_eq!(gauges.objects_by_tenant.len(), 1);
+        assert_eq!(gauges.objects_by_tenant["tenant-a"], 1024);
+        assert_eq!(gauges.replicas_by_runtime.len(), 1);
+        assert_eq!(gauges.replicas_by_runtime.values().next().unwrap().len(), 1);
+        assert_gauges_match_routes(&table);
+        for index in 0..1024 {
+            table.replace(&ObjectKey::new(format!("tenant-a::key-{index}")), None);
+        }
+        assert_eq!(table.gauge_snapshot(), &RouteGaugeSnapshot::default());
     }
 
     #[test]
