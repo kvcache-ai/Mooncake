@@ -385,6 +385,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
+    tl::expected<FetchTasksReplayResponse, ErrorCode> FetchTasksReplay(
+        const UUID& client_id, const FetchTasksReplayRequest& request);
 
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);

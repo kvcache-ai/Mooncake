@@ -238,6 +238,109 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
     return result;
 }
 
+tl::expected<ScopedTaskWriteAccess::ReplayBatch, ErrorCode>
+ScopedTaskWriteAccess::fetch_tasks_replay(const ClientSessionSharedPtr& session,
+                                          const UUID& token, uint64_t sequence,
+                                          size_t batch_size, bool closing) {
+    const auto& client_id = session->ClientId();
+    auto& states = manager_->task_fetch_replay_;
+    auto entry = states.find(client_id);
+    if (sequence == 0) {
+        if (token != UUID{} || batch_size != 0 || closing) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (entry == states.end() || entry->second.session != session) {
+            entry =
+                states
+                    .insert_or_assign(client_id,
+                                      ClientTaskManager::TaskFetchReplayState{
+                                          session, generate_uuid(), 0, 0, {}})
+                    .first;
+        }
+        const auto& state = entry->second;
+        return ReplayBatch{state.token, state.sequence, {}};
+    }
+
+    if (entry == states.end() || entry->second.session != session ||
+        entry->second.token != token) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    // Match the legacy client's maximum batch while bounding replay state
+    // independently of the caller's local credit validation.
+    constexpr size_t kMaxReplayBatchSize = 16;
+    if (batch_size == 0 || batch_size > kMaxReplayBatchSize) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& state = entry->second;
+    if (state.closed && (!closing || sequence != state.sequence)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (sequence == state.sequence) {
+        if (batch_size != state.batch_size) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        state.closed = closing;
+        ReplayBatch batch{token, sequence, {}};
+        batch.tasks.reserve(state.task_ids.size());
+        for (const auto& id : state.task_ids) {
+            const auto task = manager_->all_tasks_.find(id);
+            if (task != manager_->all_tasks_.end() &&
+                task->second.status == TaskStatus::PROCESSING) {
+                batch.tasks.push_back(task->second);
+            }
+        }
+        return batch;
+    }
+    if (sequence < state.sequence || sequence - state.sequence != 1) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (closing) {
+        state.sequence = sequence;
+        state.batch_size = batch_size;
+        state.task_ids.clear();
+        state.closed = true;
+        return ReplayBatch{token, sequence, {}};
+    }
+    if (state.sequence == 0) {
+        const auto processing = manager_->processing_tasks_.find(client_id);
+        if (processing != manager_->processing_tasks_.end() &&
+            !processing->second.empty()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    // Install the grant under the same lock that charges processing quota.
+    // Reserve the bookkeeping before claiming tasks.
+    std::vector<UUID> task_ids;
+    task_ids.reserve(batch_size);
+    auto tasks = pop_tasks(client_id, batch_size);
+    for (const auto& task : tasks) {
+        task_ids.push_back(task.id);
+    }
+    state.task_ids = std::move(task_ids);
+    state.sequence = sequence;
+    state.batch_size = batch_size;
+    return ReplayBatch{token, sequence, std::move(tasks)};
+}
+
+bool ScopedTaskWriteAccess::task_fetch_replay_active(
+    const ClientSessionSharedPtr& session) const {
+    const auto entry = manager_->task_fetch_replay_.find(session->ClientId());
+    return entry != manager_->task_fetch_replay_.end() &&
+           entry->second.session == session && entry->second.sequence != 0;
+}
+
+void ScopedTaskWriteAccess::retire_task_fetch_replay(
+    const ClientSessionSharedPtr& session) {
+    auto& states = manager_->task_fetch_replay_;
+    const auto entry = states.find(session->ClientId());
+    if (entry != states.end() && entry->second.session == session) {
+        states.erase(entry);
+    }
+}
+
 ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,

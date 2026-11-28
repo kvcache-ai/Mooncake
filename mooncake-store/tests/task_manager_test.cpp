@@ -42,6 +42,140 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
 }
 
+TEST_F(ClientTaskManagerTest, FetchReplayChargesProcessingQuotaOnce) {
+    ClientTaskManager manager({10000, 10000, 2, 0, 0, 3});
+    const auto owner = generate_uuid();
+    const auto peer = generate_uuid();
+    const auto session = std::make_shared<ClientLivenessRecord>(
+        owner, ClientLivenessRecord::Clock::now());
+    auto write = manager.get_write_access();
+    const ReplicaCopyPayload payload{
+        .key = "key", .source = "a", .targets = {"b"}};
+    auto first =
+        write.submit_task_typed<TaskType::REPLICA_COPY>(owner, payload);
+    auto second =
+        write.submit_task_typed<TaskType::REPLICA_COPY>(owner, payload);
+    auto other = write.submit_task_typed<TaskType::REPLICA_COPY>(peer, payload);
+    ASSERT_TRUE(first && second && other);
+
+    const auto opened = write.fetch_tasks_replay(session, {}, 0, 0);
+    ASSERT_TRUE(opened);
+    EXPECT_TRUE(opened->tasks.empty());
+    EXPECT_FALSE(write.task_fetch_replay_active(session));
+    const auto claimed = write.fetch_tasks_replay(session, opened->token, 1, 2);
+    ASSERT_TRUE(claimed);
+    ASSERT_EQ(claimed->tasks.size(), 2);
+    EXPECT_EQ(claimed->tasks[0].id, *first);
+    EXPECT_EQ(claimed->tasks[1].id, *second);
+    EXPECT_TRUE(write.task_fetch_replay_active(session));
+
+    const auto replayed =
+        write.fetch_tasks_replay(session, opened->token, 1, 2);
+    ASSERT_TRUE(replayed);
+    ASSERT_EQ(replayed->tasks.size(), 2);
+    EXPECT_EQ(replayed->tasks[0].id, *first);
+    EXPECT_EQ(replayed->tasks[0].payload, claimed->tasks[0].payload);
+    EXPECT_EQ(replayed->tasks[1].id, *second);
+    EXPECT_FALSE(write.fetch_tasks_replay(session, opened->token, 1, 3));
+    EXPECT_FALSE(write.fetch_tasks_replay(session, opened->token, 3, 1));
+    EXPECT_TRUE(write.pop_tasks(peer, 2).empty());
+
+    ASSERT_EQ(write.complete_task(owner, *first, TaskStatus::SUCCESS, ""),
+              ErrorCode::OK);
+    const auto peer_claim = write.pop_tasks(peer, 2);
+    ASSERT_EQ(peer_claim.size(), 1);
+    EXPECT_EQ(peer_claim[0].id, *other);
+    const auto after_completion =
+        write.fetch_tasks_replay(session, opened->token, 1, 2);
+    ASSERT_TRUE(after_completion);
+    ASSERT_EQ(after_completion->tasks.size(), 1);
+    EXPECT_EQ(after_completion->tasks[0].id, *second);
+
+    const auto acknowledged =
+        write.fetch_tasks_replay(session, opened->token, 2, 1);
+    ASSERT_TRUE(acknowledged);
+    EXPECT_TRUE(acknowledged->tasks.empty());
+    EXPECT_FALSE(write.fetch_tasks_replay(session, opened->token, 1, 2));
+}
+
+TEST_F(ClientTaskManagerTest, FetchReplayRejectsStaleSessionAndReplaysEmpty) {
+    ClientTaskManager manager({10000, 10000, 2, 0, 0, 3});
+    const auto owner = generate_uuid();
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto old_session = std::make_shared<ClientLivenessRecord>(owner, now);
+    const auto new_session = std::make_shared<ClientLivenessRecord>(owner, now);
+    auto write = manager.get_write_access();
+    const auto old_lane = write.fetch_tasks_replay(old_session, {}, 0, 0);
+    ASSERT_TRUE(old_lane);
+    write.retire_task_fetch_replay(old_session);
+    const auto new_lane = write.fetch_tasks_replay(new_session, {}, 0, 0);
+    ASSERT_TRUE(new_lane);
+    ASSERT_NE(old_lane->token, new_lane->token);
+    write.retire_task_fetch_replay(old_session);
+    EXPECT_FALSE(write.fetch_tasks_replay(new_session, old_lane->token, 1, 1));
+    const auto empty =
+        write.fetch_tasks_replay(new_session, new_lane->token, 1, 1);
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->tasks.empty());
+    auto id = write.submit_task_typed<TaskType::REPLICA_COPY>(
+        owner,
+        ReplicaCopyPayload{.key = "key", .source = "a", .targets = {"b"}});
+    ASSERT_TRUE(id);
+    const auto repeated =
+        write.fetch_tasks_replay(new_session, new_lane->token, 1, 1);
+    ASSERT_TRUE(repeated);
+    EXPECT_TRUE(repeated->tasks.empty());
+    const auto next =
+        write.fetch_tasks_replay(new_session, new_lane->token, 2, 1);
+    ASSERT_TRUE(next);
+    ASSERT_EQ(next->tasks.size(), 1);
+    EXPECT_EQ(next->tasks.front().id, *id);
+}
+
+TEST_F(ClientTaskManagerTest, FetchReplayClosesWithoutCreatingANewGrant) {
+    ClientTaskManager manager({10000, 10000, 1, 0, 0, 3});
+    const auto owner = generate_uuid();
+    const auto peer = generate_uuid();
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto session = std::make_shared<ClientLivenessRecord>(owner, now);
+    const auto peer_session = std::make_shared<ClientLivenessRecord>(peer, now);
+    auto write = manager.get_write_access();
+    const ReplicaCopyPayload payload{
+        .key = "key", .source = "a", .targets = {"b"}};
+    auto owner_task =
+        write.submit_task_typed<TaskType::REPLICA_COPY>(owner, payload);
+    auto peer_task =
+        write.submit_task_typed<TaskType::REPLICA_COPY>(peer, payload);
+    ASSERT_TRUE(owner_task && peer_task);
+
+    const auto owner_lane = write.fetch_tasks_replay(session, {}, 0, 0);
+    const auto peer_lane = write.fetch_tasks_replay(peer_session, {}, 0, 0);
+    ASSERT_TRUE(owner_lane && peer_lane);
+    const auto closed =
+        write.fetch_tasks_replay(session, owner_lane->token, 1, 1, true);
+    ASSERT_TRUE(closed);
+    EXPECT_TRUE(closed->tasks.empty());
+    EXPECT_FALSE(write.fetch_tasks_replay(session, owner_lane->token, 1, 1));
+    const auto repeated_close =
+        write.fetch_tasks_replay(session, owner_lane->token, 1, 1, true);
+    ASSERT_TRUE(repeated_close);
+    EXPECT_TRUE(repeated_close->tasks.empty());
+
+    const auto granted =
+        write.fetch_tasks_replay(peer_session, peer_lane->token, 1, 1);
+    ASSERT_TRUE(granted);
+    ASSERT_EQ(granted->tasks.size(), 1);
+    const auto recovered =
+        write.fetch_tasks_replay(peer_session, peer_lane->token, 1, 1, true);
+    ASSERT_TRUE(recovered);
+    ASSERT_EQ(recovered->tasks.size(), 1);
+    EXPECT_EQ(recovered->tasks.front().id, *peer_task);
+    EXPECT_FALSE(
+        write.fetch_tasks_replay(peer_session, peer_lane->token, 2, 1));
+    EXPECT_FALSE(
+        write.fetch_tasks_replay(peer_session, peer_lane->token, 2, 1, true));
+}
+
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();

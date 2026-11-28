@@ -1051,6 +1051,8 @@ class MasterService {
      */
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
+    tl::expected<FetchTasksReplayResponse, ErrorCode> FetchTasksReplay(
+        const UUID& client_id, const FetchTasksReplayRequest& request);
 
     /**
      * @brief Mark the task as complete

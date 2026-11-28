@@ -778,6 +778,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
     FetchTasks(size_t batch_size);
+    [[nodiscard]] tl::expected<FetchTasksReplayResponse, ErrorCode>
+    FetchTasksReplay(const FetchTasksReplayRequest& request);
 
     /**
      * @brief Mark the task as complete

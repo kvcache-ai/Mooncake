@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
+#include "client_liveness.h"
 #include "types.h"
 #include "mutex.h"
 #include "master_config.h"
@@ -229,6 +230,21 @@ class ScopedTaskWriteAccess {
 
     void prune_expired_tasks();
 
+    // A zero sequence opens the replay lane without assigning work. Each
+    // following sequence acknowledges its predecessor and may claim one batch.
+    struct ReplayBatch {
+        UUID token;
+        uint64_t sequence;
+        std::vector<Task> tasks;
+    };
+
+    tl::expected<ReplayBatch, ErrorCode> fetch_tasks_replay(
+        const ClientSessionSharedPtr& session, const UUID& token,
+        uint64_t sequence, size_t batch_size, bool closing = false);
+
+    bool task_fetch_replay_active(const ClientSessionSharedPtr& session) const;
+    void retire_task_fetch_replay(const ClientSessionSharedPtr& session);
+
    private:
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
@@ -291,6 +307,17 @@ class ClientTaskManager {
     std::unordered_map<UUID, std::unordered_set<UUID, boost::hash<UUID>>,
                        boost::hash<UUID>>
         processing_tasks_ GUARDED_BY(mutex_);
+
+    struct TaskFetchReplayState {
+        ClientSessionSharedPtr session;
+        UUID token;
+        uint64_t sequence = 0;
+        size_t batch_size = 0;
+        std::vector<UUID> task_ids;
+        bool closed = false;
+    };
+    std::unordered_map<UUID, TaskFetchReplayState, boost::hash<UUID>>
+        task_fetch_replay_ GUARDED_BY(mutex_);
 
     // Tracks the order of finished tasks (Oldest -> Newest)
     // Used to implement LRU eviction for completed tasks

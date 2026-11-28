@@ -1593,6 +1593,22 @@ WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
         [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
 }
 
+tl::expected<FetchTasksReplayResponse, ErrorCode>
+WrappedMasterService::FetchTasksReplay(const UUID& client_id,
+                                       const FetchTasksReplayRequest& request) {
+    return execute_rpc(
+        "FetchTasksReplay",
+        [&] { return master_service_.FetchTasksReplay(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", sequence=", request.sequence,
+                             ", batch_size=", request.batch_size,
+                             ", closing=", request.closing);
+        },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_requests(); },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
     return execute_rpc(
@@ -2187,6 +2203,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::ListDrainJobs, &WrappedMasterService::CancelTask,
         &WrappedMasterService::IsTaskCancellationRequested,
         &WrappedMasterService::FetchTasks,
+        &WrappedMasterService::FetchTasksReplay,
         &WrappedMasterService::MarkTaskToComplete,
         &WrappedMasterService::BeginWeightImport,
         &WrappedMasterService::CommitWeightImport,

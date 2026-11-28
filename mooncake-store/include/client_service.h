@@ -1280,15 +1280,19 @@ class Client {
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
     void TaskPollThreadMain();
+    // False means the server explicitly rejected the replay handshake.
+    bool RunReplayTaskPoller();
     void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
-    void SubmitTask(const TaskAssignment& assignment);
+    void SubmitTask(const TaskAssignment& assignment,
+                    bool holds_fetch_credit = false);
 
     // For task management
     // Client-side task representation
     struct ClientTask {
         TaskAssignment assignment;
         uint32_t retry_count = 0;
+        bool holds_fetch_credit = false;
 
         void increment_retry() { retry_count++; }
     };
@@ -1342,8 +1346,13 @@ class Client {
                                        const UUID* task_id = nullptr);
 
     // Task thread pool for async task execution
+    static constexpr size_t kTaskWorkerCount = 4;
     ThreadPool task_thread_pool_;
     std::atomic<bool> task_running_{true};
+    const bool adaptive_task_fetch_enabled_;
+    std::mutex task_poll_mutex_;
+    std::condition_variable task_poll_cv_;
+    size_t tasks_in_flight_ = 0;  // Protected by task_poll_mutex_.
 
     // Task polling configuration
     static constexpr size_t kTaskBatchSize =

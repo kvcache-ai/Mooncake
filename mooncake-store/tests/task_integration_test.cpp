@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -95,6 +96,145 @@ tl::expected<std::string, int> HttpPostJson(const std::string& url,
     }
     return std::string(response.resp_body);
 }
+
+class DelayedTaskFetch {
+   public:
+    explicit DelayedTaskFetch(WrappedMasterService& master) : master_(master) {}
+
+    tl::expected<FetchTasksReplayResponse, ErrorCode> Fetch(
+        const UUID& client_id, const FetchTasksReplayRequest& request) {
+        auto result = master_.FetchTasksReplay(client_id, request);
+        if (result && !result->assignments.empty()) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        return result;
+    }
+
+   private:
+    WrappedMasterService& master_;
+};
+
+class TaskFetchReplayTcpTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TaskFetchReplayTcpTest, SettlesOriginalGrantAfterResponseTimeout) {
+    const bool cancel_and_close = GetParam();
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_metric_reporting = false;
+    config.max_total_processing_tasks = 1;
+    WrappedMasterService service(config);
+    coro_rpc::coro_rpc_server master(2, 0, "127.0.0.1");
+    RegisterRpcService(master, service);
+    auto master_started = master.async_start();
+    ASSERT_FALSE(master_started.hasResult());
+    const UUID owner = generate_uuid();
+    const UUID other_owner = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "replay-source";
+    source.base = 0x300000000;
+    source.size = 16 * 1024 * 1024;
+    Segment target = source;
+    target.id = generate_uuid();
+    target.name = "replay-target";
+    target.base = 0x400000000;
+    ASSERT_TRUE(service.MountSegment(source, owner));
+    ASSERT_TRUE(service.MountSegment(target, other_owner));
+
+    // Register metadata only. These tests exercise assignment and completion
+    // over RPC. DrainJobCompleteFlow covers the actual data transfer.
+    MasterClient client(owner);
+    ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(master.port())),
+              ErrorCode::OK);
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segment = source.name;
+    std::vector<UUID> ids;
+    for (const std::string key : {"replay-first", "replay-second"}) {
+        ASSERT_TRUE(client.PutStart(key, {1024}, placement));
+        ASSERT_TRUE(
+            client.PutEnd(ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY));
+        auto task = client.CreateMoveTask(key, source.name, target.name);
+        ASSERT_TRUE(task);
+        ids.push_back(*task);
+    }
+
+    auto opened = client.FetchTasksReplay({});
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(opened->sequence, 0u);
+    ASSERT_TRUE(opened->assignments.empty());
+    FetchTasksReplayRequest request{opened->token, 1, 1, false};
+
+    DelayedTaskFetch delayed(service);
+    coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+    server.register_handler<&DelayedTaskFetch::Fetch>(
+        &delayed, coro_rpc::func_id<&WrappedMasterService::FetchTasksReplay>());
+    auto started = server.async_start();
+    ASSERT_FALSE(started.hasResult());
+    coro_rpc::coro_rpc_client raw;
+    using async_simple::coro::syncAwait;
+    ASSERT_FALSE(
+        syncAwait(raw.connect("127.0.0.1", std::to_string(server.port()))));
+    const auto timed_out =
+        syncAwait(raw.call_for<&WrappedMasterService::FetchTasksReplay>(
+            std::chrono::milliseconds(500), owner, request));
+    ASSERT_FALSE(timed_out);
+    EXPECT_EQ(timed_out.error().code, coro_rpc::errc::timed_out);
+
+    const auto assigned = client.QueryTask(ids[0]);
+    ASSERT_TRUE(assigned);
+    ASSERT_EQ(assigned->status, TaskStatus::PROCESSING);
+    if (cancel_and_close) {
+        ASSERT_TRUE(client.CancelTask(ids[0]));
+        request.closing = true;
+    }
+
+    const auto replayed = client.FetchTasksReplay(request);
+    ASSERT_TRUE(replayed);
+    ASSERT_EQ(replayed->token, request.token);
+    ASSERT_EQ(replayed->sequence, request.sequence);
+    ASSERT_EQ(replayed->assignments.size(), 1u);
+    EXPECT_EQ(replayed->assignments[0].id, ids[0]);
+    EXPECT_FALSE(replayed->assignments[0].payload.empty());
+    if (cancel_and_close) {
+        const auto cancellation = client.IsTaskCancellationRequested(ids[0]);
+        ASSERT_TRUE(cancellation);
+        EXPECT_TRUE(*cancellation);
+        auto late = request;
+        late.closing = false;
+        EXPECT_FALSE(client.FetchTasksReplay(late));
+    }
+
+    TaskCompleteRequest completed;
+    completed.id = ids[0];
+    completed.status =
+        cancel_and_close ? TaskStatus::CANCELED : TaskStatus::SUCCESS;
+    ASSERT_TRUE(client.MarkTaskToComplete(completed));
+    const auto terminal = client.QueryTask(ids[0]);
+    ASSERT_TRUE(terminal);
+    EXPECT_EQ(terminal->status, completed.status);
+    const auto duplicate = client.FetchTasksReplay(request);
+    ASSERT_TRUE(duplicate);
+    EXPECT_TRUE(duplicate->assignments.empty());
+    const auto pending = client.QueryTask(ids[1]);
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(pending->status, TaskStatus::PENDING);
+    if (!cancel_and_close) {
+        ++request.sequence;
+        const auto next = client.FetchTasksReplay(request);
+        ASSERT_TRUE(next);
+        ASSERT_EQ(next->assignments.size(), 1u);
+        EXPECT_EQ(next->assignments[0].id, ids[1]);
+        completed.id = ids[1];
+        EXPECT_TRUE(client.MarkTaskToComplete(completed));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(LostResponse, TaskFetchReplayTcpTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "CancelAndClose" : "Retry";
+                         });
 
 }  // namespace
 

@@ -333,6 +333,25 @@ struct TaskAssignment {
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
          max_retry_attempts);
 
+// Sequence 0 opens the lane without assigning work, with a zero token and batch
+// size. A nonzero sequence acknowledges the preceding response. An RPC retry
+// uses the same token, sequence and requested size. A closing request only
+// recovers an existing grant and fences any delayed claim for its sequence.
+struct FetchTasksReplayRequest {
+    UUID token{};
+    uint64_t sequence = 0;
+    uint32_t batch_size = 0;
+    bool closing = false;
+};
+YLT_REFL(FetchTasksReplayRequest, token, sequence, batch_size, closing);
+
+struct FetchTasksReplayResponse {
+    UUID token{};
+    uint64_t sequence = 0;
+    std::vector<TaskAssignment> assignments;
+};
+YLT_REFL(FetchTasksReplayResponse, token, sequence, assignments);
+
 /**
  * @brief Task update structure
  */
