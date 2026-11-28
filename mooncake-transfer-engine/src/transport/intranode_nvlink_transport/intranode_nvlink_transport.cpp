@@ -408,6 +408,20 @@ IntraNodeNvlinkTransport::~IntraNodeNvlinkTransport() {
     remap_entries_.clear();
 }
 
+int IntraNodeNvlinkTransport::resetPeerMappingsQuiescent(uint64_t peer_id) {
+    RWSpinlock::WriteGuard guard(remap_lock_);
+    for (auto it = remap_entries_.begin(); it != remap_entries_.end();) {
+        if (it->first.first != peer_id) {
+            ++it;
+            continue;
+        }
+        auto error = cudaIpcCloseMemHandle(it->second.shm_addr);
+        if (error != cudaSuccess) return -1;
+        it = remap_entries_.erase(it);
+    }
+    return 0;
+}
+
 int IntraNodeNvlinkTransport::install(
     std::string &local_server_name, std::shared_ptr<TransferMetadata> metadata,
     std::shared_ptr<Topology> topology) {

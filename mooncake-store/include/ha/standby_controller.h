@@ -85,7 +85,8 @@ class StandbyController {
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    StandbyController::StartErrorInjector start_error_injector = {});
+    StandbyController::StartErrorInjector start_error_injector = {},
+    std::function<bool()> startup_cancelled = {});
 
 }  // namespace ha
 }  // namespace mooncake

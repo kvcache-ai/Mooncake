@@ -1,8 +1,11 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -130,9 +133,31 @@ void CopyRegistry(const StandbySegmentRegistry& source,
     }
 }
 
-AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
-                           OpLogApplier& applier, const DurablePrefix* baseline,
-                           const std::function<bool()>& cancelled) {
+bool WaitForCancellation(
+    std::chrono::milliseconds delay, const std::function<bool()>& cancelled,
+    const BatchOpLogSnapshotProvider::CancellationWait& wait_cancelled) {
+    if (wait_cancelled) return wait_cancelled(delay);
+    if (!cancelled) {
+        std::this_thread::sleep_for(delay);
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + delay;
+    while (!cancelled()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        std::this_thread::sleep_until(
+            std::min(deadline, now + std::chrono::milliseconds(100)));
+    }
+    return true;
+}
+
+AttemptResult ReplaySuffix(
+    const std::string& cluster_id, HaKvBackend& backend, OpLogApplier& applier,
+    const DurablePrefix* baseline, size_t max_batches_per_poll,
+    std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout,
+    const std::function<bool()>& cancelled,
+    const BatchOpLogSnapshotProvider::CancellationWait& wait_cancelled) {
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Replay);
     OpLogBatchStandbyReader reader(cluster_id, backend, applier);
@@ -144,11 +169,23 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
 
     HAMetricManager::instance().update_snapshot_runtime(
         [](auto& metrics) { metrics.suffix_batches = 0; });
+    // Partial progress and full pages do not resolve a pending suffix wait.
+    // Preserve its age so strong revalidation can finish across pages.
+    std::optional<std::chrono::steady_clock::time_point> suffix_wait_since;
     for (;;) {
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
-        auto poll = reader.PollOnce();
+        const auto poll_started = std::chrono::steady_clock::now();
+        const auto read_mode =
+            suffix_wait_since &&
+                    poll_started - *suffix_wait_since >= no_progress_timeout
+                ? OpLogBatchStandbyReadMode::LINEARIZABLE
+                : OpLogBatchStandbyReadMode::SERIALIZABLE;
+        auto poll = reader.PollOnce(max_batches_per_poll, read_mode);
+        if (cancelled && cancelled()) {
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
             metrics.suffix_batches += poll.applied_batches;
             if (poll.durable_prefix_present)
@@ -169,11 +206,40 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
         }
         const uint64_t applied = applier.GetExpectedSequenceId() - 1;
         if (applied == poll.durable_prefix.last_seq) {
+            const auto cursor = reader.GetLastAppliedDurablePrefix();
+            if (!cursor || *cursor != poll.durable_prefix) {
+                return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+            }
             metric_timer.error = 0;
             return {AttemptDisposition::kSuccess,
                     ErrorCode::OK,
-                    {.last_included_seq = poll.durable_prefix.last_seq,
-                     .last_included_batch_id = poll.durable_prefix.batch_id}};
+                    {.last_included_seq = cursor->last_seq,
+                     .last_included_batch_id = cursor->batch_id}};
+        }
+        if (poll.disposition ==
+            OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            if (!suffix_wait_since) {
+                suffix_wait_since = std::chrono::steady_clock::now();
+            }
+            auto delay = poll_interval;
+            if (no_progress_timeout > std::chrono::milliseconds::zero()) {
+                const auto elapsed =
+                    std::chrono::steady_clock::now() - *suffix_wait_since;
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        no_progress_timeout - elapsed);
+                delay = std::min(
+                    delay,
+                    std::max(remaining, std::chrono::milliseconds::zero()));
+            }
+            if (delay > std::chrono::milliseconds::zero() &&
+                WaitForCancellation(delay, cancelled, wait_cancelled)) {
+                return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+            }
+            continue;
+        }
+        if (poll.error == ErrorCode::OK && !poll.has_more_pages) {
+            suffix_wait_since.reset();
         }
         if (poll.applied_entries == 0) {
             return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
@@ -186,7 +252,10 @@ AttemptResult RestorePointer(
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
     StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
-    const std::function<bool()>& cancelled) {
+    size_t max_batches_per_poll, std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout,
+    const std::function<bool()>& cancelled,
+    const BatchOpLogSnapshotProvider::CancellationWait& wait_cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
@@ -339,8 +408,9 @@ AttemptResult RestorePointer(
         }
     }
 
-    auto suffix =
-        ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
+    auto suffix = ReplaySuffix(cluster_id, backend, *applier, &baseline,
+                               max_batches_per_poll, poll_interval,
+                               no_progress_timeout, cancelled, wait_cancelled);
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
@@ -373,12 +443,14 @@ AttemptResult RestorePointer(
              .max_replica_id = live_max_replica_id}};
 }
 
-AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
-                                   HaKvBackend& backend,
-                                   StandbyMetadataStore& metadata,
-                                   StandbySegmentRegistry& registry,
-                                   OpLogApplier* supplied_applier,
-                                   const std::function<bool()>& cancelled) {
+AttemptResult RestoreCompleteOpLog(
+    const std::string& cluster_id, HaKvBackend& backend,
+    StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
+    OpLogApplier* supplied_applier, size_t max_batches_per_poll,
+    std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout,
+    const std::function<bool()>& cancelled,
+    const BatchOpLogSnapshotProvider::CancellationWait& wait_cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
@@ -395,8 +467,9 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
         return IsRetryableBackendError(init_error) ? Infrastructure(init_error)
                                                    : Invalid(init_error);
     }
-    auto replay =
-        ReplaySuffix(cluster_id, backend, *applier, nullptr, cancelled);
+    auto replay = ReplaySuffix(cluster_id, backend, *applier, nullptr,
+                               max_batches_per_poll, poll_interval,
+                               no_progress_timeout, cancelled, wait_cancelled);
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
@@ -415,18 +488,24 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
 
 BatchOpLogSnapshotProvider::BatchOpLogSnapshotProvider(
     std::string cluster_id, HaKvBackend& backend,
-    SnapshotObjectStore& object_store, std::string snapshot_root)
+    SnapshotObjectStore& object_store, std::string snapshot_root,
+    size_t max_batches_per_poll, std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout)
     : cluster_id_(std::move(cluster_id)),
       backend_(backend),
       object_store_(object_store),
-      snapshot_root_(std::move(snapshot_root)) {}
+      snapshot_root_(std::move(snapshot_root)),
+      max_batches_per_poll_(max_batches_per_poll),
+      poll_interval_(poll_interval),
+      no_progress_timeout_(no_progress_timeout) {}
 
 tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
 BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                             StandbySegmentRegistry& registry,
                                             OpLogApplier* applier,
                                             uint64_t minimum_snapshot_batch,
-                                            std::function<bool()> cancelled) {
+                                            std::function<bool()> cancelled,
+                                            CancellationWait wait_cancelled) {
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Bootstrap);
     metadata.Clear();
@@ -487,9 +566,13 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             descriptor->last_included_batch_id < minimum_snapshot_batch) {
             continue;
         }
-        auto attempt = RestorePointer(cluster_id_, backend_, object_store_,
-                                      snapshot_root_, pointer_bytes, metadata,
-                                      registry, applier, cancelled);
+        auto attempt = RestorePointer(
+            cluster_id_, backend_, object_store_, snapshot_root_, pointer_bytes,
+            metadata, registry, applier, max_batches_per_poll_, poll_interval_,
+            no_progress_timeout_, cancelled, wait_cancelled);
+        if (cancelled && cancelled()) {
+            attempt = Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return metric_timer.Success(attempt.value);
         }
@@ -499,7 +582,8 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             applier->Recover(0);
             applier->LoadSegmentRegistry({});
         }
-        if (attempt.disposition == AttemptDisposition::kInfrastructure) {
+        if (attempt.disposition == AttemptDisposition::kInfrastructure ||
+            attempt.error == ErrorCode::ETCD_CTX_CANCELLED) {
             return tl::make_unexpected(attempt.error);
         }
     }
@@ -507,8 +591,13 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     if (minimum_snapshot_batch != 0) {
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
-    auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
-                                            registry, applier, cancelled);
+    auto full_replay =
+        RestoreCompleteOpLog(cluster_id_, backend_, metadata, registry, applier,
+                             max_batches_per_poll_, poll_interval_,
+                             no_progress_timeout_, cancelled, wait_cancelled);
+    if (cancelled && cancelled()) {
+        full_replay = Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+    }
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();

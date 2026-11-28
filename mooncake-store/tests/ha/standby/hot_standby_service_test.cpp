@@ -5,6 +5,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,10 +24,13 @@
 #include "ha_metric_manager.h"
 #include "master_service.h"
 #include "metadata_store.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -136,17 +144,26 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        ++range_calls_;
         if (range_error_ != ErrorCode::OK) {
             return range_error_;
         }
-        kvs.clear();
-        for (const auto& [key, value] : values_) {
-            if (key >= begin_key && key < end_key) {
-                kvs.push_back({.key = key, .value = value});
-                if (kvs.size() >= limit) break;
-            }
+        return RangeLocked(begin_key, end_key, limit, kvs);
+    }
+    ErrorCode RangeSerializable(std::string_view begin_key,
+                                std::string_view end_key, size_t limit,
+                                std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++serializable_range_calls_;
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            kvs.clear();
+            return ErrorCode::OK;
         }
-        return ErrorCode::OK;
+        if (range_error_ != ErrorCode::OK) {
+            return range_error_;
+        }
+        return RangeLocked(begin_key, end_key, limit, kvs);
     }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
@@ -179,13 +196,40 @@ class FakeHaKvBackend : public HaKvBackend {
         std::lock_guard<std::mutex> lock(mutex_);
         next_get_error_ = err;
     }
+    void StaleNextSerializableRange() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stale_serializable_ranges_;
+    }
+    int range_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return range_calls_;
+    }
+    int serializable_range_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return serializable_range_calls_;
+    }
 
    private:
+    ErrorCode RangeLocked(std::string_view begin_key, std::string_view end_key,
+                          size_t limit, std::vector<KvPair>& kvs) {
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (kvs.size() >= limit) break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+
     mutable std::mutex mutex_;
     std::map<std::string, std::string> values_;
     ErrorCode get_error_{ErrorCode::OK};
     ErrorCode range_error_{ErrorCode::OK};
     ErrorCode next_get_error_{ErrorCode::OK};
+    size_t stale_serializable_ranges_{0};
+    int range_calls_{0};
+    int serializable_range_calls_{0};
 };
 
 OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
@@ -285,6 +329,167 @@ class HotStandbyServiceTest : public ::testing::Test {
     std::string oplog_endpoints_;
     std::string cluster_id_;
 };
+
+class BootstrapCancellationTest : public HotStandbyServiceTest,
+                                  public ::testing::WithParamInterface<bool> {
+   protected:
+    class LaggingBackend final : public FakeHaKvBackend {
+       public:
+        ErrorCode RangeSerializable(std::string_view begin,
+                                    std::string_view end, size_t limit,
+                                    std::vector<KvPair>& output) override {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (lagging_) {
+                    output.clear();
+                    read_observed_ = true;
+                    cv_.notify_all();
+                    return ErrorCode::OK;
+                }
+            }
+            return FakeHaKvBackend::RangeSerializable(begin, end, limit,
+                                                      output);
+        }
+
+        bool WaitForLaggingRead() {
+            std::unique_lock<std::mutex> lock(mutex_);
+            return cv_.wait_for(lock, std::chrono::seconds(2),
+                                [this] { return read_observed_; });
+        }
+
+        void CatchUp() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            lagging_ = false;
+        }
+
+       private:
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool lagging_{true};
+        bool read_observed_{false};
+    };
+
+    void SetUp() override {
+        HotStandbyServiceTest::SetUp();
+        char pattern[] = "/tmp/mooncake-bootstrap-cancel-XXXXXX";
+        const char* root = mkdtemp(pattern);
+        ASSERT_NE(nullptr, root);
+        root_ = root;
+        objects_ = std::make_unique<LocalFileSnapshotObjectStore>(root_);
+        backend_ = std::make_shared<LaggingBackend>();
+        ASSERT_EQ(ErrorCode::OK,
+                  backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+        ASSERT_EQ(
+            ErrorCode::OK,
+            backend_->Put(BuildDurablePrefixKey(cluster_id_),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+        config_.enable_snapshot_bootstrap = true;
+        config_.enable_oplog_following = GetParam();
+        config_.oplog_poll_interval_ms = 2000;
+        config_.batch_oplog_retry_timeout_sec = 2;
+        service_ = std::make_unique<HotStandbyService>(config_);
+        service_->SetCatchUpBatchKvBackendForTesting(backend_);
+        service_->SetBatchOpLogSnapshotProvider(
+            std::make_unique<BatchOpLogSnapshotProvider>(
+                cluster_id_, *backend_, *objects_, "snapshots", 2,
+                std::chrono::seconds(2), std::chrono::seconds(2)));
+    }
+
+    void TearDown() override {
+        service_.reset();
+        objects_.reset();
+        if (!root_.empty()) std::filesystem::remove_all(root_);
+        HotStandbyServiceTest::TearDown();
+    }
+
+    std::shared_ptr<LaggingBackend> backend_;
+    std::unique_ptr<LocalFileSnapshotObjectStore> objects_;
+    std::string root_;
+};
+
+TEST_P(BootstrapCancellationTest, StopCancelsSuffixWaitAndAllowsRestart) {
+    auto started = std::async(std::launch::async, [this] {
+        return service_->Start("", "", cluster_id_);
+    });
+    EXPECT_TRUE(backend_->WaitForLaggingRead());
+    // Leave the restore inside its long suffix wait before requesting stop.
+    EXPECT_EQ(std::future_status::timeout,
+              started.wait_for(std::chrono::milliseconds(50)));
+    auto stopped = std::async(std::launch::async, [this] { service_->Stop(); });
+
+    EXPECT_EQ(std::future_status::ready,
+              stopped.wait_for(std::chrono::milliseconds(500)));
+    stopped.get();
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+
+    backend_->CatchUp();
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
+    service_->Stop();
+}
+
+TEST_P(BootstrapCancellationTest,
+       ShutdownPredicateCancelsSuffixWaitWithoutStop) {
+    std::atomic<bool> shutdown{false};
+    auto started = std::async(std::launch::async, [this, &shutdown] {
+        return service_->Start("", "", cluster_id_,
+                               [&shutdown] { return shutdown.load(); });
+    });
+    EXPECT_TRUE(backend_->WaitForLaggingRead());
+    EXPECT_EQ(std::future_status::timeout,
+              started.wait_for(std::chrono::milliseconds(50)));
+    shutdown.store(true);
+
+    EXPECT_EQ(std::future_status::ready,
+              started.wait_for(std::chrono::milliseconds(500)));
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+    EXPECT_FALSE(service_->GetLastAppliedBatchOpLogSnapshotPrefix());
+}
+
+INSTANTIATE_TEST_SUITE_P(OplogFollowing, BootstrapCancellationTest,
+                         ::testing::Bool());
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+TEST_P(BootstrapCancellationTest, PendingStopRejectsNewBootstrap) {
+    const char* previous = std::getenv("MOONCAKE_TEST_FAILPOINT_DIR");
+    const std::optional<std::string> previous_directory =
+        previous ? std::optional<std::string>(previous) : std::nullopt;
+    setenv("MOONCAKE_TEST_FAILPOINT_DIR", root_.c_str(), 1);
+    const auto point = root_ + "/standby_stop_before_lock";
+    std::ofstream(point + ".arm");
+    auto stopped = std::async(std::launch::async, [this] { service_->Stop(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!std::filesystem::exists(point + ".hit") &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(std::filesystem::exists(point + ".hit"));
+    auto started = std::async(std::launch::async, [this] {
+        return service_->Start("", "", cluster_id_);
+    });
+    EXPECT_EQ(std::future_status::ready,
+              started.wait_for(std::chrono::milliseconds(500)));
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    std::ofstream(point + ".release");
+    stopped.get();
+    if (previous_directory) {
+        setenv("MOONCAKE_TEST_FAILPOINT_DIR", previous_directory->c_str(), 1);
+    } else {
+        unsetenv("MOONCAKE_TEST_FAILPOINT_DIR");
+    }
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+}
+#endif
 
 namespace {
 
@@ -818,6 +1023,132 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
     service->Stop();
 }
 
+TEST_F(HotStandbyServiceTest,
+       SerializableSuffixLagUsesStrongRevalidationAndContinues) {
+    const std::string cluster_id = "batch-standby-lagged-suffix";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 2),
+                                 EncodeOpLogBatchRecord(MakeBatch(2, 2, 2))));
+    batch_backend->StaleNextSerializableRange();
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(2u, service->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1, batch_backend->serializable_range_calls());
+    EXPECT_EQ(1, batch_backend->range_calls());
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest,
+       PersistentSuffixGapIsStronglyRevalidatedBeforeFailure) {
+    const std::string cluster_id = "batch-standby-missing-suffix";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::FAILED, service->GetState());
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
+              service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest,
+       RevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto backend = std::make_shared<AdvancingSuffixLagBackend>(
+        cluster_id_, std::make_shared<FakeHaKvBackend>());
+    backend->StartLagging(1, std::chrono::seconds(5), 3);
+    config_.enable_snapshot_bootstrap = false;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 1;
+    config_.oplog_standby_max_batches_per_poll = 2;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((service_->GetSyncStatus().applied_seq_id < 2 ||
+            service_->GetSyncStatus().lag_entries != 0) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(service_->GetLatestAppliedSequenceId(), 2u);
+    EXPECT_EQ(0u, service_->GetSyncStatus().lag_entries);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+}
+
+TEST_F(HotStandbyServiceTest,
+       PromotionRevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto backend = std::make_shared<AdvancingSuffixLagBackend>(
+        cluster_id_, std::make_shared<FakeHaKvBackend>());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.enable_snapshot_bootstrap = false;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 1;
+    config_.oplog_standby_max_batches_per_poll = 2;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    LocalFileSnapshotObjectStore objects("/tmp/mooncake-suffix-lag-promotion");
+    service_->SetBatchOpLogSnapshotProvider(
+        std::make_unique<BatchOpLogSnapshotProvider>(cluster_id_, *backend,
+                                                     objects, "snapshots"));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(capture);
+    backend->StartLagging(1, std::chrono::seconds(5), 3);
+
+    auto handoff = service_->PromoteAndDetachBatchOpLogStore();
+
+    ASSERT_TRUE(handoff.has_value());
+    EXPECT_GE(handoff->applied_cursor.batch_id, 2u);
+    EXPECT_EQ(handoff->applied_cursor.batch_id,
+              handoff->applied_cursor.last_seq);
+}
+
 TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
@@ -975,6 +1306,61 @@ TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
     EXPECT_EQ(1u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, RevalidatesSuffixBeforeLegacyDeadlineAcrossPages) {
+    class LaggingBackend final : public FakeHaKvBackend {
+       public:
+        ErrorCode RangeSerializable(std::string_view begin,
+                                    std::string_view end, size_t limit,
+                                    std::vector<KvPair>& output) override {
+            if (lagging.load()) {
+                output.clear();
+                return ErrorCode::OK;
+            }
+            return FakeHaKvBackend::RangeSerializable(begin, end, limit,
+                                                      output);
+        }
+        std::atomic<bool> lagging{false};
+    };
+    auto backend = std::make_shared<LaggingBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.oplog_standby_max_batches_per_poll = 1;
+    config_.batch_oplog_retry_timeout_sec = 180;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    // Pause background replication before publishing the promotion backlog.
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(capture);
+    for (uint64_t id = 1; id <= 3; ++id) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend->Put(BuildBatchRecordKey(cluster_id_, id),
+                               EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
+    }
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+    backend->lagging.store(true);
+    StandbySnapshot snapshot;
+    auto promoted = std::async(std::launch::async, [this, &snapshot] {
+        return service_->PromoteAndExportSnapshot(snapshot);
+    });
+
+    const auto status = promoted.wait_for(std::chrono::seconds(1));
+    // Release lag on failure so a regression does not stall the test for 30 s.
+    backend->lagging.store(false);
+    const auto error = promoted.get();
+
+    EXPECT_EQ(std::future_status::ready, status);
+    EXPECT_EQ(ErrorCode::OK, error);
+    EXPECT_EQ(3u, snapshot.oplog_sequence_id);
+    EXPECT_EQ(3u, snapshot.objects.size());
+    EXPECT_GE(backend->range_calls(), 3);
 }
 
 TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
