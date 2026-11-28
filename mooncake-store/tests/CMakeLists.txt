@@ -76,6 +76,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
     "-Wl,--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
 endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
+add_store_test(offload_read_scheduler_test offload_read_scheduler_test.cpp)
+add_store_test(offload_read_chunk_config_test
+               offload_read_chunk_config_test.cpp)
 add_store_test(read_singleflight_test read_singleflight_test.cpp)
 add_store_test(real_client_heartbeat_test real_client_heartbeat_test.cpp)
 add_store_test(real_client_heartbeat_progress_test

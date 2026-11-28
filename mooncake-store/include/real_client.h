@@ -19,6 +19,7 @@
 #include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
 #include "client_service.h"
+#include "config/offload_read_chunk_config.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "common/network.h"
@@ -779,7 +780,8 @@ class RealClient : public PyClient {
         const std::string &, LocalDiskOffloadObjects &)>;
 
     // Dependency-injected overload used to verify routing decisions without
-    // requiring multiple live SSD offload servers.
+    // requiring multiple live SSD offload servers. An empty local_disk_reader
+    // reads from the owners (batch_get_into_offload_object_internal).
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
@@ -1008,10 +1010,48 @@ class RealClient : public PyClient {
         int64_t object_size;
     };
 
+    // chunk_of_split_read: logs the per-call timing at VLOG(1) instead of
+    // INFO, because read_local_disk_objects logs one summary per owner read.
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
-        const OffloadReadRange *read_range = nullptr);
+        const OffloadReadRange *read_range = nullptr,
+        bool chunk_of_split_read = false);
+
+    // Whether a key's master lease has expired (IsLocalDiskMasterLeaseExpired
+    // on the key's query result). Called concurrently from the threads of one
+    // chunked read.
+    using LocalDiskLeaseCheck = std::function<bool(const std::string &)>;
+
+    struct LocalDiskReadResult {
+        // Keys that were not read, or whose master lease had expired when
+        // their chunk was read, with their error; empty when every key was
+        // read.
+        std::unordered_map<std::string, ErrorCode> failed_keys;
+        // The read was split into chunks, and the master lease of every key
+        // not in failed_keys was checked right after its own chunk was read.
+        // Callers then skip their own lease recheck: it would also fail keys
+        // that were read before a later chunk took the batch past its lease.
+        bool lease_checked = false;
+    };
+
+    // Reads the LOCAL_DISK objects of one owner for a batch get. A read
+    // larger than offload_read_chunk_config_.chunk_bytes is split into
+    // chunks, each its own read_chunk call (owner RPC + transfer + release),
+    // with chunk_concurrency in flight, and lease_expired is checked for each
+    // key right after its chunk is read (#5228); see offload_read_scheduler.h.
+    // An unsplit read is one read_chunk call, as before chunking, and leaves
+    // the lease recheck to the caller. read_chunk defaults to
+    // batch_get_into_offload_object_internal.
+    LocalDiskReadResult read_local_disk_objects(
+        const std::string &endpoint, LocalDiskOffloadObjects &objects,
+        const LocalDiskLeaseCheck &lease_expired,
+        const LocalDiskOffloadReader *read_chunk = nullptr);
+
+    // Read when the client is created (MOONCAKE_OFFLOAD_READ_CHUNK_BYTES,
+    // MOONCAKE_OFFLOAD_READ_CHUNK_CONCURRENCY).
+    OffloadReadChunkConfig offload_read_chunk_config_ =
+        OffloadReadChunkConfig::FromEnvironment();
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
