@@ -4722,7 +4722,12 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
 
     if (replica_list.empty()) {
         if (metadata.AllReplicas([](const Replica& replica) {
-                return replica.status() == ReplicaStatus::REMOVED;
+                if (replica.status() == ReplicaStatus::REMOVED) {
+                    return true;
+                }
+                const auto* registration = replica.getLocalDiskRegistration();
+                return registration &&
+                       !registration->mounted.load(std::memory_order_acquire);
             })) {
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }

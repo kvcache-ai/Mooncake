@@ -541,7 +541,14 @@ TEST_F(MasterServiceSSDTest, RemountSurvivesRetiredLocalDiskCleanup) {
     const auto before_unmount = metrics.get_file_cache_nums();
 
     ASSERT_TRUE(service->UnmountLocalDiskSegment(owner).has_value());
-    EXPECT_FALSE(service->GetReplicaList("old", tenant).has_value());
+    const auto retired = service->GetReplicaList("old", tenant);
+    ASSERT_FALSE(retired.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, retired.error());
+    const auto batch = service->BatchGetReplicaList({"old", "healthy"}, tenant);
+    ASSERT_EQ(2u, batch.size());
+    ASSERT_FALSE(batch[0].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, batch[0].error());
+    EXPECT_TRUE(batch[1].has_value());
     EXPECT_EQ(before_unmount, metrics.get_file_cache_nums());
 
     ASSERT_TRUE(service->MountLocalDiskSegment(owner, true).has_value());
